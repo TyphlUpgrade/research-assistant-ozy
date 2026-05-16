@@ -1,0 +1,17 @@
+{
+  "_comment": "Project-scoped CC settings for the Stock Research Assistant. SessionStart hook nudges the user when no morning brief exists for today (ET-aware). Schema uses real CC hook shape (matcher + hooks array + type:command + $CLAUDE_PROJECT_DIR) — verified against ~/.claude/plugins/marketplaces/omc/hooks/hooks.json. NOT VS Code's ${workspaceFolder} variable (Critic iter2 BLOCKER 2 caught a fictional schema in the iter2 draft; this is the canonical replacement).",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/session_start.py\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
