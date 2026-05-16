@@ -1,0 +1,13 @@
+# Stock Research Assistant — Watchlist
+# One ticker per line. Lines starting with # are comments.
+# This file is the v1 candidate universe for /brief opportunity surfacing.
+
+# Mega-cap tech
+AAPL
+MSFT
+NVDA
+GOOGL
+
+# Broad market reference
+SPY
+QQQ

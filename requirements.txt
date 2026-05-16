@@ -1,0 +1,12 @@
+# Anthropic SDK for direct Claude calls (clean-room SDK wrapper)
+anthropic>=0.40.0
+
+# YAML frontmatter parsing for dossiers
+python-frontmatter>=1.1.0
+
+# Ozy modules (editable install from sibling repo)
+# Run separately: pip install -e /home/typhlupgrade/.local/share/ozy-bot-v3
+
+# Test framework
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
