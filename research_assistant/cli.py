@@ -160,7 +160,7 @@ def _render_research_result(result) -> str:
     if result.risks:
         lines.append("**Risks (named):**")
         for r in result.risks:
-            lines.append(f"- {r}")
+            lines.append(f"- {r}  {_anchor_for(r)}")
         lines.append("")
     if result.critique_text:
         lines.append(f"**Skeptic critique:** {result.critique_text}")

@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -55,6 +56,17 @@ class CostTracker:
         return cost
 
 
+@dataclass
+class CallResult:
+    """Per-call result with text and metadata for trace emission."""
+    text: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    latency_ms: int
+
+
 class ClaudeClient:
     """
     Minimal async Anthropic client with retry + cost tracking.
@@ -86,8 +98,14 @@ class ClaudeClient:
         max_tokens: int = 4096,
         system: Optional[str] = None,
         temperature: float = 1.0,
-    ) -> str:
-        """Single-turn call. Returns text response. Raises on unrecoverable errors."""
+    ) -> CallResult:
+        """
+        Single-turn call. Returns CallResult with text + metadata (model,
+        tokens, cost, latency). Raises on unrecoverable errors.
+
+        Per-call metadata enables cascade trace emission downstream — the
+        orchestrator captures it and writes per-stage events to JSONL.
+        """
         chosen_model = model or self.default_model
         kwargs: dict[str, Any] = {
             "model": chosen_model,
@@ -102,14 +120,22 @@ class ClaudeClient:
         last_err: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
             try:
+                start = time.perf_counter()
                 response = await self._client.messages.create(**kwargs)
-                self.cost.record(
+                latency_ms = int((time.perf_counter() - start) * 1000)
+                cost = self.cost.record(
                     chosen_model,
                     response.usage.input_tokens,
                     response.usage.output_tokens,
                 )
-                # First content block is text in single-turn calls
-                return response.content[0].text
+                return CallResult(
+                    text=response.content[0].text,
+                    model=chosen_model,
+                    input_tokens=response.usage.input_tokens,
+                    output_tokens=response.usage.output_tokens,
+                    cost_usd=cost,
+                    latency_ms=latency_ms,
+                )
             except (anthropic.RateLimitError, anthropic.APIStatusError) as e:
                 last_err = e
                 if isinstance(e, anthropic.APIStatusError) and e.status_code < 500:

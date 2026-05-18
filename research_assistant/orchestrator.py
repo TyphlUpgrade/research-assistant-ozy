@@ -26,13 +26,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from research_assistant.claude_sdk import ClaudeClient
+from research_assistant.claude_sdk import CallResult, ClaudeClient
 from research_assistant.dossier_io import (
     Dossier,
     LedgerEntry,
     read_dossier,
     write_dossier_atomic,
 )
+from research_assistant.trace_renderer import append_stage_event
 from ozymandias.intelligence.claude_json import parse_claude_response
 
 log = logging.getLogger(__name__)
@@ -88,8 +89,12 @@ async def _stage_2_thesis(
     ticker_data: dict,
     stage_1_result: dict,
     headlines: list[dict],
-) -> Optional[dict]:
-    """Invoke Stage 2 (Sonnet thesis). Returns parsed JSON or None on parse failure."""
+) -> tuple[Optional[dict], Optional[CallResult]]:
+    """
+    Invoke Stage 2 (Sonnet thesis). Returns (parsed_json, call_metadata).
+    parsed_json is None on parse failure; call_metadata is always returned
+    (so trace events can record even when JSON parse fails).
+    """
     template = _load_prompt("stage_2_thesis")
     prompt = _render(
         template,
@@ -98,8 +103,8 @@ async def _stage_2_thesis(
         headlines_json=json.dumps(headlines, indent=2),
     )
     system = f"WORLD_STATE for this session:\n{json.dumps(world_state, indent=2)}"
-    raw = await client.call(prompt, model="claude-sonnet-4-6", system=system)
-    return parse_claude_response(raw)
+    result = await client.call(prompt, model="claude-sonnet-4-6", system=system)
+    return parse_claude_response(result.text), result
 
 
 async def _stage_3_skeptic(
@@ -107,13 +112,15 @@ async def _stage_3_skeptic(
     world_state: dict,
     thesis_with_ticker_data: dict,
     model: str = "claude-sonnet-4-6",
-) -> Optional[dict]:
-    """Invoke Stage 3 (Skeptic). Returns parsed JSON or None on parse failure."""
+) -> tuple[Optional[dict], Optional[CallResult]]:
+    """
+    Invoke Stage 3 (Skeptic). Returns (parsed_json, call_metadata).
+    """
     template = _load_prompt("stage_3_skeptic")
     prompt = _render(template, thesis_json=json.dumps(thesis_with_ticker_data, indent=2))
     system = f"WORLD_STATE for this session:\n{json.dumps(world_state, indent=2)}"
-    raw = await client.call(prompt, model=model, system=system)
-    return parse_claude_response(raw)
+    result = await client.call(prompt, model=model, system=system)
+    return parse_claude_response(result.text), result
 
 
 def _chain_id() -> str:
@@ -160,18 +167,45 @@ async def research_ticker(
         "intrinsic_score": 0.5,
         "reason": "single-ticker on-demand DD (Stage 1 batched filter skipped)",
     }
-    stage_2 = await _stage_2_thesis(
+    stage_2, s2_meta = await _stage_2_thesis(
         client, world_state, ticker_data, stage_1_placeholder, headlines
     )
+    traces_base = base / "traces"
+    append_stage_event(
+        chain_id=chain,
+        stage_id="stage_2_thesis",
+        model=s2_meta.model if s2_meta else "unknown",
+        tokens_in=s2_meta.input_tokens if s2_meta else 0,
+        tokens_out=s2_meta.output_tokens if s2_meta else 0,
+        cost_usd=s2_meta.cost_usd if s2_meta else 0.0,
+        latency_ms=s2_meta.latency_ms if s2_meta else 0,
+        parsed=stage_2,
+        raw_response=s2_meta.text if s2_meta else None,
+        traces_base=traces_base,
+        error=None if stage_2 else "Stage 2 JSON parse failed",
+    )
     if stage_2 is None:
-        raise RuntimeError(f"Stage 2 JSON parse failed for {symbol}")
+        raise RuntimeError(f"Stage 2 JSON parse failed for {symbol} (chain={chain})")
 
     # Stage 3 — supply Stage 2 + ticker_data for momentum/exhaustion fields
     thesis_with_data = dict(stage_2)
     thesis_with_data["ticker_data"] = ticker_data
-    stage_3 = await _stage_3_skeptic(client, world_state, thesis_with_data)
+    stage_3, s3_meta = await _stage_3_skeptic(client, world_state, thesis_with_data)
+    append_stage_event(
+        chain_id=chain,
+        stage_id="stage_3_skeptic",
+        model=s3_meta.model if s3_meta else "unknown",
+        tokens_in=s3_meta.input_tokens if s3_meta else 0,
+        tokens_out=s3_meta.output_tokens if s3_meta else 0,
+        cost_usd=s3_meta.cost_usd if s3_meta else 0.0,
+        latency_ms=s3_meta.latency_ms if s3_meta else 0,
+        parsed=stage_3,
+        raw_response=s3_meta.text if s3_meta else None,
+        traces_base=traces_base,
+        error=None if stage_3 else "Stage 3 JSON parse failed",
+    )
     if stage_3 is None:
-        raise RuntimeError(f"Stage 3 JSON parse failed for {symbol}")
+        raise RuntimeError(f"Stage 3 JSON parse failed for {symbol} (chain={chain})")
 
     # Merge into dossier
     dossier = read_dossier(symbol, base) or Dossier(symbol=symbol)

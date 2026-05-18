@@ -75,7 +75,7 @@ class TestAxis1Factual:
         ):
             captured_stage_2_prompt["ticker_data"] = td
             captured_stage_2_prompt["headlines"] = headlines
-            return {
+            parsed = {
                 "ticker": "NVDA",
                 "thesis_text": "Test thesis from mocked Stage 2.",
                 "conviction_score": 0.6,
@@ -87,9 +87,10 @@ class TestAxis1Factual:
                     {"claim": "China export", "source": "tool_call_test_2"},
                 ],
             }
+            return parsed, None  # None for CallResult — trace event tolerates it
 
         async def fake_stage_3_skeptic(client, ws, thesis_with_td, model="x"):
-            return {
+            parsed = {
                 "ticker": "NVDA",
                 "critique_text": "Test critique.",
                 "adjusted_score": 0.55,
@@ -97,6 +98,7 @@ class TestAxis1Factual:
                 "open_questions_added": [],
                 "news_reactivity_flag": False,
             }
+            return parsed, None
 
         with patch("research_assistant.orchestrator._stage_2_thesis", fake_stage_2_thesis), \
              patch("research_assistant.orchestrator._stage_3_skeptic", fake_stage_3_skeptic):
@@ -129,7 +131,7 @@ class TestAxis1Factual:
                 "risks": ["regulatory"],
                 "open_questions": [],
                 "evidence_anchors": [{"claim": "services growth", "source": "tc_x"}],
-            }
+            }, None
 
         async def fake_stage_3(client, ws, twd, model="x"):
             return {
@@ -139,7 +141,7 @@ class TestAxis1Factual:
                 "flagged_risks": [],
                 "open_questions_added": [],
                 "news_reactivity_flag": False,
-            }
+            }, None
 
         with patch("research_assistant.orchestrator._stage_2_thesis", fake_stage_2), \
              patch("research_assistant.orchestrator._stage_3_skeptic", fake_stage_3):
