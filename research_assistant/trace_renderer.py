@@ -60,14 +60,21 @@ def _format_stage_event(event: dict) -> str:
                 source = _NO_ANCHOR_MARKER
             lines.append(f"    - `{claim}` ← {source}")
 
-    # Flag any claim in the stage output without a matching anchor (visibility regression)
+    # Flag any claim in the stage output without a matching anchor (visibility regression).
+    # Strict exact-match (after case+whitespace normalization) — fuzzy bidirectional
+    # substring was too lax and let paraphrased anchors slip through. The Stage 2 prompt
+    # now requires verbatim claim text in anchors, so exact match is the right contract.
     drivers = parsed.get("key_drivers", []) or []
     risks = parsed.get("risks", []) or []
-    anchor_claims = {a.get("claim", "").strip().lower() for a in (anchors or [])}
+    anchor_claims = {
+        a.get("claim", "").strip().lower()
+        for a in (anchors or [])
+        if a.get("claim") and a.get("source")  # empty source = no anchor
+    }
     for claim_set, label in [(drivers, "driver"), (risks, "risk")]:
         for c in claim_set:
             c_norm = (c or "").strip().lower()
-            if c_norm and not any(c_norm in ac or ac in c_norm for ac in anchor_claims):
+            if c_norm and c_norm not in anchor_claims:
                 lines.append(f"- ⚠ {label}: `{c}` {_NO_ANCHOR_MARKER}")
 
     # Other parsed fields, lightly rendered

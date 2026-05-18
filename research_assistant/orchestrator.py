@@ -67,8 +67,19 @@ def _load_prompt(stem: str) -> str:
 
 
 def _render(template: str, **subs: Any) -> str:
-    """Plain .format() with strict missing-key detection."""
-    return template.format(**subs)
+    """
+    Substitute `{key}` placeholders in a prompt template.
+
+    Uses literal `.replace()` rather than `str.format()` so that JSON schema
+    examples inside the prompt body (e.g. `{ "ticker": "<symbol>", ... }`)
+    don't get interpreted as format substitution fields and KeyError.
+    Only the named placeholders in `subs` are substituted; everything else
+    in the template is preserved verbatim.
+    """
+    result = template
+    for key, value in subs.items():
+        result = result.replace("{" + key + "}", str(value))
+    return result
 
 
 async def _stage_2_thesis(
