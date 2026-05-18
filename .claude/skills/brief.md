@@ -1,47 +1,61 @@
 ---
 name: brief
-description: On-demand morning market brief. Builds world-state regime classification + ranked opportunity surface (top 4-8 from user's static watchlist) with one-line thesis per item. Layered output — scannable top-level summary first, drill-down via `/brief <TICKER>` for any item. No Stage 3 Skeptic in brief; user runs `/research <TICKER>` for the full bias-defense treatment on names they want to probe.
+description: On-demand morning market brief. Builds world-state regime classification + ranked opportunity surface (top 4-8 from the user's static watchlist) with one-line thesis per item. Layered output — scannable top-level summary first, drill-down via `/brief <TICKER>` for any item. No Skeptic in brief; user runs `/research <TICKER>` for full bias-defense treatment on selected names.
 ---
 
-When the user runs `/brief` (no args) or natural-language equivalents ("what's the market doing", "morning brief", "what should I look at today"):
+When the user runs `/brief` (no args) or says equivalents like "what's the market doing", "morning brief", "what should I look at today":
 
-1. **Check today's cache.** Look for `.research/briefs/<date-ET>.json` where `<date-ET>` is computed via `datetime.now(ZoneInfo("America/New_York")).date().isoformat()`. If cached and the user has not specified `--refresh`, render from cache (cheap, fast).
+## Invocation
 
-2. **If no cache:**
-   a. Load watchlist from `.research/watchlist.txt` via `load_watchlist(base=Path(".research"))`.
-   b. Fetch market context (SPY/QQQ bars, VIX, sector ETFs, macro headlines) via yfinance_adapter. Wrap via `research_assistant.market_context.build_research_context(...)`.
-   c. Fetch per-watchlist-ticker data (price, return_5d, return_30d, return_90d, weekly_rsi_14, volume_5d_trend) and recent headlines.
-   d. Call `research_assistant.brief.build_brief(...)` — runs Stage 0 + Stage 1 + parallel Stage 2 (semaphore-bounded at 5 concurrent).
-   e. Brief is auto-cached at `.research/briefs/<date-ET>.json`.
+Run the CLI via Bash:
 
-3. **Render top-level** via `render_brief_top_level(brief)`:
-   - Regime + dispersion + macro signals (1 paragraph)
-   - Top 4-8 opportunities, each with: ticker, conviction, 1-line thesis preview
-   - "Run `/research <TICKER>` for full DD" footer + chain ID
+```bash
+python -m research_assistant brief
+```
 
-4. **Drill-down**: when the user asks for more on a specific ticker from the brief (`/brief NVDA`, "tell me more about NVDA from the brief", "expand NVDA"), render `render_brief_drill_down(brief, ticker)` showing:
-   - Full thesis text
-   - Conviction score
-   - Key drivers with inline `[anchor: tool_call_X]` citations
-   - Named risks
-   - Open questions to probe further
-   - "Run `/research <TICKER>` for full Skeptic + Defender DD" footer
+The CLI does cache-first lookup — if today's brief (ET date) already exists at `.research/briefs/<date-ET>.json`, it returns from cache instantly (no API spend). To force a rebuild:
 
-5. **Visibility regression flagging**: in drill-down, any key driver whose claim text has no matching `evidence_anchors` entry shows as `[NO ANCHOR — visibility regression]` — the visibility-axis quality contract surfaces immediately.
+```bash
+python -m research_assistant brief --refresh
+```
 
-## Why no Skeptic in /brief
+To drill down into a specific item from the brief:
 
-Stage 3 Skeptic costs Sonnet × 8 calls per morning brief = significant daily spend even on idle days. The /brief surface is meant for SCANNING — the user picks 1-3 names they want to probe and runs `/research <TICKER>` for the full Stage 2 + Stage 3 + Defender treatment. This keeps /brief cheap (~$0.20-0.50 per generation) and concentrates the expensive Skeptic call on the names where the user is actually about to do something.
+```bash
+python -m research_assistant brief --ticker NVDA
+```
+
+JSON output for chaining: add `--json`.
+
+## Display the output
+
+The CLI's stdout is the brief — markdown formatted, ready to show directly. It includes:
+- Market regime (bull-trending / bear-trending / choppy / panic / euphoria) + confidence + dispersion
+- VIX level + trend, active catalysts (FOMC, CPI, etc.)
+- Top 4-8 opportunities with ticker + 1-line thesis + conviction
+- Chain ID footer
+
+Drill-down view (when `--ticker` is set) adds:
+- Full Stage 2 thesis text
+- Key drivers with `[anchor: tool_call_X]` citations inline
+- Named risks
+- Open questions to probe further
+- `[NO ANCHOR — visibility regression]` flags on any unanchored claim
 
 ## Failure modes
 
-- Watchlist file empty / missing → friendly error: "Add tickers to `.research/watchlist.txt` (one per line). Run again."
-- yfinance fetch fails → refuse to produce stale data per Principle 1: "I don't have fresh market data right now. Try again or check your network."
-- Stage 0 / Stage 1 JSON parse fails → log chain_id, surface partial output if any, ask user to retry.
+- Empty watchlist → CLI exits 1, asks user to populate `.research/watchlist.txt`.
+- yfinance fetch fails → exits 1; surface the error.
+- Missing `ANTHROPIC_API_KEY` → exits 3.
+- Stage 0 / Stage 1 JSON parse fail → exits 1; chain_id logged.
+
+## Why no Skeptic in /brief
+
+Stage 3 Skeptic costs Sonnet × 8 calls per morning brief — significant daily spend on idle days. The brief is for SCANNING — the user picks 1-3 names worth probing and runs `/research <TICKER>` for the full Stage 2 + Stage 3 + Defender treatment. Keeps brief cheap (~$0.20-0.50 per generation) and concentrates the expensive Skeptic call on names the user is about to act on.
 
 ## Quality contract enforcement
 
-- **Factual:** every item's drivers cite an anchor; missing anchors flagged in drill-down.
-- **Backbone:** Defender does NOT fire on /brief output — brief is informational, not a recommendation under user pushback. The Defender pattern activates only in /research conversation context where a Recommendation has been issued.
-- **Depth:** Stage 2 prompts mandate fundamentals/filings depth; v1 ships with this floor. v1.x evaluator LLM upgrade in Open Follow-ups.
-- **Visibility:** `/trace <chain_id>` works on the brief's chain too — surfaces all stage events with anchors per claim.
+- **Factual:** every item's drivers cite an anchor; orphans flagged in drill-down.
+- **Backbone:** Defender does NOT fire on /brief output — brief is informational. Activates only in /research conversation context after a Recommendation.
+- **Depth:** Stage 2 prompt mandates fundamentals/filings depth. v1.x evaluator LLM in Open Follow-ups.
+- **Visibility:** `/trace <chain_id>` works on the brief's chain — surfaces all stage events with per-claim anchors.

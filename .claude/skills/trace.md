@@ -1,32 +1,40 @@
 ---
 name: trace
-description: Render the cascade trace for a given chain_id as human-readable terminal output. Surfaces per-stage events (Stage 2, Stage 3, optional Defender), evidence-anchor citations per claim, and flags claims without anchors as visibility regressions. Usage `/trace <chain_id>` — typically the chain_id printed at the end of a `/research` result.
+description: Render the cascade trace for a given chain_id as human-readable terminal output. Surfaces per-stage events (Stage 2, Stage 3, optional Defender), evidence-anchor citations per claim, flags claims without anchors as visibility regressions. Usage `/trace <chain_id>` — typically the chain_id printed at end of a `/research` or `/brief` result.
 ---
 
-When the user runs `/trace <chain_id>`:
+When the user runs `/trace <chain_id>` or says "show me the trace for X" / "what was the reasoning on X":
 
-1. **Parse the chain_id** from the user's message. Format is typically `YYYYMMDDTHHMMSS-XXXXXX` (timestamp + 6-hex suffix).
+## Invocation
 
-2. **Invoke `research_assistant.trace_renderer.render_trace(chain_id, traces_base=Path(".research/traces"))`** to read the JSONL file and produce the rendered markdown.
+```bash
+python -m research_assistant trace <CHAIN_ID>
+```
 
-3. **Display the output directly** in the terminal. Each stage block looks like:
+The CLI's stdout is the rendered trace — markdown formatted per-stage events with anchors inline. Show it directly.
 
-   ```
-   ## stage_2_thesis (claude-sonnet-4-6)
-   - chain_id: `20260514T143022-abc123`
-   - timestamp: 2026-05-14T14:30:22Z
-   - tokens: in=4823 out=412 cost=$0.0203 latency=2451ms
-   - evidence anchors (per-claim citations):
-       - `Data-center revenue +27% QoQ` ← tool_call_nv001
-       - `H100→H200 transition smooth` ← tool_call_nv002
-   - thesis_text: NVDA's Q2 segment results show data-center revenue accelerating…
-   - conviction_score: 0.72
-   ```
+If the chain isn't found, the CLI exits 1 and lists the 5 most recent chains on stderr to help the user. Surface those alternatives.
 
-4. **Visibility regression detection**: any driver or risk in the parsed output that lacks a matching evidence_anchor is flagged inline with `⚠ ... [NO ANCHOR — visibility regression]`. This is the visibility-axis test of the quality contract — the user sees IMMEDIATELY when the assistant has made a claim it can't anchor.
+## Output format
 
-5. **Error handling**: if no trace file exists for the cited chain_id, return "No trace found for chain_id `<id>`. Available recent chains: <list>" and list the 5 most recent chain_ids from `.research/traces/`.
+Each cascade stage appears as a section:
 
-## Quality contract enforcement
+```
+## stage_2_thesis (claude-sonnet-4-6)
+- chain_id: `20260514T143022-abc123`
+- timestamp: 2026-05-14T14:30:22Z
+- tokens: in=4823 out=412 cost=$0.0203 latency=2451ms
+- evidence anchors (per-claim citations):
+    - `Data-center revenue +27% QoQ` ← tool_call_nv001
+    - `H100→H200 transition smooth` ← tool_call_nv002
+- thesis_text: NVDA's Q2 segment results show data-center revenue accelerating…
+- conviction_score: 0.72
+```
 
-The `/trace` command is the visibility-axis enforcement surface. Every Recommendation produces a trace; every trace must render cleanly; any anchorless claim must be flagged. If `/trace` shows clean output with all anchors present, the visibility floor is met. If `/trace` shows `[NO ANCHOR — visibility regression]` flags, the v1 quality contract is broken for that chain.
+## Visibility regression detection
+
+The CLI automatically flags any `key_drivers` or `risks` claim without a matching `evidence_anchors` entry with `⚠ ... [NO ANCHOR — visibility regression]`. If you see those flags, surface them prominently — they are exactly the visibility-axis failures the quality contract exists to catch.
+
+## Quality contract surface
+
+`/trace` is the user-facing visibility-axis enforcement: every Recommendation should produce a trace; every trace should render cleanly; orphan-claim flags mean the assistant made a claim it can't anchor. This is how the user sees and audits the assistant's reasoning chain.

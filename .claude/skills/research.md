@@ -1,71 +1,72 @@
 ---
 name: research
-description: Single-ticker on-demand due diligence. Invokes the Stage 2 thesis + Stage 3 Skeptic pipeline for one symbol, writes findings into the per-ticker dossier with append-only ledger, and surfaces a layered summary with evidence anchors inline. Usage `/research <TICKER>` or just say "look at NVDA for me" inside CC.
+description: Single-ticker on-demand due diligence. Runs the Stage 2 thesis + Stage 3 Skeptic pipeline for one symbol, writes findings into the per-ticker dossier with append-only ledger, surfaces a layered summary with evidence anchors inline. Usage `/research <TICKER>` or just say "look at NVDA for me" in CC.
 ---
 
-When the user asks for research on a ticker (slash command `/research <TICKER>` or natural-language equivalents like "look at TSLA", "what's the case for AAPL", "dig into NVDA"):
+When the user requests research on a ticker (slash command `/research <TICKER>` or natural-language equivalents like "look at TSLA", "what's the case for AAPL", "dig into NVDA"):
 
-1. **Parse the symbol** from the user's message. Default to uppercase. If ambiguous (e.g. "tesla"), confirm before proceeding.
+## Invocation
 
-2. **Load ticker data via yfinance** — bars (daily, 90-day window), latest quote, recent news (max 15-min cache TTL per spec §95). Compute the TA snapshot needed by Stage 3's momentum-band check:
-   - `return_30d`, `return_90d` from bars
-   - `weekly_rsi_14` from weekly-resampled closes
-   - `volume_5d_trend` (rising/flat/declining via 5d-rolling avg slope)
-   - `earnings_within_days` if known from yfinance calendar
+Run the CLI via Bash:
 
-3. **Build or load WorldState** — if a `.research/briefs/<today-ET>.json` cache exists from today's `/brief`, reuse its world_state. Otherwise build it via the Stage 0 prompt (cheaper than re-running per `/research`).
+```bash
+python -m research_assistant research <TICKER>
+```
 
-4. **Invoke `research_assistant.orchestrator.research_ticker(...)`** with the loaded inputs. The orchestrator runs Stage 2 + Stage 3, writes to the dossier, and returns a `ResearchResult`.
+The CLI handles: yfinance data loading, world-state assembly (or reuse from today's cached brief), Stage 2 thesis (Sonnet), Stage 3 Skeptic (Sonnet), dossier write with append-only ledger validation, evidence-anchor citations, and rendered output.
 
-5. **Render the response** in the terminal:
+Output is human-readable markdown by default; pass `--json` for machine-readable output if you need to chain further commands.
 
-   ```
-   ## NVDA — Research result (chain: 20260514T143022-abc123)
+## Display the output
 
-   **Thesis (Sonnet):**
-   <thesis_text>
+The CLI's stdout IS the research response. Show it directly to the user — it already includes:
+- Thesis text + conviction (pre and post-Skeptic)
+- Key drivers with inline `[anchor: tool_call_X]` citations
+- Named risks
+- Skeptic critique
+- Flagged additional risks
+- Open questions to probe
+- News reactivity flag
+- Session cost so far
+- Dossier path + chain ID
 
-   **Conviction:** 0.62 → 0.55 (post-Skeptic adjustment)
+If any driver renders as `[NO ANCHOR — visibility regression]`, surface that prominently — the user needs to see immediately when the assistant has made an unanchored claim.
 
-   **Key drivers:**
-   - <driver 1> [anchor: tool_call_xy123]
-   - <driver 2> [anchor: tool_call_xy124]
+## On user pushback in the same conversation
 
-   **Risks (named):**
-   - <risk 1>
-   - <risk 2>
+After a research result has been issued in the current conversation, monitor the next user message. If it matches the Defender heuristic (disagreement + no evidence marker), invoke the Defender subagent directly via the Task tool — do NOT capitulate in your conversational layer.
 
-   **Skeptic critique:**
-   <critique_text>
+```python
+# Pseudocode for the Defender invocation
+# (replace with actual Task call)
+Task(
+    subagent_type="defender",
+    description="Defender review on user pushback",
+    prompt=json.dumps({
+        "recommendation": <prior research result summary>,
+        "evidence_anchors": <result.evidence_anchors>,
+        "user_pushback": <user's message>,
+    }),
+)
+```
 
-   **Flagged additional risks:**
-   - <risk a>
-   - <risk b>
+The Defender returns HOLD or REVISE with reasoning. Surface its decision directly. If REVISE, append the revision to the dossier ledger with the new anchor that justified the change.
 
-   **Open questions to probe:**
-   - <question 1>
-   - <question 2>
+To programmatically check whether to fire the Defender, call:
+```bash
+python -c "from research_assistant.orchestrator import should_invoke_defender; print(should_invoke_defender(True, '<user msg>'))"
+```
 
-   **News reactivity flag:** false
-   **Cost so far this session:** $0.12
+## Failure modes
 
-   Dossier appended at `.research/tickers/NVDA.md` (ledger entry tagged with chain ID).
-   Run `/trace 20260514T143022-abc123` to see the full cascade JSONL.
-   ```
-
-6. **Inline anchor citations**: every driver and named claim in the rendered output should cite its evidence anchor from `result.evidence_anchors`. If a claim has no anchor, flag it visually (`[NO ANCHOR — visibility regression]`) and add it to a quality-contract regression report.
-
-7. **On user pushback in the same conversation thread**: check `should_invoke_defender(prior_turn_had_recommendation=True, user_message=<user msg>)`. If true, spawn the Defender subagent via Task tool with the 3-tuple `(recommendation, evidence_anchors, pushback)`. Render the Defender's HOLD/REVISE decision inline.
-
-## Failure modes to surface
-
-- yfinance fetch fails / returns stale data → refuse to produce a thesis. Tell the user "I don't have fresh data on `{symbol}` right now — try again or fix the data path."
-- Stage 2 or Stage 3 JSON parse fails → log the chain_id, surface partial dossier write if any, tell the user to retry.
-- Conviction is very low (`adjusted_score < 0.3`) → surface clearly: "Low conviction — skeptic flagged X. The case here is weak."
+- yfinance fetch failure / insufficient data → CLI exits 1 with stderr explaining. Surface that to the user as "I don't have fresh data on `<symbol>` right now."
+- Missing `ANTHROPIC_API_KEY` → CLI exits 3 with stderr explaining. Surface that to the user.
+- Stage 2 or Stage 3 JSON parse fails → CLI exits 1; chain_id is logged. Suggest retry.
+- Very low conviction (`adjusted_score < 0.3`) → surface plainly: "Low conviction — Skeptic flagged X. Case is weak."
 
 ## Quality contract enforcement points
 
-- **Factual:** every claim has an anchor in `result.evidence_anchors`. Anchorless claims fail visibility regression.
-- **Backbone:** Defender pattern fires on the heuristic — do NOT capitulate in the conversational layer.
-- **Depth:** if Stage 2 output reads as headline-summary level (no filings/transcripts/segment-data references), flag for v1.x evaluator review.
-- **Visibility:** the full cascade trace is captured in `.research/traces/<date>/<chain_id>.jsonl`. The `/trace` skill renders it.
+- **Factual:** every claim has an anchor in `result.evidence_anchors`; orphans are flagged in render.
+- **Backbone:** Defender subagent invoked via the heuristic on pushback — do NOT fold in your conversational layer.
+- **Depth:** Stage 2 prompt mandates fundamentals/filings depth. If output reads as headline-summary level, flag for v1.x evaluator review.
+- **Visibility:** full cascade trace captured at `.research/traces/<date>/<chain_id>.jsonl`. The `/trace` skill renders it.
