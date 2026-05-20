@@ -183,6 +183,7 @@ async def research_ticker(
         raw_response=s2_meta.text if s2_meta else None,
         traces_base=traces_base,
         error=None if stage_2 else "Stage 2 JSON parse failed",
+        symbol=symbol,
     )
     if stage_2 is None:
         raise RuntimeError(f"Stage 2 JSON parse failed for {symbol} (chain={chain})")
@@ -203,6 +204,7 @@ async def research_ticker(
         raw_response=s3_meta.text if s3_meta else None,
         traces_base=traces_base,
         error=None if stage_3 else "Stage 3 JSON parse failed",
+        symbol=symbol,
     )
     if stage_3 is None:
         raise RuntimeError(f"Stage 3 JSON parse failed for {symbol} (chain={chain})")
@@ -308,16 +310,27 @@ def _flatten_anchors_to_corpus(anchors: list) -> str:
 def _citation_resolves(user_message: str, anchors: list) -> bool:
     """
     True iff the user's strong citation tokens (dates, quarters, %, $, bps)
-    each appear in the prior anchor corpus. Returns False when the user
-    supplied only weak markers (e.g., bare "10-K", "per the filing") — those
-    can't be checked against a typed-anchor corpus and so default to
-    unverified, which closes the v1 fake-citation floor (Open Follow-up #2).
+    each appear in the prior anchor corpus with digit/period boundaries
+    on both sides — so "18%" does NOT resolve against a corpus containing
+    "118%" or "18.05%". Returns False when the user supplied only weak
+    markers (e.g., bare "10-K", "per the filing") — those can't be checked
+    against a typed-anchor corpus and so default to unverified.
+
+    Asymmetric notation (`$5B` vs `5 billion`, `$5.0B`) intentionally fails
+    closed — Defender fires. The conservative direction is correct for the
+    BACKBONE axis: over-firing the Defender is safe; under-firing isn't.
     """
     tokens = _extract_strong_tokens(user_message)
     if not tokens:
         return False
     corpus = _flatten_anchors_to_corpus(anchors)
-    return all(t.lower() in corpus for t in tokens)
+    for token in tokens:
+        pattern = re.compile(
+            r"(?<![\d.])" + re.escape(token.lower()) + r"(?![\d.])"
+        )
+        if not pattern.search(corpus):
+            return False
+    return True
 
 
 def should_invoke_defender(

@@ -132,8 +132,15 @@ def append_stage_event(
     raw_response: Optional[str],
     traces_base: Path,
     error: Optional[str] = None,
+    symbol: Optional[str] = None,
 ) -> Path:
-    """Append one StageEvent to the chain's JSONL. Returns the file path."""
+    """Append one StageEvent to the chain's JSONL. Returns the file path.
+
+    `symbol` scopes the event to a specific ticker so multi-survivor brief
+    chains (which share one chain_id across N Stage-2 events) can be
+    filtered downstream (e.g., Defender citation verification picks only
+    the survivor under disagreement).
+    """
     now = datetime.now(timezone.utc)
     date_dir = traces_base / now.strftime("%Y-%m-%d")
     date_dir.mkdir(parents=True, exist_ok=True)
@@ -151,6 +158,7 @@ def append_stage_event(
         "raw_response_truncated": (raw_response or "")[:200],
         "parsed": parsed,
         "error": error,
+        "symbol": symbol,
     }
     with path.open("a") as f:
         f.write(json.dumps(event) + "\n")

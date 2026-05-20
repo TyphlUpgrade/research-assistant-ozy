@@ -54,14 +54,30 @@ The Defender returns HOLD or REVISE with reasoning. Surface its decision directl
 
 To programmatically check whether to fire the Defender, call:
 ```bash
-python -m research_assistant defender-check --user-message "<user msg>" --chain-id <prior_result.chain_id>
+python -m research_assistant defender-check \
+    --user-message "<user msg>" \
+    --chain-id <prior_result.chain_id> \
+    [--ticker <TICKER>]
 ```
 
 Prints `true` (fire Defender) or `false` (orchestrator handles normally). The
 CLI loads `evidence_anchors` from the prior chain's Stage-2 trace events and
-verifies the user's citation tokens against that corpus — uncorroborated
-citations (e.g., "per the 10-K page 47" when no 10-K was actually fetched)
-no longer suppress the Defender (closes v1 known floor §7b / Open Follow-up #2).
+verifies the user's strong citation tokens (dates, quarters, %, $, bps) against
+that corpus with word-boundary matching — uncorroborated citations (e.g., "per
+the 10-K page 47" when no 10-K was actually fetched) no longer suppress the
+Defender (closes the typed-anchor-corpus subset of Open Follow-up #2; full
+cited-document grep is blocked on #9 EDGAR/FRED/transcripts).
+
+**Pass `--ticker` when the prior result was a `/brief` chain** — the brief
+shares one chain_id across all survivors, so the filter scopes verification
+to the survivor the user is actually pushing back on. For `/research` chains
+(single survivor), omit `--ticker`.
+
+Agent loop:
+1. Call `defender-check` with chain_id (and `--ticker` when applicable).
+2. If `true` → invoke `Task(subagent_type="defender", ...)` with the prior
+   recommendation, evidence_anchors, and user pushback.
+3. If `false` → respond to the user directly; orchestrator handles normally.
 
 ## Failure modes
 

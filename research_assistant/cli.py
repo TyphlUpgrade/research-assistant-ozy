@@ -327,15 +327,27 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
 # defender-check
 # ---------------------------------------------------------------------------
 
-def _load_anchors_from_chain(traces_base: Path, chain_id: str) -> list[dict]:
+def _load_anchors_from_chain(
+    traces_base: Path,
+    chain_id: str,
+    *,
+    ticker: Optional[str] = None,
+) -> list[dict]:
     """Pull every Stage-2 thesis's evidence_anchors out of the trace JSONL
     for `chain_id`. Returns the flattened list; raises FileNotFoundError if
-    the chain has no trace on disk."""
+    the chain has no trace on disk.
+
+    When `ticker` is supplied, events are filtered to those whose `symbol`
+    matches (case-insensitive). Events without a `symbol` field — older
+    /research traces written before the field existed — are included so
+    single-ticker chains stay backward-compatible.
+    """
     matches = list(traces_base.rglob(f"{chain_id}.jsonl"))
     if not matches:
         raise FileNotFoundError(
             f"No trace for chain {chain_id} under {traces_base}"
         )
+    target = ticker.upper() if ticker else None
     anchors: list[dict] = []
     for path in matches:
         for line in path.read_text().splitlines():
@@ -348,6 +360,10 @@ def _load_anchors_from_chain(traces_base: Path, chain_id: str) -> list[dict]:
                 continue
             if event.get("stage_id") != "stage_2_thesis":
                 continue
+            if target is not None:
+                event_symbol = event.get("symbol")
+                if event_symbol is not None and event_symbol.upper() != target:
+                    continue
             parsed = event.get("parsed") or {}
             anchors.extend(parsed.get("evidence_anchors") or [])
     return anchors
@@ -359,7 +375,9 @@ def _cmd_defender_check(args: argparse.Namespace) -> int:
     base = _resolve_base(args.base)
     traces_base = base / "traces"
     try:
-        anchors = _load_anchors_from_chain(traces_base, args.chain_id)
+        anchors = _load_anchors_from_chain(
+            traces_base, args.chain_id, ticker=args.ticker,
+        )
     except FileNotFoundError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -475,6 +493,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--chain-id",
         required=True,
         help="Chain ID of the prior research result whose anchors should verify citations",
+    )
+    pdc.add_argument(
+        "--ticker",
+        default=None,
+        help="Scope brief chains to one survivor — verify against only that ticker's "
+             "Stage-2 anchors. Omit for /research chains (single survivor).",
     )
 
     return p

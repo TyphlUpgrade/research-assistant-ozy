@@ -88,7 +88,13 @@ def test_load_prior_universe_snapshot_corrupt_json_falls_through(tmp_path: Path)
 # defender-check
 # ---------------------------------------------------------------------------
 
-def _write_trace(traces_base: Path, chain_id: str, anchors: list[dict]) -> Path:
+def _write_trace(
+    traces_base: Path,
+    chain_id: str,
+    anchors: list[dict],
+    *,
+    symbol: str | None = None,
+) -> Path:
     """Write a one-event trace JSONL file with the given Stage-2 anchors."""
     dated = traces_base / "2026-05-20"
     dated.mkdir(parents=True, exist_ok=True)
@@ -96,9 +102,32 @@ def _write_trace(traces_base: Path, chain_id: str, anchors: list[dict]) -> Path:
     event = {
         "stage_id": "stage_2_thesis",
         "chain_id": chain_id,
+        "symbol": symbol,
         "parsed": {"evidence_anchors": anchors},
     }
     path.write_text(json.dumps(event) + "\n")
+    return path
+
+
+def _append_trace_event(
+    traces_base: Path,
+    chain_id: str,
+    anchors: list[dict],
+    *,
+    symbol: str | None = None,
+    stage_id: str = "stage_2_thesis",
+) -> Path:
+    dated = traces_base / "2026-05-20"
+    dated.mkdir(parents=True, exist_ok=True)
+    path = dated / f"{chain_id}.jsonl"
+    event = {
+        "stage_id": stage_id,
+        "chain_id": chain_id,
+        "symbol": symbol,
+        "parsed": {"evidence_anchors": anchors},
+    }
+    with path.open("a") as f:
+        f.write(json.dumps(event) + "\n")
     return path
 
 
@@ -168,6 +197,113 @@ def test_defender_check_missing_chain_returns_error(tmp_path: Path, capsys) -> N
     rc = cli._cmd_defender_check(ns)
     assert rc == 1
     assert "No trace for chain ghost-chain" in capsys.readouterr().err
+
+
+def test_load_anchors_aggregates_multiple_stage_2_events(tmp_path: Path) -> None:
+    """A brief chain has multiple Stage-2 events (one per survivor). All
+    anchors should be aggregated when no ticker filter is supplied."""
+    traces = tmp_path / "traces"
+    chain = "20260520T000000-multi1"
+    _append_trace_event(traces, chain,
+        anchors=[{"claim": "NVDA +24% 30d", "source": "TICKER_DATA"}],
+        symbol="NVDA",
+    )
+    _append_trace_event(traces, chain,
+        anchors=[{"claim": "TSLA -5% 5d", "source": "TICKER_DATA"}],
+        symbol="TSLA",
+    )
+    all_anchors = cli._load_anchors_from_chain(traces, chain)
+    assert len(all_anchors) == 2
+    claims = {a["claim"] for a in all_anchors}
+    assert claims == {"NVDA +24% 30d", "TSLA -5% 5d"}
+
+
+def test_load_anchors_filters_by_ticker(tmp_path: Path) -> None:
+    """The --ticker filter scopes to one survivor's anchors only — the fix
+    for the architect's HIGH multi-survivor scoping finding."""
+    traces = tmp_path / "traces"
+    chain = "20260520T000000-multi2"
+    _append_trace_event(traces, chain,
+        anchors=[{"claim": "NVDA +24% 30d", "source": "TICKER_DATA"}],
+        symbol="NVDA",
+    )
+    _append_trace_event(traces, chain,
+        anchors=[{"claim": "TSLA -5% 5d", "source": "TICKER_DATA"}],
+        symbol="TSLA",
+    )
+    nvda_only = cli._load_anchors_from_chain(traces, chain, ticker="NVDA")
+    assert len(nvda_only) == 1
+    assert nvda_only[0]["claim"] == "NVDA +24% 30d"
+
+
+def test_load_anchors_ticker_filter_case_insensitive(tmp_path: Path) -> None:
+    traces = tmp_path / "traces"
+    chain = "20260520T000000-case01"
+    _append_trace_event(traces, chain,
+        anchors=[{"claim": "x", "source": "y"}],
+        symbol="NVDA",
+    )
+    assert len(cli._load_anchors_from_chain(traces, chain, ticker="nvda")) == 1
+
+
+def test_load_anchors_ticker_filter_passes_through_legacy_events(tmp_path: Path) -> None:
+    """Events without a `symbol` field (older traces) are included so
+    single-ticker chains stay backward-compatible."""
+    traces = tmp_path / "traces"
+    chain = "20260520T000000-legacy"
+    _append_trace_event(traces, chain,
+        anchors=[{"claim": "legacy event", "source": "x"}],
+        symbol=None,
+    )
+    result = cli._load_anchors_from_chain(traces, chain, ticker="NVDA")
+    assert len(result) == 1
+
+
+def test_load_anchors_skips_corrupt_jsonl_lines(tmp_path: Path) -> None:
+    """A truncated/corrupt line in the trace file should not crash the loader."""
+    traces = tmp_path / "traces" / "2026-05-20"
+    traces.mkdir(parents=True)
+    chain = "20260520T000000-corrupt"
+    path = traces / f"{chain}.jsonl"
+    good_event = {
+        "stage_id": "stage_2_thesis",
+        "chain_id": chain,
+        "symbol": "NVDA",
+        "parsed": {"evidence_anchors": [{"claim": "x", "source": "y"}]},
+    }
+    path.write_text(
+        json.dumps(good_event) + "\n"
+        + "{not valid json\n"
+        + json.dumps(good_event) + "\n"
+    )
+    result = cli._load_anchors_from_chain(tmp_path / "traces", chain)
+    assert len(result) == 2
+
+
+def test_defender_check_brief_scoping_uses_ticker(tmp_path: Path, capsys) -> None:
+    """End-to-end: a TSLA pushback citing "+24% 30d" must NOT verify against
+    the NVDA anchor (also "+24% 30d") when --ticker TSLA scopes the corpus."""
+    traces = tmp_path / "traces"
+    chain = "20260520T000000-scope1"
+    _append_trace_event(traces, chain,
+        anchors=[{"claim": "NVDA delivered +24% 30d return", "source": "TICKER_DATA"}],
+        symbol="NVDA",
+    )
+    _append_trace_event(traces, chain,
+        anchors=[{"claim": "TSLA delivered -8% 5d return", "source": "TICKER_DATA"}],
+        symbol="TSLA",
+    )
+    ns = cli._build_parser().parse_args([
+        "--base", str(tmp_path),
+        "defender-check",
+        "--user-message", "I disagree, your +24% number is wrong",
+        "--chain-id", chain,
+        "--ticker", "TSLA",
+    ])
+    rc = cli._cmd_defender_check(ns)
+    assert rc == 0
+    # +24% appears in NVDA's anchor but TSLA filter scopes it out → fires
+    assert capsys.readouterr().out.strip() == "true"
 
 
 def test_parser_trace_required_chain_id() -> None:

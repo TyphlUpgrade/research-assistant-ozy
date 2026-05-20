@@ -156,3 +156,53 @@ def test_fires_when_corpus_empty_even_with_strong_token() -> None:
         user_message="I disagree, your 18% is wrong.",
         prior_evidence_anchors=[],
     ) is True
+
+
+# ---------------------------------------------------------------------------
+# Adversarial cases: substring-containment false positives must be rejected
+# (the bug the code-reviewer + architect both caught in 99d1cb9)
+# ---------------------------------------------------------------------------
+
+def test_fires_when_user_token_is_digit_prefix_of_corpus_value() -> None:
+    """'18%' must NOT resolve against a corpus containing '118%'."""
+    assert should_invoke_defender(
+        prior_turn_had_recommendation=True,
+        user_message="I disagree, revenue is down 18%.",
+        prior_evidence_anchors=[{"claim": "YoY growth of 118%", "source": "headlines"}],
+    ) is True
+
+
+def test_fires_when_user_percentage_is_decimal_prefix_of_corpus_value() -> None:
+    """'18.05%' must NOT resolve against a corpus containing '+118.05%'."""
+    assert should_invoke_defender(
+        prior_turn_had_recommendation=True,
+        user_message="I disagree, your +18.05% number is wrong.",
+        prior_evidence_anchors=[{"claim": "30-day return +118.05% with price above EMA", "source": "TICKER_DATA"}],
+    ) is True
+
+
+def test_fires_when_user_dollar_is_prefix_of_corpus_value() -> None:
+    """'$5' must NOT resolve against a corpus containing '$500M'."""
+    assert should_invoke_defender(
+        prior_turn_had_recommendation=True,
+        user_message="I disagree, revenue was $5.",
+        prior_evidence_anchors=[{"claim": "Quarterly revenue $500M", "source": "headlines"}],
+    ) is True
+
+
+def test_fires_when_user_bps_is_prefix_of_corpus_value() -> None:
+    """'200 bps' must NOT resolve against a corpus containing '1200 bps'."""
+    assert should_invoke_defender(
+        prior_turn_had_recommendation=True,
+        user_message="I disagree, spread widened 200 bps.",
+        prior_evidence_anchors=[{"claim": "Spread widened 1200 bps YoY", "source": "headlines"}],
+    ) is True
+
+
+def test_resolves_when_percentage_matches_with_boundary() -> None:
+    """The previous bug-fix's defensive boundary must NOT block real matches."""
+    assert should_invoke_defender(
+        prior_turn_had_recommendation=True,
+        user_message="I disagree, the +18% is too low.",
+        prior_evidence_anchors=[{"claim": "30-day return +18% with price above EMA20", "source": "TICKER_DATA"}],
+    ) is False

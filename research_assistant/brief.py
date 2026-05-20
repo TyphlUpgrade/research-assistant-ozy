@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo
 
 from research_assistant.claude_sdk import ClaudeClient
 from research_assistant.orchestrator import _load_prompt, _render, _chain_id
+from research_assistant.trace_renderer import append_stage_event
 from ozymandias.intelligence.claude_json import parse_claude_response
 
 log = logging.getLogger(__name__)
@@ -122,12 +123,34 @@ async def _stage_2_for_survivor(
     stage_1_result: dict,
     headlines: list[dict],
     semaphore: asyncio.Semaphore,
+    *,
+    chain_id: str,
+    traces_base: Path,
 ) -> Optional[dict]:
-    """Stage 2 thesis for one survivor, semaphore-bounded."""
+    """Stage 2 thesis for one survivor, semaphore-bounded.
+
+    Emits a `stage_2_thesis` trace event stamped with the survivor's symbol
+    so downstream Defender citation verification can scope the anchor corpus
+    to one survivor (the chain_id is shared across all survivors in a brief).
+    """
     async with semaphore:
         from research_assistant.orchestrator import _stage_2_thesis
-        stage_2, _meta = await _stage_2_thesis(
+        stage_2, s2_meta = await _stage_2_thesis(
             client, world_state, ticker_data, stage_1_result, headlines
+        )
+        append_stage_event(
+            chain_id=chain_id,
+            stage_id="stage_2_thesis",
+            model=s2_meta.model if s2_meta else "unknown",
+            tokens_in=s2_meta.input_tokens if s2_meta else 0,
+            tokens_out=s2_meta.output_tokens if s2_meta else 0,
+            cost_usd=s2_meta.cost_usd if s2_meta else 0.0,
+            latency_ms=s2_meta.latency_ms if s2_meta else 0,
+            parsed=stage_2,
+            raw_response=s2_meta.text if s2_meta else None,
+            traces_base=traces_base,
+            error=None if stage_2 else "Stage 2 JSON parse failed",
+            symbol=stage_1_result.get("ticker"),
         )
         return stage_2
 
@@ -199,6 +222,7 @@ async def build_brief(
 
     # Stage 2 — parallel theses with semaphore cap
     semaphore = asyncio.Semaphore(_STAGE_2_CONCURRENCY)
+    traces_base = research_base / "traces"
     stage_2_tasks = [
         _stage_2_for_survivor(
             client,
@@ -207,6 +231,8 @@ async def build_brief(
             s,
             headlines_per_ticker.get(s["ticker"], []),
             semaphore,
+            chain_id=chain,
+            traces_base=traces_base,
         )
         for s in survivors
     ]
