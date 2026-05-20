@@ -69,6 +69,10 @@ class Brief:
     world_state: dict
     items: list[BriefItem]
     cost_usd: float
+    # Tickers fed into Stage 1; persisted so `/brief --refresh` re-runs the
+    # LLM pipeline against the same universe without intra-day Yahoo drift.
+    # Pass --rediscover (or --static-only) to override.
+    discovered_universe: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +139,7 @@ async def _stage_2_for_survivor(
 async def build_brief(
     *,
     market_context: dict,
+    universe: list[str],
     watchlist_tickers_with_data: dict[str, dict],
     headlines_per_ticker: dict[str, list[dict]],
     research_base: Path,
@@ -230,6 +235,7 @@ async def build_brief(
         world_state=world_state,
         items=items,
         cost_usd=client.cost.total_usd,
+        discovered_universe=list(universe),
     )
 
     # Cache to .research/briefs/<date-ET>.json — used by SessionStart hook
@@ -256,6 +262,7 @@ async def build_brief(
             for i in brief.items
         ],
         "cost_usd": brief.cost_usd,
+        "discovered_universe": brief.discovered_universe,
     }
     cache_path.write_text(json.dumps(cache_payload, indent=2))
 

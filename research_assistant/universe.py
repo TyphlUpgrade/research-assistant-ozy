@@ -8,10 +8,15 @@ Nasdaq 100 index constituents). Russell 2000 is intentionally off — gated by
 
 Ozy's fetcher swallows network failures and returns `[]`, so a flaky Yahoo
 screener degrades to pins-only without exceptions.
+
+A module-level `UniverseFetcher` singleton honors Ozy's 24h Source B
+Wikipedia cache — instantiating fresh each call would defeat it. Tests
+bypass the singleton by passing `fetcher=` explicitly.
 """
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from ozymandias.intelligence.universe_fetcher import UniverseFetcher
 
@@ -19,11 +24,34 @@ log = logging.getLogger(__name__)
 
 DEFAULT_CAP = 30
 
+_FETCHER: Optional[UniverseFetcher] = None
 
-async def discover_universe(pins: list[str], cap: int = DEFAULT_CAP) -> list[str]:
+
+def _get_fetcher() -> UniverseFetcher:
+    global _FETCHER
+    if _FETCHER is None:
+        _FETCHER = UniverseFetcher(no_entry_symbols=None, cascade_config=None)
+    return _FETCHER
+
+
+def _reset_fetcher_cache() -> None:
+    """Test hook: drop the cached fetcher so the next call re-constructs."""
+    global _FETCHER
+    _FETCHER = None
+
+
+async def discover_universe(
+    pins: list[str],
+    cap: int = DEFAULT_CAP,
+    fetcher: Optional[UniverseFetcher] = None,
+) -> list[str]:
     """
     Return up to `cap` tickers: pins first (in order), then dynamic discovery
     deduped against pins, truncated to `cap`.
+
+    Pass `fetcher` to inject a custom (typically mocked) UniverseFetcher;
+    when None, the module singleton is used so Ozy's 24h Source B cache
+    stays warm across briefs in the same process.
     """
     if cap <= 0:
         return []
@@ -35,7 +63,7 @@ async def discover_universe(pins: list[str], cap: int = DEFAULT_CAP) -> list[str
     if len(result) >= cap:
         return result[:cap]
 
-    fetcher = UniverseFetcher(no_entry_symbols=None, cascade_config=None)
+    fetcher = fetcher if fetcher is not None else _get_fetcher()
     discovered = await fetcher.get_universe()
 
     for sym in discovered:

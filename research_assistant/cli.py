@@ -44,6 +44,19 @@ def _setup_logging(quiet: bool) -> None:
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
 
 
+def _load_prior_universe_snapshot(cache_path: Path) -> list[str]:
+    """Return `discovered_universe` from a prior brief cache, or [] when
+    the file is missing, unreadable, or pre-dates the field."""
+    if not cache_path.exists():
+        return []
+    try:
+        prior = json.loads(cache_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        logging.warning("Prior brief cache unreadable, falling through: %s", exc)
+        return []
+    return list(prior.get("discovered_universe") or [])
+
+
 def _require_api_key(quiet: bool) -> Optional[str]:
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
@@ -228,16 +241,32 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
             world_state=raw["world_state"],
             items=[BriefItem(**i) for i in raw["items"]],
             cost_usd=raw.get("cost_usd", 0.0),
+            discovered_universe=raw.get("discovered_universe", []),
         )
     else:
         adapter = YFinanceAdapter()
         pins = load_watchlist(base)
+
+        # Universe resolution. To keep `--refresh` deterministic within the
+        # ET day, reuse the prior cache's `discovered_universe` snapshot when
+        # one is available. `--rediscover` and `--static-only` force fresh
+        # resolution (overriding any snapshot).
+        prior_snapshot: list[str] = []
+        if not args.rediscover and not args.static_only:
+            prior_snapshot = _load_prior_universe_snapshot(cache_path)
+
         if args.static_only:
             universe = pins
             source_label = "static watchlist"
+        elif prior_snapshot:
+            universe = prior_snapshot
+            source_label = "snapshot reused from prior cache"
         else:
             universe = await discover_universe(pins=pins, cap=30)
-            source_label = f"{len(pins)} pinned + {len(universe) - len(pins)} discovered"
+            pins_set = {p.upper() for p in pins}
+            pinned_in_universe = sum(1 for t in universe if t in pins_set)
+            discovered_count = len(universe) - pinned_in_universe
+            source_label = f"{pinned_in_universe} pinned + {discovered_count} discovered"
         if not universe:
             print(
                 f"ERROR: universe is empty. Add tickers to {base}/watchlist.txt "
@@ -261,6 +290,7 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
         )
         brief = await build_brief(
             market_context=market_context,
+            universe=universe,
             watchlist_tickers_with_data=tickers_with_data,
             headlines_per_ticker=headlines_per_ticker,
             research_base=base,
@@ -373,6 +403,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--static-only",
         action="store_true",
         help="Use only .research/watchlist.txt (skip Yahoo screener discovery)",
+    )
+    pb.add_argument(
+        "--rediscover",
+        action="store_true",
+        help="Re-run Yahoo screener discovery instead of reusing today's cached snapshot",
     )
 
     pt = sub.add_parser("trace", help="Render a cascade trace by chain_id")

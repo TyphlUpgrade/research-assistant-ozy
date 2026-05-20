@@ -46,6 +46,44 @@ def test_parser_brief_with_drilldown() -> None:
     assert ns.refresh is True
 
 
+def test_parser_brief_default_flags_false() -> None:
+    parser = cli._build_parser()
+    ns = parser.parse_args(["brief"])
+    assert ns.refresh is False
+    assert ns.static_only is False
+    assert ns.rediscover is False
+
+
+def test_parser_brief_static_only_and_rediscover() -> None:
+    parser = cli._build_parser()
+    ns = parser.parse_args(["brief", "--refresh", "--static-only", "--rediscover"])
+    assert ns.refresh is True
+    assert ns.static_only is True
+    assert ns.rediscover is True
+
+
+def test_load_prior_universe_snapshot_missing_file(tmp_path: Path) -> None:
+    assert cli._load_prior_universe_snapshot(tmp_path / "absent.json") == []
+
+
+def test_load_prior_universe_snapshot_old_format_no_field(tmp_path: Path) -> None:
+    cache = tmp_path / "old.json"
+    cache.write_text('{"date_et": "2026-05-20", "items": []}')
+    assert cli._load_prior_universe_snapshot(cache) == []
+
+
+def test_load_prior_universe_snapshot_returns_persisted_tickers(tmp_path: Path) -> None:
+    cache = tmp_path / "today.json"
+    cache.write_text('{"discovered_universe": ["AAPL", "NVDA", "TSLA"]}')
+    assert cli._load_prior_universe_snapshot(cache) == ["AAPL", "NVDA", "TSLA"]
+
+
+def test_load_prior_universe_snapshot_corrupt_json_falls_through(tmp_path: Path) -> None:
+    cache = tmp_path / "broken.json"
+    cache.write_text("{not valid json")
+    assert cli._load_prior_universe_snapshot(cache) == []
+
+
 def test_parser_trace_required_chain_id() -> None:
     parser = cli._build_parser()
     ns = parser.parse_args(["trace", "20260514T093000-deadbeef"])
