@@ -98,7 +98,7 @@ async def _stage_0_world_state(client: ClaudeClient, context: dict) -> Optional[
     template = _load_prompt("world_state")
     prompt = _render(template, context_json=json.dumps(context, indent=2))
     raw = await client.call(prompt, model="claude-sonnet-4-6")
-    return parse_claude_response(raw)
+    return parse_claude_response(raw.text)
 
 
 async def _stage_1_filter(
@@ -108,7 +108,7 @@ async def _stage_1_filter(
     prompt = _render(template, candidates_json=json.dumps(candidates, indent=2))
     system = f"WORLD_STATE:\n{json.dumps(world_state, indent=2)}"
     raw = await client.call(prompt, model="claude-haiku-4-5-20251001", system=system)
-    return parse_claude_response(raw)
+    return parse_claude_response(raw.text)
 
 
 async def _stage_2_for_survivor(
@@ -122,9 +122,10 @@ async def _stage_2_for_survivor(
     """Stage 2 thesis for one survivor, semaphore-bounded."""
     async with semaphore:
         from research_assistant.orchestrator import _stage_2_thesis
-        return await _stage_2_thesis(
+        stage_2, _meta = await _stage_2_thesis(
             client, world_state, ticker_data, stage_1_result, headlines
         )
+        return stage_2
 
 
 # ---------------------------------------------------------------------------
