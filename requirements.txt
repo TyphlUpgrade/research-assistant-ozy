@@ -4,6 +4,11 @@ anthropic>=0.40.0
 # YAML frontmatter parsing for dossiers
 python-frontmatter>=1.1.0
 
+# HTML parser used by Ozy's universe_fetcher for S&P 500 / Nasdaq 100
+# constituents (pandas.read_html → lxml backend); without it Source B
+# silently degrades to Source A (Yahoo screeners) only.
+lxml>=5.0.0
+
 # Ozy modules (editable install from sibling repo)
 # Run separately: pip install -e /home/typhlupgrade/.local/share/ozy-bot-v3
 

@@ -209,6 +209,7 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
         build_world_state_input,
         load_watchlist_data,
     )
+    from research_assistant.universe import discover_universe
 
     base = _resolve_base(args.base)
     today_et = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
@@ -230,24 +231,33 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
         )
     else:
         adapter = YFinanceAdapter()
-        watchlist = load_watchlist(base)
-        if not watchlist:
+        pins = load_watchlist(base)
+        if args.static_only:
+            universe = pins
+            source_label = "static watchlist"
+        else:
+            universe = await discover_universe(pins=pins, cap=30)
+            source_label = f"{len(pins)} pinned + {len(universe) - len(pins)} discovered"
+        if not universe:
             print(
-                f"ERROR: watchlist is empty (looked at {base}/watchlist.txt). "
-                "Add tickers one-per-line and retry.",
+                f"ERROR: universe is empty. Add tickers to {base}/watchlist.txt "
+                "one-per-line, or drop --static-only so Yahoo screeners can fill in.",
                 file=sys.stderr,
             )
             return 1
         if not args.quiet:
-            print(f"Building brief over {len(watchlist)} watchlist tickers…",
+            print(f"Building brief over {len(universe)} tickers ({source_label})…",
                   file=sys.stderr)
 
-        # Market context for Stage 0 input
+        # Market context for Stage 0 input — keep headlines anchored to pinned
+        # names (or the first 5 universe entries when no pins exist) to bound
+        # the Stage 0 news cost.
+        news_seed = pins[:5] if pins else universe[:5]
         market_context = await build_world_state_input(
-            adapter, watchlist_news_for=watchlist[:5]  # only first 5 to limit cost
+            adapter, watchlist_news_for=news_seed,
         )
         tickers_with_data, headlines_per_ticker = await load_watchlist_data(
-            watchlist, adapter
+            universe, adapter
         )
         brief = await build_brief(
             market_context=market_context,
@@ -356,9 +366,14 @@ def _build_parser() -> argparse.ArgumentParser:
     pr = sub.add_parser("research", help="Single-ticker full DD")
     pr.add_argument("ticker", help="Stock symbol, e.g. NVDA")
 
-    pb = sub.add_parser("brief", help="Morning summary over watchlist")
+    pb = sub.add_parser("brief", help="Morning summary over watchlist + dynamic universe")
     pb.add_argument("--refresh", action="store_true", help="Bypass today's cache and rebuild")
     pb.add_argument("--ticker", help="Drill-down on a specific ticker from the brief")
+    pb.add_argument(
+        "--static-only",
+        action="store_true",
+        help="Use only .research/watchlist.txt (skip Yahoo screener discovery)",
+    )
 
     pt = sub.add_parser("trace", help="Render a cascade trace by chain_id")
     pt.add_argument("chain_id", help="Chain ID printed at end of a research/brief result")

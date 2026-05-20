@@ -42,6 +42,10 @@ ALLOWED_OZY_PREFIXES = {
     "ozymandias.intelligence.technical_analysis",
     "ozymandias.intelligence.claude_json",
     "ozymandias.intelligence.context_compressor",  # pure compute
+    # universe_fetcher graduated v1.x: Ozy momentum-blindspot fix landed
+    # (commit f07f526 — score-cascade replaces intraday momentum loop),
+    # making the lift safe per Open Follow-up #1.
+    "ozymandias.intelligence.universe_fetcher",
     "ozymandias.core",
     "ozymandias.core.config",
     "ozymandias.core.market_context",
@@ -77,7 +81,6 @@ FORBIDDEN_MODULE_PATTERNS = {
     "ozymandias.intelligence.skeptic",          # research forks the Skeptic prompts
     "ozymandias.intelligence.portfolio_fit",    # skipped per spec
     "ozymandias.intelligence.opportunity_ranker",  # retired in Ozy, never used here
-    "ozymandias.intelligence.universe_fetcher",  # not in v1 lift list
     "ozymandias.intelligence.universe_scanner",  # not in v1 lift list
     "ozymandias.intelligence.claude_reasoning",  # use claude_json submodule instead
 }
