@@ -324,6 +324,56 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# defender-check
+# ---------------------------------------------------------------------------
+
+def _load_anchors_from_chain(traces_base: Path, chain_id: str) -> list[dict]:
+    """Pull every Stage-2 thesis's evidence_anchors out of the trace JSONL
+    for `chain_id`. Returns the flattened list; raises FileNotFoundError if
+    the chain has no trace on disk."""
+    matches = list(traces_base.rglob(f"{chain_id}.jsonl"))
+    if not matches:
+        raise FileNotFoundError(
+            f"No trace for chain {chain_id} under {traces_base}"
+        )
+    anchors: list[dict] = []
+    for path in matches:
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("stage_id") != "stage_2_thesis":
+                continue
+            parsed = event.get("parsed") or {}
+            anchors.extend(parsed.get("evidence_anchors") or [])
+    return anchors
+
+
+def _cmd_defender_check(args: argparse.Namespace) -> int:
+    from research_assistant.orchestrator import should_invoke_defender
+
+    base = _resolve_base(args.base)
+    traces_base = base / "traces"
+    try:
+        anchors = _load_anchors_from_chain(traces_base, args.chain_id)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    fire = should_invoke_defender(
+        prior_turn_had_recommendation=True,
+        user_message=args.user_message,
+        prior_evidence_anchors=anchors,
+    )
+    print("true" if fire else "false")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # trace <CHAIN_ID>
 # ---------------------------------------------------------------------------
 
@@ -416,6 +466,17 @@ def _build_parser() -> argparse.ArgumentParser:
     pd = sub.add_parser("dossier", help="Print the current per-ticker dossier")
     pd.add_argument("ticker", help="Stock symbol")
 
+    pdc = sub.add_parser(
+        "defender-check",
+        help="Decide whether the Defender subagent should fire on user pushback",
+    )
+    pdc.add_argument("--user-message", required=True, help="The user's pushback text")
+    pdc.add_argument(
+        "--chain-id",
+        required=True,
+        help="Chain ID of the prior research result whose anchors should verify citations",
+    )
+
     return p
 
 
@@ -424,10 +485,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     _setup_logging(args.quiet)
 
     handlers = {
-        "research": lambda a: asyncio.run(_cmd_research(a)),
-        "brief":    lambda a: asyncio.run(_cmd_brief(a)),
-        "trace":    _cmd_trace,
-        "dossier":  _cmd_dossier,
+        "research":       lambda a: asyncio.run(_cmd_research(a)),
+        "brief":          lambda a: asyncio.run(_cmd_brief(a)),
+        "trace":          _cmd_trace,
+        "dossier":        _cmd_dossier,
+        "defender-check": _cmd_defender_check,
     }
     handler = handlers.get(args.cmd)
     if handler is None:

@@ -84,6 +84,92 @@ def test_load_prior_universe_snapshot_corrupt_json_falls_through(tmp_path: Path)
     assert cli._load_prior_universe_snapshot(cache) == []
 
 
+# ---------------------------------------------------------------------------
+# defender-check
+# ---------------------------------------------------------------------------
+
+def _write_trace(traces_base: Path, chain_id: str, anchors: list[dict]) -> Path:
+    """Write a one-event trace JSONL file with the given Stage-2 anchors."""
+    dated = traces_base / "2026-05-20"
+    dated.mkdir(parents=True, exist_ok=True)
+    path = dated / f"{chain_id}.jsonl"
+    event = {
+        "stage_id": "stage_2_thesis",
+        "chain_id": chain_id,
+        "parsed": {"evidence_anchors": anchors},
+    }
+    path.write_text(json.dumps(event) + "\n")
+    return path
+
+
+def test_parser_defender_check_requires_both_args() -> None:
+    parser = cli._build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["defender-check"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["defender-check", "--user-message", "x"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["defender-check", "--chain-id", "y"])
+
+
+def test_load_anchors_from_chain_reads_stage_2_only(tmp_path: Path) -> None:
+    """Other stage events in the trace are ignored — only stage_2_thesis."""
+    traces = tmp_path / "traces"
+    chain = "20260520T000000-test01"
+    _write_trace(traces, chain, [{"claim": "30d +18%", "source": "TICKER_DATA"}])
+    anchors = cli._load_anchors_from_chain(traces, chain)
+    assert anchors == [{"claim": "30d +18%", "source": "TICKER_DATA"}]
+
+
+def test_load_anchors_from_chain_missing_raises(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError):
+        cli._load_anchors_from_chain(tmp_path / "traces", "no-such-chain")
+
+
+def test_defender_check_returns_false_on_verified_citation(tmp_path: Path, capsys) -> None:
+    traces = tmp_path / "traces"
+    chain = "20260520T000000-verif1"
+    _write_trace(traces, chain, [{"claim": "30-day return +18.05%", "source": "TICKER_DATA"}])
+    ns = cli._build_parser().parse_args([
+        "--base", str(tmp_path),
+        "defender-check",
+        "--user-message", "I disagree, your +18.05% number is wrong",
+        "--chain-id", chain,
+    ])
+    rc = cli._cmd_defender_check(ns)
+    assert rc == 0
+    out = capsys.readouterr().out.strip()
+    assert out == "false"
+
+
+def test_defender_check_returns_true_on_uncorroborated_citation(tmp_path: Path, capsys) -> None:
+    traces = tmp_path / "traces"
+    chain = "20260520T000000-uncorr"
+    _write_trace(traces, chain, [{"claim": "ADX 33 confirms trend", "source": "TICKER_DATA"}])
+    ns = cli._build_parser().parse_args([
+        "--base", str(tmp_path),
+        "defender-check",
+        "--user-message", "I disagree, the 10-K page 47 shows 18%",
+        "--chain-id", chain,
+    ])
+    rc = cli._cmd_defender_check(ns)
+    assert rc == 0
+    out = capsys.readouterr().out.strip()
+    assert out == "true"
+
+
+def test_defender_check_missing_chain_returns_error(tmp_path: Path, capsys) -> None:
+    ns = cli._build_parser().parse_args([
+        "--base", str(tmp_path),
+        "defender-check",
+        "--user-message", "I disagree",
+        "--chain-id", "ghost-chain",
+    ])
+    rc = cli._cmd_defender_check(ns)
+    assert rc == 1
+    assert "No trace for chain ghost-chain" in capsys.readouterr().err
+
+
 def test_parser_trace_required_chain_id() -> None:
     parser = cli._build_parser()
     ns = parser.parse_args(["trace", "20260514T093000-deadbeef"])

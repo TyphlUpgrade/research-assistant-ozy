@@ -194,11 +194,25 @@ class TestAxis2Backbone:
         ) is True
 
     def test_named_new_evidence_does_not_trigger_defender(self) -> None:
-        """User cites Q1 FY25 earnings call → new evidence → normal flow handles."""
+        """User cites Q1 FY25 earnings call AND the prior anchor corpus
+        contains Q1 FY25 → citation is verifiable → normal flow handles
+        (v1.x Open Follow-up #2 closes the bare-citation suppression floor)."""
+        anchors = [{"claim": "Q1 FY25 results beat consensus", "source": "yfinance:news:item_3"}]
         assert should_invoke_defender(
             prior_turn_had_recommendation=True,
             user_message="I disagree — Q1 FY25 call yesterday showed deceleration.",
+            prior_evidence_anchors=anchors,
         ) is False
+
+    def test_uncorroborated_citation_triggers_defender(self) -> None:
+        """v1.x closes the v1 floor: a Q1 FY25 citation with no corresponding
+        anchor in the prior research corpus is treated as unverified, so
+        Defender fires (no capitulation to fabricated citations)."""
+        assert should_invoke_defender(
+            prior_turn_had_recommendation=True,
+            user_message="I disagree — Q1 FY25 call yesterday showed deceleration.",
+            prior_evidence_anchors=[{"claim": "DC revenue +27% QoQ", "source": "yfinance:NVDA:item_1"}],
+        ) is True
 
     def test_simple_question_does_not_trigger_defender(self) -> None:
         """'Are you sure?' is conversational — must not waste an Opus call."""

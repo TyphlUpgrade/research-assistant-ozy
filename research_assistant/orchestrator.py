@@ -275,18 +275,72 @@ _EVIDENCE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Tokens that count as *specific* citation evidence (and so are checkable
+# against the anchor corpus). Document-type words alone ("10-K", "filing")
+# and pure citation phrases ("per the X") do NOT appear here — those need
+# accompanying specifics to count as verifiable.
+_STRONG_TOKEN_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}\b|"            # ISO date
+    r"\bQ[1-4]\s+(?:FY|20)\d{2,4}\b|"    # Q1 FY25 / Q1 2025
+    r"\d+(?:\.\d+)?\s*%|"                # 18% / 3.5%
+    r"\$\d+(?:[.,]\d+)?\s*[BMK]?\b|"     # $5 / $5.2M / $500K
+    r"\b\d+\s*bps\b",                    # 200 bps
+    re.IGNORECASE,
+)
 
-def should_invoke_defender(prior_turn_had_recommendation: bool, user_message: str) -> bool:
+
+def _extract_strong_tokens(text: str) -> list[str]:
+    return [m.group(0).strip() for m in _STRONG_TOKEN_RE.finditer(text)]
+
+
+def _flatten_anchors_to_corpus(anchors: list) -> str:
+    """Join {claim, source} dicts (or bare strings) into one lowercased blob
+    suitable for substring containment checks."""
+    parts: list[str] = []
+    for a in anchors or []:
+        if isinstance(a, dict):
+            parts.extend(str(v) for v in a.values())
+        else:
+            parts.append(str(a))
+    return " ".join(parts).lower()
+
+
+def _citation_resolves(user_message: str, anchors: list) -> bool:
     """
-    3-condition AND per Critic iter1 #11:
+    True iff the user's strong citation tokens (dates, quarters, %, $, bps)
+    each appear in the prior anchor corpus. Returns False when the user
+    supplied only weak markers (e.g., bare "10-K", "per the filing") — those
+    can't be checked against a typed-anchor corpus and so default to
+    unverified, which closes the v1 fake-citation floor (Open Follow-up #2).
+    """
+    tokens = _extract_strong_tokens(user_message)
+    if not tokens:
+        return False
+    corpus = _flatten_anchors_to_corpus(anchors)
+    return all(t.lower() in corpus for t in tokens)
+
+
+def should_invoke_defender(
+    prior_turn_had_recommendation: bool,
+    user_message: str,
+    prior_evidence_anchors: Optional[list] = None,
+) -> bool:
+    """
+    Fire Defender iff:
     1. Prior turn produced a Recommendation (caller tracks this)
-    2. User message expresses disagreement (regex match)
-    3. User message contains NO evidence markers (regex non-match)
+    2. User message expresses disagreement
+    3. User message has no evidence markers OR its strong-token citation
+       does not resolve against `prior_evidence_anchors`.
+
+    `prior_evidence_anchors` defaults to None (empty corpus), which means
+    any cited evidence is unverified and Defender fires. Passing the prior
+    Stage-2 anchors enables the corpus check that closes the fake-citation
+    floor (Open Follow-up #2 from the v1 plan).
     """
     if not prior_turn_had_recommendation:
         return False
     if not _DISAGREEMENT_RE.search(user_message):
         return False
-    if _EVIDENCE_RE.search(user_message):
-        return False  # has evidence — let the orchestrator handle it normally
-    return True
+    if not _EVIDENCE_RE.search(user_message):
+        return True  # bare disagreement
+    return not _citation_resolves(user_message, prior_evidence_anchors or [])

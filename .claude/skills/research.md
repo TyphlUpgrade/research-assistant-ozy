@@ -54,8 +54,14 @@ The Defender returns HOLD or REVISE with reasoning. Surface its decision directl
 
 To programmatically check whether to fire the Defender, call:
 ```bash
-python -c "from research_assistant.orchestrator import should_invoke_defender; print(should_invoke_defender(True, '<user msg>'))"
+python -m research_assistant defender-check --user-message "<user msg>" --chain-id <prior_result.chain_id>
 ```
+
+Prints `true` (fire Defender) or `false` (orchestrator handles normally). The
+CLI loads `evidence_anchors` from the prior chain's Stage-2 trace events and
+verifies the user's citation tokens against that corpus — uncorroborated
+citations (e.g., "per the 10-K page 47" when no 10-K was actually fetched)
+no longer suppress the Defender (closes v1 known floor §7b / Open Follow-up #2).
 
 ## Failure modes
 
