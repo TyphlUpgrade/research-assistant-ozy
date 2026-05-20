@@ -199,6 +199,17 @@ def test_defender_check_missing_chain_returns_error(tmp_path: Path, capsys) -> N
     assert "No trace for chain ghost-chain" in capsys.readouterr().err
 
 
+def test_load_anchors_rejects_malformed_chain_id(tmp_path: Path) -> None:
+    """Defense-in-depth: chain_id must match the canonical token format
+    before being passed to rglob."""
+    with pytest.raises(ValueError, match="Invalid chain_id format"):
+        cli._load_anchors_from_chain(tmp_path / "traces", "../../etc/passwd")
+    with pytest.raises(ValueError, match="Invalid chain_id format"):
+        cli._load_anchors_from_chain(tmp_path / "traces", "chain*id")
+    with pytest.raises(ValueError, match="Invalid chain_id format"):
+        cli._load_anchors_from_chain(tmp_path / "traces", "short")
+
+
 def test_load_anchors_aggregates_multiple_stage_2_events(tmp_path: Path) -> None:
     """A brief chain has multiple Stage-2 events (one per survivor). All
     anchors should be aggregated when no ticker filter is supplied."""

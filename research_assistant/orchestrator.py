@@ -270,7 +270,10 @@ _DISAGREEMENT_RE = re.compile(
 )
 _EVIDENCE_RE = re.compile(
     r"(\b\d{4}-\d{2}-\d{2}\b|"           # ISO date
-    r"\bQ[1-4]\s+(FY|20)\d{2,4}\b|"      # earnings call ref
+    r"\bQ[1-4]\s+(FY|20)\d{2,4}\b|"      # Q1 FY25 / Q1 2025
+    r"\b[1-4]Q\d{2,4}\b|"                # 3Q24
+    r"\b[1-4]H\d{2,4}\b|"                # 1H25
+    r"\bFY\d{2,4}\b|"                    # FY2025
     r"\bper\s+the\b|\baccording\s+to\b|"  # citation markers
     r"\b10-?[QK]\b|\bfiling\b|\btranscript\b|"  # filing refs
     r"\$\d|\d+\s*%|\bbps\b)",            # numeric/financial
@@ -284,6 +287,9 @@ _EVIDENCE_RE = re.compile(
 _STRONG_TOKEN_RE = re.compile(
     r"\b\d{4}-\d{2}-\d{2}\b|"            # ISO date
     r"\bQ[1-4]\s+(?:FY|20)\d{2,4}\b|"    # Q1 FY25 / Q1 2025
+    r"\b[1-4]Q\d{2,4}\b|"                # 3Q24 / 2Q2025
+    r"\b[1-4]H\d{2,4}\b|"                # 1H25 / 2H2024
+    r"\bFY\d{2,4}\b|"                    # FY25 / FY2025 (bare)
     r"\d+(?:\.\d+)?\s*%|"                # 18% / 3.5%
     r"\$\d+(?:[.,]\d+)?\s*[BMK]?\b|"     # $5 / $5.2M / $500K
     r"\b\d+\s*bps\b",                    # 200 bps

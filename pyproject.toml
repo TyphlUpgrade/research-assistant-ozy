@@ -10,9 +10,6 @@ requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.40.0",
     "python-frontmatter>=1.1.0",
-    # lxml backs Ozy universe_fetcher's S&P 500 / Nasdaq 100 source
-    # (pandas.read_html). Source B silently degrades without it.
-    "lxml>=5.0.0",
 ]
 
 [project.optional-dependencies]

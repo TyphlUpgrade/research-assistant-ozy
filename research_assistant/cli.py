@@ -34,6 +34,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -327,6 +328,9 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
 # defender-check
 # ---------------------------------------------------------------------------
 
+_CHAIN_ID_RE = re.compile(r"^[A-Za-z0-9T\-]{8,64}$")
+
+
 def _load_anchors_from_chain(
     traces_base: Path,
     chain_id: str,
@@ -335,13 +339,20 @@ def _load_anchors_from_chain(
 ) -> list[dict]:
     """Pull every Stage-2 thesis's evidence_anchors out of the trace JSONL
     for `chain_id`. Returns the flattened list; raises FileNotFoundError if
-    the chain has no trace on disk.
+    the chain has no trace on disk, or ValueError if `chain_id` doesn't match
+    the canonical format (defense-in-depth — prevents glob metacharacters
+    or path separators from interacting with rglob).
 
     When `ticker` is supplied, events are filtered to those whose `symbol`
     matches (case-insensitive). Events without a `symbol` field — older
     /research traces written before the field existed — are included so
     single-ticker chains stay backward-compatible.
     """
+    if not _CHAIN_ID_RE.match(chain_id):
+        raise ValueError(
+            f"Invalid chain_id format: {chain_id!r} "
+            "(expected 8-64 alphanumeric/'T'/'-' chars)"
+        )
     matches = list(traces_base.rglob(f"{chain_id}.jsonl"))
     if not matches:
         raise FileNotFoundError(

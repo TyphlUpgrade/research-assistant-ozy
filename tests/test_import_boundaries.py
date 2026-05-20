@@ -42,9 +42,12 @@ ALLOWED_OZY_PREFIXES = {
     "ozymandias.intelligence.technical_analysis",
     "ozymandias.intelligence.claude_json",
     "ozymandias.intelligence.context_compressor",  # pure compute
-    # universe_fetcher graduated v1.x: Ozy momentum-blindspot fix landed
-    # (commit f07f526 — score-cascade replaces intraday momentum loop),
-    # making the lift safe per Open Follow-up #1.
+    # universe_fetcher graduated v1.x for Open Follow-up #1. Two Ozy commits
+    # cleared the prerequisites:
+    #   - f07f526 (score-cascade pivot retires opportunity_ranker /
+    #     momentum_strategy; D7's transitive-deprecated-symbol blocker gone)
+    #   - dae1d99 (Phase 2a universe-fetcher rewrite — the substantive
+    #     momentum-blindspot fix that decided what get_universe() returns today)
     "ozymandias.intelligence.universe_fetcher",
     "ozymandias.core",
     "ozymandias.core.config",
@@ -59,6 +62,14 @@ ALLOWED_NAMED_SYMBOL: dict[tuple[str, str], set[str]] = {
     ("ozymandias.core.state_manager", "WatchlistState"): {
         "research_assistant/null_state_manager.py",
     },
+}
+
+# Inverse of ALLOWED_NAMED_SYMBOL: for modules in ALLOWED_OZY_PREFIXES that
+# we want to pin to a narrow public surface, list the symbols research_assistant
+# is permitted to import. Any other symbol from these modules trips the test
+# and forces a research-side review when Ozy adds new public API.
+RESTRICTED_OZY_SYMBOLS: dict[str, set[str]] = {
+    "ozymandias.intelligence.universe_fetcher": {"UniverseFetcher"},
 }
 
 # Anything matching these is forbidden (substring match on module name)
@@ -151,6 +162,17 @@ def _check_edge(
         violations.append(
             f"FORBIDDEN: {source_file} imports `{symbol or '<module>'}` from `{module}`"
         )
+        return
+
+    # Restricted-symbol enforcement: for allowed modules, restrict the
+    # imported symbols to a narrow whitelist when one is declared.
+    restricted = RESTRICTED_OZY_SYMBOLS.get(module)
+    if restricted is not None and symbol is not None and symbol not in restricted:
+        violations.append(
+            f"RESTRICTED: {source_file} imports `{symbol}` from `{module}` "
+            f"— only {sorted(restricted)} permitted (tighten RESTRICTED_OZY_SYMBOLS "
+            "to widen the surface deliberately)"
+        )
 
 
 def test_import_boundaries_transitive() -> None:
@@ -210,7 +232,33 @@ def test_no_forbidden_instantiations() -> None:
     assert not violations, "\n".join(violations)
 
 
+def test_restricted_symbols_enforced_for_universe_fetcher() -> None:
+    """The boundary contract limits universe_fetcher imports to {UniverseFetcher}.
+    If research-side code imports a different symbol from that module, this
+    test must fail — Ozy's public surface should not silently widen here."""
+    violations: list[str] = []
+    _check_edge(
+        module="ozymandias.intelligence.universe_fetcher",
+        symbol="UniverseScanner",  # hypothetical addition Ozy might make
+        source_file="research_assistant/universe.py",
+        violations=violations,
+    )
+    assert violations, "RESTRICTED_OZY_SYMBOLS check did not fire on disallowed symbol"
+    assert "RESTRICTED" in violations[0]
+
+    # Sanity: the canonical allowed symbol must NOT trigger a violation.
+    clean: list[str] = []
+    _check_edge(
+        module="ozymandias.intelligence.universe_fetcher",
+        symbol="UniverseFetcher",
+        source_file="research_assistant/universe.py",
+        violations=clean,
+    )
+    assert clean == []
+
+
 if __name__ == "__main__":
     test_import_boundaries_transitive()
     test_no_forbidden_instantiations()
+    test_restricted_symbols_enforced_for_universe_fetcher()
     print("OK")

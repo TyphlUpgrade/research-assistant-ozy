@@ -206,3 +206,43 @@ def test_resolves_when_percentage_matches_with_boundary() -> None:
         user_message="I disagree, the +18% is too low.",
         prior_evidence_anchors=[{"claim": "30-day return +18% with price above EMA20", "source": "TICKER_DATA"}],
     ) is False
+
+
+# ---------------------------------------------------------------------------
+# Quarter-form coverage: 3Q24 / 1H25 / FY2025 must also be extracted as
+# strong tokens (not silently dropped per the round-2 code-reviewer note)
+# ---------------------------------------------------------------------------
+
+def test_fires_on_uncorroborated_alt_quarter_form() -> None:
+    """'3Q24' alone with empty corpus is unverified — Defender fires."""
+    assert should_invoke_defender(
+        prior_turn_had_recommendation=True,
+        user_message="I disagree, 3Q24 was the inflection.",
+        prior_evidence_anchors=[],
+    ) is True
+
+
+def test_does_not_fire_when_alt_quarter_resolves_in_corpus() -> None:
+    anchors = [{"claim": "3Q24 results posted margin expansion", "source": "headlines"}]
+    assert should_invoke_defender(
+        prior_turn_had_recommendation=True,
+        user_message="I disagree, 3Q24 was the inflection.",
+        prior_evidence_anchors=anchors,
+    ) is False
+
+
+def test_fires_on_half_year_form_uncorroborated() -> None:
+    assert should_invoke_defender(
+        prior_turn_had_recommendation=True,
+        user_message="I disagree, 1H25 guidance was lifted.",
+        prior_evidence_anchors=[],
+    ) is True
+
+
+def test_does_not_fire_on_fy_form_resolved() -> None:
+    anchors = [{"claim": "FY2025 outlook raised by 8%", "source": "headlines"}]
+    assert should_invoke_defender(
+        prior_turn_had_recommendation=True,
+        user_message="I disagree, FY2025 guide is fine.",
+        prior_evidence_anchors=anchors,
+    ) is False
