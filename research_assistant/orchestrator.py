@@ -33,6 +33,7 @@ from research_assistant.dossier_io import (
     read_dossier,
     write_dossier_atomic,
 )
+from research_assistant.observations import Observation, append_observation
 from research_assistant.trace_renderer import append_stage_event
 from ozymandias.intelligence.claude_json import parse_claude_response
 
@@ -241,6 +242,24 @@ async def research_ticker(
     )
 
     write_dossier_atomic(dossier, base)
+
+    append_observation(
+        Observation(
+            ts=ts,
+            kind="research",
+            symbol=symbol,
+            chain_id=chain,
+            thesis=stage_2["thesis_text"],
+            conviction=dossier.conviction,
+            regime=world_state.get("regime"),
+            drivers=list(stage_2.get("key_drivers", [])),
+            risks=list(stage_2.get("risks", [])),
+            flagged_risks=list(stage_3.get("flagged_risks", [])),
+            open_questions=new_questions,
+            anchors=list(stage_2.get("evidence_anchors", [])),
+        ),
+        base,
+    )
 
     return ResearchResult(
         symbol=symbol,

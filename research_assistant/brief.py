@@ -31,6 +31,7 @@ from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from research_assistant.claude_sdk import ClaudeClient
+from research_assistant.observations import Observation, append_observation, now_iso
 from research_assistant.orchestrator import _load_prompt, _render, _chain_id
 from research_assistant.trace_renderer import append_stage_event
 from ozymandias.intelligence.claude_json import parse_claude_response
@@ -239,6 +240,8 @@ async def build_brief(
     stage_2_results = await asyncio.gather(*stage_2_tasks)
 
     items: list[BriefItem] = []
+    regime = world_state.get("regime") if isinstance(world_state, dict) else None
+    obs_ts = now_iso()
     for survivor, stage_2 in zip(survivors, stage_2_results):
         item = BriefItem(
             ticker=survivor["ticker"],
@@ -253,6 +256,22 @@ async def build_brief(
             item.risks = stage_2.get("risks", [])
             item.open_questions = stage_2.get("open_questions", [])
             item.evidence_anchors = stage_2.get("evidence_anchors", [])
+            append_observation(
+                Observation(
+                    ts=obs_ts,
+                    kind="brief",
+                    symbol=item.ticker,
+                    chain_id=chain,
+                    thesis=item.thesis_text or "",
+                    conviction=item.conviction_score,
+                    regime=regime,
+                    drivers=list(item.key_drivers),
+                    risks=list(item.risks),
+                    open_questions=list(item.open_questions),
+                    anchors=list(item.evidence_anchors),
+                ),
+                research_base,
+            )
         items.append(item)
 
     brief = Brief(
