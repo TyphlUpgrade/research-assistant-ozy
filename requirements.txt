@@ -4,6 +4,10 @@ anthropic>=0.40.0
 # YAML frontmatter parsing for dossiers
 python-frontmatter>=1.1.0
 
+# EDGAR client (FOLLOWUPS #1): async HTTP + HTML parsing
+httpx>=0.28.0
+beautifulsoup4>=4.12.0
+
 # Ozy modules (editable install from sibling repo)
 # Run separately: pip install -e /home/typhlupgrade/.local/share/ozy-bot-v3
 

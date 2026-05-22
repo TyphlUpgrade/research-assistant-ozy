@@ -53,19 +53,37 @@ context-budget a contract, not a per-source vigilance task.
 
 ## 1. EDGAR client foundation + full-text filings (10-K / 10-Q / 8-K)
 
-Status: **OPEN** — top priority. Closes the depth-axis regression that
-the spec's quality contract (§77, §131) explicitly forbids.
+Status: **PARTIAL** — adapter foundation shipped 2026-05-22 in
+`research_assistant/edgar.py` + `tests/test_edgar.py` (24 tests).
 
-Gate: **`/probe` only** for full filing text. Citation-anchor
-resolution (via #2) gets the raw filing text injected into Defender's
-anchor corpus when a pushback cites *"per the 10-K page 47"*. Stage 2
-never sees raw 10-K text.
+Shipped:
+- `EdgarClient` async HTTP client, 5 req/sec sliding-window throttle,
+  SEC-required User-Agent (default `research-assistant
+  william.a.sit@gmail.com`, env override `EDGAR_USER_AGENT`).
+- `resolve_cik(ticker)` via `company_tickers.json` (lazy single-fetch
+  cache; case-insensitive).
+- `list_filings(cik, form_type, since=, limit=)` via
+  `data.sec.gov/submissions/CIK{cik}.json` — works for any form code
+  (10-K / 10-Q / 8-K today; 4 / 13F-HR consumed by #3 and #5).
+- `fetch_filing(filing)` returns `FilingText` with HTML→paragraph
+  extraction (script/style stripped, whitespace collapsed,
+  parent/child div+p dedupe).
+- Stable anchor format `edgar:{form}:{accession}:para_{n}` matching the
+  v1 spec; `FilingText.search(needle)` returns (anchor, paragraph)
+  hits for Defender (#2) anchor-corpus injection.
+- CLI smoke: `python -m research_assistant.edgar <TICKER> <FORM>`.
 
-Foundational: builds the rate-limited EDGAR HTTP client + accession-
-number resolver + per-form parser that #3 (Form 4) and #5 (13F)
-reuse. The EDGAR client is the load-bearing infrastructure piece —
-ship it first as a self-contained adapter, then layer the form-
-specific parsers (#3 and #5) on top.
+Remaining for full closure:
+- `/probe` wiring — when a probe question references filings, fetch
+  via `EdgarClient` and inject into the probe prompt's
+  `dossier_context` slot (out of scope of this commit per scope
+  decision; sequenced with #2).
+- Defender anchor-corpus injection — pushback citations like *"per
+  the 10-K page 47"* should resolve against `FilingText.search`
+  hits. Lands with #2 (bare-citation suppression floor).
+
+Gate (when fully wired): **`/probe` only** for full filing text.
+Stage 2 never sees raw 10-K text.
 
 Surfaced incidents:
 - 2026-05-19 RIG / NVDA brief session — Stage 3 Skeptic flagged
