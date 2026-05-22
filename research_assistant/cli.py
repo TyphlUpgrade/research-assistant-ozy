@@ -45,6 +45,25 @@ def _setup_logging(quiet: bool) -> None:
     logging.basicConfig(level=level, format="%(levelname)s %(name)s: %(message)s")
 
 
+def _load_dotenv() -> None:
+    """Populate os.environ from a `.env` file in the project root, if present.
+
+    Walks from CWD upward looking for `.env`. Lines are `KEY=VALUE`; surrounding
+    quotes on the value are stripped. Existing env vars take precedence."""
+    for parent in (Path.cwd(), *Path.cwd().parents):
+        candidate = parent / ".env"
+        if candidate.is_file():
+            for raw in candidate.read_text().splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                os.environ.setdefault(key, value)
+            return
+
+
 def _load_prior_universe_snapshot(cache_path: Path) -> list[str]:
     """Return `discovered_universe` from a prior brief cache, or [] when
     the file is missing, unreadable, or pre-dates the field."""
@@ -516,6 +535,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    _load_dotenv()
     args = _build_parser().parse_args(argv)
     _setup_logging(args.quiet)
 
