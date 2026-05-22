@@ -11,6 +11,7 @@ integration point for a v2 Discord bot (the bot calls the same CLI).
 
 Subcommands:
   research <TICKER>       Full single-ticker DD (Stage 2 + Stage 3 + dossier write)
+  probe <TICKER> <Q>      Focused dossier-scoped question (no Skeptic by default)
   brief                   Morning summary (Stage 0 + 1 + parallel Stage 2 over watchlist)
   trace <CHAIN_ID>        Render a cascade trace as human-readable text
   dossier <TICKER>        Print the current per-ticker dossier markdown
@@ -214,6 +215,111 @@ def _render_research_result(result) -> str:
     lines.append(
         f"Dossier appended at `.research/tickers/{result.symbol}.md`. "
         f"Run `python -m research_assistant trace {result.chain_id}` for the full cascade trace."
+    )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# probe <TICKER> <QUESTION>
+# ---------------------------------------------------------------------------
+
+async def _cmd_probe(args: argparse.Namespace) -> int:
+    if _require_api_key(args.quiet) is None:
+        return 3
+
+    from ozymandias.data.adapters.yfinance_adapter import YFinanceAdapter
+    from research_assistant.data_loader import (
+        build_world_state_input,
+        load_headlines,
+        load_ticker_data,
+    )
+    from research_assistant.orchestrator import probe_ticker
+
+    base = _resolve_base(args.base)
+    symbol = args.ticker.upper()
+    adapter = YFinanceAdapter()
+
+    if not args.quiet:
+        print(f"Loading {symbol} data via yfinance…", file=sys.stderr)
+    ticker_data = await load_ticker_data(symbol, adapter)
+    if ticker_data.get("_data_quality") != "ok":
+        print(
+            f"ERROR: insufficient yfinance data for {symbol} "
+            f"({ticker_data.get('_data_quality')}).",
+            file=sys.stderr,
+        )
+        return 1
+    headlines = await load_headlines(symbol, adapter, max_items=5)
+
+    world_state: dict
+    today_cache = base / "briefs" / f"{ticker_data.get('_date_et', '')}.json"
+    if today_cache.exists():
+        try:
+            world_state = json.loads(today_cache.read_text()).get("world_state", {})
+        except Exception:
+            world_state = {}
+    else:
+        world_state = await build_world_state_input(adapter)
+
+    if not args.quiet:
+        deep_note = " + Stage 3 Skeptic" if args.deep else ""
+        print(f"Running probe (Sonnet){deep_note}…", file=sys.stderr)
+
+    try:
+        result = await probe_ticker(
+            symbol,
+            args.question,
+            world_state=world_state,
+            ticker_data=ticker_data,
+            headlines=headlines,
+            base=base,
+            deep=args.deep,
+        )
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(dataclasses.asdict(result), indent=2, default=str))
+    else:
+        print(_render_probe_result(result))
+    return 0
+
+
+def _render_probe_result(result) -> str:
+    lines = [
+        f"## {result.symbol} — Probe (chain: {result.chain_id})",
+        "",
+        f"**Question:** {result.question}",
+        "",
+        f"**Answer:** {result.answer}",
+        "",
+    ]
+    if result.evidence_anchors:
+        lines.append("**Evidence anchors:**")
+        for a in result.evidence_anchors:
+            claim = a.get("claim", "")
+            source = a.get("source", "")
+            lines.append(f"- {claim}  [anchor: {source}]")
+        lines.append("")
+    if result.closes_questions:
+        lines.append("**Closed open questions (removed from dossier):**")
+        for q in result.closes_questions:
+            lines.append(f"- {q}")
+        lines.append("")
+    if result.new_open_questions:
+        lines.append("**New open questions (appended to dossier):**")
+        for q in result.new_open_questions:
+            lines.append(f"- {q}")
+        lines.append("")
+    if result.critique_text:
+        lines.append(f"**Skeptic critique:** {result.critique_text}")
+        lines.append("")
+    lines.append(f"**Cost so far this session:** ${result.cost_usd:.4f}")
+    lines.append("")
+    lines.append(
+        f"Dossier updated at `.research/tickers/{result.symbol}.md`. "
+        f"Run `python -m research_assistant trace {result.chain_id}` for the trace."
     )
     return "\n".join(lines)
 
@@ -494,6 +600,18 @@ def _build_parser() -> argparse.ArgumentParser:
     pr = sub.add_parser("research", help="Single-ticker full DD")
     pr.add_argument("ticker", help="Stock symbol, e.g. NVDA")
 
+    pp = sub.add_parser(
+        "probe",
+        help="Focused dossier-scoped question (cheaper than /research)",
+    )
+    pp.add_argument("ticker", help="Stock symbol — must already have a dossier")
+    pp.add_argument("question", help="Focused question to answer against the dossier")
+    pp.add_argument(
+        "--deep",
+        action="store_true",
+        help="Also run Stage 3 Skeptic over the probe answer",
+    )
+
     pb = sub.add_parser("brief", help="Morning summary over watchlist + dynamic universe")
     pb.add_argument("--refresh", action="store_true", help="Bypass today's cache and rebuild")
     pb.add_argument("--ticker", help="Drill-down on a specific ticker from the brief")
@@ -541,6 +659,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     handlers = {
         "research":       lambda a: asyncio.run(_cmd_research(a)),
+        "probe":          lambda a: asyncio.run(_cmd_probe(a)),
         "brief":          lambda a: asyncio.run(_cmd_brief(a)),
         "trace":          _cmd_trace,
         "dossier":        _cmd_dossier,

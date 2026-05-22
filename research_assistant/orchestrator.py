@@ -279,6 +279,200 @@ async def research_ticker(
 
 
 # ---------------------------------------------------------------------------
+# /probe — focused dossier-scoped query
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ProbeResult:
+    """Output of one `/probe <TICKER> <QUESTION>` invocation."""
+    symbol: str
+    question: str
+    answer: str
+    evidence_anchors: list[dict]
+    closes_questions: list[str]
+    new_open_questions: list[str]
+    critique_text: str = ""        # populated only when deep=True
+    chain_id: str = ""
+    cost_usd: float = 0.0
+
+
+def _format_dossier_context(dossier: Dossier, *, ledger_tail: int = 6) -> str:
+    """Render the dossier into the probe prompt's `dossier_context` slot.
+    Includes State, all Open Questions, and the most recent `ledger_tail`
+    ledger entries (the probe stage doesn't need full ledger history)."""
+    lines = ["## DOSSIER STATE", dossier.state_md or "(empty)"]
+    lines.append("\n## OPEN QUESTIONS (verbatim — use exact strings in closes_questions)")
+    if dossier.open_questions:
+        for q in dossier.open_questions:
+            lines.append(f"- {q}")
+    else:
+        lines.append("(none)")
+    lines.append(f"\n## RECENT LEDGER (last {ledger_tail})")
+    tail = dossier.ledger[-ledger_tail:] if dossier.ledger else []
+    if tail:
+        for entry in tail:
+            anchor = f" [anchor: {entry.evidence_anchor}]" if entry.evidence_anchor else ""
+            lines.append(f"- {entry.timestamp} — {entry.kind}: {entry.summary}{anchor}")
+    else:
+        lines.append("(empty)")
+    return "\n".join(lines)
+
+
+async def _stage_2_probe(
+    client: ClaudeClient,
+    world_state: dict,
+    ticker_data: dict,
+    headlines: list[dict],
+    dossier_context: str,
+    focused_question: str,
+) -> tuple[Optional[dict], Optional[CallResult]]:
+    """Invoke the probe stage (Sonnet, dossier-scoped focused answer).
+    Returns (parsed_json, call_metadata)."""
+    template = _load_prompt("probe")
+    prompt = _render(
+        template,
+        ticker_json=json.dumps(ticker_data, indent=2),
+        headlines_json=json.dumps(headlines, indent=2),
+        dossier_context=dossier_context,
+        focused_question=focused_question,
+    )
+    system = f"WORLD_STATE for this session:\n{json.dumps(world_state, indent=2)}"
+    result = await client.call(prompt, model="claude-sonnet-4-6", system=system)
+    return parse_claude_response(result.text), result
+
+
+async def probe_ticker(
+    symbol: str,
+    question: str,
+    *,
+    world_state: dict,
+    ticker_data: dict,
+    headlines: list[dict],
+    base: Path,
+    deep: bool = False,
+    client: Optional[ClaudeClient] = None,
+) -> ProbeResult:
+    """Run a focused probe against an existing dossier.
+
+    Raises FileNotFoundError if no dossier exists for `symbol` — probe is the
+    cold-start entry point against a SAVED dossier, not a way to create one.
+    Use `/research <TICKER>` first if no dossier is present.
+
+    Side effects (atomic w.r.t. dossier write):
+      * appends a kind="probe" ledger entry citing the chain_id
+      * drops resolved questions from dossier.open_questions
+      * appends new_open_questions surfaced by the probe
+      * appends a kind="probe" observation to the per-ticker stream
+    """
+    symbol = symbol.upper()
+    dossier = read_dossier(symbol, base)
+    if dossier is None:
+        raise FileNotFoundError(
+            f"No dossier found for {symbol}. Run `/research {symbol}` first to "
+            f"build one before probing."
+        )
+
+    if client is None:
+        client = ClaudeClient()
+    chain = _chain_id()
+    traces_base = base / "traces"
+
+    dossier_context = _format_dossier_context(dossier)
+    stage_2, s2_meta = await _stage_2_probe(
+        client, world_state, ticker_data, headlines, dossier_context, question
+    )
+    append_stage_event(
+        chain_id=chain,
+        stage_id="stage_2_probe",
+        model=s2_meta.model if s2_meta else "unknown",
+        tokens_in=s2_meta.input_tokens if s2_meta else 0,
+        tokens_out=s2_meta.output_tokens if s2_meta else 0,
+        cost_usd=s2_meta.cost_usd if s2_meta else 0.0,
+        latency_ms=s2_meta.latency_ms if s2_meta else 0,
+        parsed=stage_2,
+        raw_response=s2_meta.text if s2_meta else None,
+        traces_base=traces_base,
+        error=None if stage_2 else "Probe Stage 2 JSON parse failed",
+        symbol=symbol,
+    )
+    if stage_2 is None:
+        raise RuntimeError(f"Probe JSON parse failed for {symbol} (chain={chain})")
+
+    answer = stage_2.get("answer", "")
+    closes = list(stage_2.get("closes_questions", []))
+    new_qs = list(stage_2.get("new_open_questions", []))
+    anchors = list(stage_2.get("evidence_anchors", []))
+
+    critique_text = ""
+    if deep:
+        # Optional Skeptic pass over the probe answer. Reuses the Stage 3
+        # prompt — it tolerates any thesis-shaped input.
+        thesis_for_skeptic = {
+            "ticker": symbol,
+            "thesis_text": answer,
+            "conviction_score": 0.5,
+            "key_drivers": [],
+            "risks": [],
+            "evidence_anchors": anchors,
+            "ticker_data": ticker_data,
+        }
+        stage_3, s3_meta = await _stage_3_skeptic(client, world_state, thesis_for_skeptic)
+        append_stage_event(
+            chain_id=chain,
+            stage_id="stage_3_skeptic",
+            model=s3_meta.model if s3_meta else "unknown",
+            tokens_in=s3_meta.input_tokens if s3_meta else 0,
+            tokens_out=s3_meta.output_tokens if s3_meta else 0,
+            cost_usd=s3_meta.cost_usd if s3_meta else 0.0,
+            latency_ms=s3_meta.latency_ms if s3_meta else 0,
+            parsed=stage_3,
+            raw_response=s3_meta.text if s3_meta else None,
+            traces_base=traces_base,
+            error=None if stage_3 else "Stage 3 JSON parse failed",
+            symbol=symbol,
+        )
+        if stage_3 is not None:
+            critique_text = stage_3.get("critique_text", "")
+
+    # Update dossier: drop closed questions, append new ones, append probe ledger entry.
+    ts = datetime.now(timezone.utc).isoformat()
+    dossier.open_questions = [q for q in dossier.open_questions if q not in closes]
+    dossier.open_questions = list(dict.fromkeys(dossier.open_questions + new_qs))
+    ledger_summary = f"Probed: {question[:120]} → {answer[:120]}"
+    dossier.ledger.append(LedgerEntry(
+        timestamp=ts, kind="probe", summary=ledger_summary, evidence_anchor=chain,
+    ))
+    write_dossier_atomic(dossier, base)
+
+    append_observation(
+        Observation(
+            ts=ts,
+            kind="probe",
+            symbol=symbol,
+            chain_id=chain,
+            thesis=answer,
+            conviction=dossier.conviction,
+            regime=world_state.get("regime"),
+            open_questions=list(dossier.open_questions),
+            anchors=anchors,
+        ),
+        base,
+    )
+
+    return ProbeResult(
+        symbol=symbol,
+        question=question,
+        answer=answer,
+        evidence_anchors=anchors,
+        closes_questions=closes,
+        new_open_questions=new_qs,
+        critique_text=critique_text,
+        chain_id=chain,
+        cost_usd=client.cost.total_usd,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Defender invocation heuristic (3-condition AND, per Critic iter1 #11)
 # ---------------------------------------------------------------------------
 

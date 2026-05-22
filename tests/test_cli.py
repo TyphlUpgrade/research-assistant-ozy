@@ -38,6 +38,27 @@ def test_parser_research_subcommand() -> None:
     assert ns.quiet is False
 
 
+def test_parser_probe_subcommand() -> None:
+    parser = cli._build_parser()
+    ns = parser.parse_args(["probe", "IONQ", "What is the catalyst?"])
+    assert ns.cmd == "probe"
+    assert ns.ticker == "IONQ"
+    assert ns.question == "What is the catalyst?"
+    assert ns.deep is False
+
+
+def test_parser_probe_deep_flag() -> None:
+    parser = cli._build_parser()
+    ns = parser.parse_args(["probe", "IONQ", "Q?", "--deep"])
+    assert ns.deep is True
+
+
+def test_parser_probe_requires_question() -> None:
+    parser = cli._build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["probe", "IONQ"])
+
+
 def test_parser_brief_with_drilldown() -> None:
     parser = cli._build_parser()
     ns = parser.parse_args(["brief", "--ticker", "TSLA", "--refresh"])
