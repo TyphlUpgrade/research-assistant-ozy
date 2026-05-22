@@ -135,36 +135,152 @@ Once the stream exists:
 Cosmetic / operator-accessibility layer. Defer until the stream has
 real data in it.
 
-## 8. Document-sourced citation verification (deepens #6)
+## 8. Data source expansion (parent — spec §247 TBD #4)
 
-Status: **OPEN** (blocked on document-source integrations)
+Status: **OPEN** (parent; sub-items have independent ship gates).
 
-#6's typed-anchor-corpus check resolves cited tokens against the prior
-Stage 2 anchor strings. The full backbone wave still wants literal
-document grep — a citation like *"per the 10-K page 47"* should
-resolve against the actual filing text, not against whatever the Stage
-2 prompt happened to surface. Today such tokens are conservatively
-treated as unverified; loses signal once the documents are local.
+Brings new data sources into the cascade. Existing data is `yfinance`
+(quotes, bars, news) + Stage 0 world-state aggregation. Sub-items here
+extend that surface.
 
-Pulls in EDGAR / FRED / earnings-transcript adapters (spec §247 TBD
-#4). Tracked as the data dependency of this item rather than a separate
-"integrate EDGAR" follow-up — the integrations only earn their keep
-once a downstream consumer (this item + #9 as an evaluator input) needs
-them.
+**Context-budget discipline (binding on every sub-item):** brief Stage
+2 stays unmodified. No per-ticker enrichment block lands at brief time
+— the brief is for scanning, and 8× parallel Stage 2 calls compound
+input noise into ranking error. Each sub-item must declare exactly one
+**gate**:
 
-Sequenced before #9 because #9's evaluator LLM benefits substantially
-from being able to grep filings as part of the depth-axis check; the
-adapters built here become its primary input.
+- **Stage 0 (regime)** — shared across all items in the brief; ≤3 lines
+  added to world-state. For regime/macro signal only.
+- **Stage 1 (filter)** — rank-decisional only, ≤1 line per candidate
+  for the batched Haiku filter. Adjusts survivor selection without
+  polluting Stage 2 narrative.
+- **`/research` Stage 2 only** — per-ticker enrichment block; lands
+  here because the operator committed to deep DD on this name.
+- **`/probe` only** — fetch on demand; never pre-loaded into any
+  cascade prompt.
+
+Sub-items that don't fit one of these gates don't ship. This makes
+context-budget a contract, not a per-source vigilance task.
+
+Two downstream consumers reuse whatever lands: #6 (bare-citation
+suppression — anchors gain literal-document resolution as sub-items
+ship) and #9 (evaluator LLM — uses the document corpus as one of its
+depth-axis inputs).
 
 Surfaced incidents:
-- 2026-05-19 RIG / NVDA brief session, where Stage 3 Skeptic flagged
+- 2026-05-19 RIG / NVDA brief session — Stage 3 Skeptic flagged
   missing real-time macro/news (spot WTI sensitivity, options-implied
-  move) the system structurally cannot fetch beyond yfinance headlines.
-- 2026-05-22 IONQ `/research` session, where the news-cycle pull
-  identified a federal-quantum-policy catalyst but the absence of an
-  EDGAR adapter blocked checking IONQ 8-K filings and Form 4 insider
-  transactions during a +117% / 30d move. Same data-source gap; same
-  wave.
+  move) the system structurally cannot fetch beyond yfinance.
+- 2026-05-22 IONQ `/research` session — federal-quantum-policy
+  catalyst identified, but absence of an EDGAR adapter blocked
+  checking IONQ 8-K filings and Form 4 insider transactions during a
+  +117% / 30d move. NVDA and IONQ dossiers both explicitly raised
+  insider-positioning questions as Open Questions the cascade
+  couldn't answer.
+
+Ship order favors **highest depth-axis lift per token added**: 8b
+(Form 4) closes existing Open Questions the cascade is *currently
+generating*; 8c (Polymarket) is the cheapest integration and the only
+candidate that makes Stage 0 quantitative. 13F and the rest follow.
+
+### 8a. EDGAR client foundation + full-text filings (10-K / 10-Q / 8-K)
+
+Gate: **`/probe` only** for full filing text. Citation-anchor
+resolution (via #6) gets the raw filing text injected into Defender's
+anchor corpus when a pushback cites *"per the 10-K page 47"*. Stage 2
+never sees raw 10-K text.
+
+Foundational: builds the rate-limited EDGAR HTTP client + accession-
+number resolver + per-form parser that 8b (Form 4) and 8d (13F)
+reuse. Worth landing first as infrastructure even though 8b is the
+higher-value endpoint.
+
+### 8b. EDGAR Form 4 insider transactions
+
+Gate: **Stage 1 (filter)** + **`/research` Stage 2 only** + **`/probe`**.
+
+Best academic alpha evidence in the candidate set, and the source
+that directly closes Open Questions the cascade is already generating
+("What is the current insider transaction profile?" — NVDA + IONQ
+dossiers, 2026-05-18 to 2026-05-22).
+
+Surfaces:
+- **Stage 1 filter:** 1-line per candidate ("insider net flow last
+  90d: -$42M / 4 sales / 0 buys"). Decisional, not narrative-affecting.
+  Disqualifies names with severe insider selling before they reach
+  brief Stage 2.
+- **`/research` Stage 2 enrichment:** compressed 3-line summary
+  ("3 sales last 90d, net -2.1% of insider holdings, codes 100% S,
+  latest 2026-05-19; CFO held flat, CEO sold $18M") in the Stage 2
+  prompt for the committed ticker.
+- **`/probe`:** full historical insider lookup with per-officer
+  breakdown.
+
+Adapter-side compression is non-negotiable; transaction-code parsing
+(P / S / A / M) is the failure mode to guard against.
+
+### 8c. Polymarket odds
+
+Gate: **Stage 0 (regime)** + **`/research` Stage 2 only**.
+
+Surfaces:
+- **Stage 0:** 2-3 lines of regime-relevant markets shared across all
+  brief items ("Fed cuts May 2026: 0.28 | S&P year-end target $X:
+  0.42 | CHIPS Act funding passes: 0.61"). Quantifies catalysts that
+  today live as narrative strings (e.g. today's brief has
+  `Trump_bull_market_narrative` with no probability attached).
+- **`/research` Stage 2 enrichment:** any ticker-specific Polymarket
+  markets that exist (earnings beats, M&A, regulatory events). 1-line
+  each. Most tickers will have none — that's a valid "" enrichment.
+
+Min-volume filter required ($1M+ resting liquidity) to drop noise
+markets. Read-only CLOB API access (free) is enough; we don't trade.
+
+Cheapest integration in the candidate set. Anchors are stable
+(`polymarket:market:0x_abc:price_yes=0.42:ts=…`).
+
+### 8d. EDGAR 13F institutional filings
+
+Gate: **`/research` Stage 2 only** + **`/probe`**.
+
+Pairs with 8b: insiders + institutions = full ownership signature.
+45-day lag makes it weaker than 8b standalone (best for fundamental
+theses, not catalyst-driven trades).
+
+Adapter-side compression to ≤1 line per ticker ("5 new positions
+>100K shares last quarter, 2 exited, net concentration index 0.42").
+Per-stock aggregation requires flipping the per-fund 13F orientation
+— non-trivial; pre-aggregated free sources (13F.info) may be the
+cheapest path.
+
+### 8e. FRED macro time series
+
+Gate: **Stage 0 (regime)**.
+
+Regime/macro signal only — yield curves, employment, inflation
+prints. Stage 0's existing world-state assembly gains a small block
+of FRED-sourced series. ≤3 lines added.
+
+### 8f. Earnings transcripts
+
+Gate: **`/probe` only**.
+
+Sparse-signal, valuable-when-present. Probe-fetch on user demand
+(e.g. *"what did NVDA management say about data-center backlog last
+quarter?"*). Stage 2/3 never see raw transcript text by default.
+
+Paid (Tikr, AlphaSense) or scraped; sourcing decision is per-source.
+
+### 8g. Congressional trading disclosures
+
+Gate: **`/probe` only**.
+
+Sparse signal, 45-day reporting lag, real risk of optical bias if
+surfaced into Stage 2 prompts. Pull on user demand only via a `/probe
+congressional <TICKER>` invocation. Never a default cascade input.
+
+Free aggregators (Senate Stock Watcher, House Stock Watcher) require
+some scraping; paid (CapitolTrades, QuiverQuant) have cleaner APIs.
 
 ## 9. Evaluator LLM for quality-contract depth (closes v1 #3)
 
@@ -177,7 +293,8 @@ etc.) with a small evaluator LLM call that scores Stage 2 output
 against the quality contract and returns structured pass/fail per
 dimension. Largest scope of the open list; wants a stable foundation
 underneath, and benefits from being able to read prior observations
-(#1, #5) and grep filings (#8) as evaluation inputs. Highest cost item
+(#1, #5) and grep filings (#8a, plus 8b–8g as they land) as evaluation
+inputs. Highest cost item
 — ship last among the build queue.
 
 ## 10. Cascade stages routed through CC Task tool
@@ -227,8 +344,8 @@ is research-specific.
 Two items promote from optional to load-bearing on this surface:
 - **Defender heuristic graduation** — every chat message is potential
   pressure, so the 3-condition AND fires continuously. #6
-  (bare-citation suppression) and #8 (document-citation verification)
-  become required-before-launch.
+  (bare-citation suppression) and #8a (EDGAR full filings, where
+  document-citation verification lives) become required-before-launch.
 - **Cost ceiling** — graduate `cost.hard_ceiling_usd` from default-OFF
   to default-ON with a per-session bound; intent classification +
   Defender both fire more often in continuous chat.
