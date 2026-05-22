@@ -26,7 +26,7 @@ from research_assistant.dossier_io import (
     write_dossier_atomic,
 )
 from research_assistant.observations import read_observations
-from research_assistant.orchestrator import probe_ticker
+from research_assistant.orchestrator import _render, probe_ticker
 
 
 def _seed_dossier(base: Path, symbol: str = "IONQ") -> Dossier:
@@ -180,40 +180,9 @@ async def test_probe_appends_new_open_questions(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_probe_deep_runs_skeptic(tmp_path: Path) -> None:
-    _seed_dossier(tmp_path)
-    fake = _fake_probe_response(answer="Probe answer.")
-    skeptic_calls = []
-
-    async def fake_skeptic(client, ws, twd, model="x"):
-        skeptic_calls.append(twd)
-        return {
-            "ticker": "IONQ",
-            "critique_text": "Mock critique against the probe answer.",
-            "adjusted_score": 0.5,
-            "flagged_risks": [],
-            "open_questions_added": [],
-            "news_reactivity_flag": False,
-        }, None
-
-    with patch("research_assistant.orchestrator._stage_2_probe", fake), \
-         patch("research_assistant.orchestrator._stage_3_skeptic", fake_skeptic):
-        result = await probe_ticker(
-            "IONQ",
-            "Q",
-            world_state={},
-            ticker_data={"price": 30.0},
-            headlines=[],
-            base=tmp_path,
-            deep=True,
-        )
-
-    assert len(skeptic_calls) == 1
-    assert result.critique_text == "Mock critique against the probe answer."
-
-
-@pytest.mark.asyncio
-async def test_probe_no_deep_does_not_run_skeptic(tmp_path: Path) -> None:
+async def test_probe_does_not_call_skeptic(tmp_path: Path) -> None:
+    """Per v1 scope (post-remediation 2026-05-22): /probe is thin-and-fast and
+    NEVER invokes the Skeptic — for adversarial pressure, use /research."""
     _seed_dossier(tmp_path)
     fake = _fake_probe_response(answer="Probe answer.")
     skeptic_calls = []
@@ -224,7 +193,7 @@ async def test_probe_no_deep_does_not_run_skeptic(tmp_path: Path) -> None:
 
     with patch("research_assistant.orchestrator._stage_2_probe", fake), \
          patch("research_assistant.orchestrator._stage_3_skeptic", fake_skeptic):
-        result = await probe_ticker(
+        await probe_ticker(
             "IONQ",
             "Q",
             world_state={},
@@ -234,4 +203,27 @@ async def test_probe_no_deep_does_not_run_skeptic(tmp_path: Path) -> None:
         )
 
     assert skeptic_calls == []
-    assert result.critique_text == ""
+
+
+def test_render_does_not_recursively_substitute() -> None:
+    """Persistent dossier content (e.g. an Open Question that happens to
+    contain `{focused_question}`) must NOT splice into the next probe's
+    prompt. Pins the post-remediation single-pass regex behavior."""
+    out = _render(
+        "Q: {focused_question}\nDOSSIER:\n{dossier_context}",
+        dossier_context="Open Q: 'what about {focused_question}?'",
+        focused_question="this turn's question",
+    )
+    # The `{focused_question}` inside dossier_context is preserved verbatim,
+    # not re-interpolated to the actual question text.
+    assert "Open Q: 'what about {focused_question}?'" in out
+    assert "Q: this turn's question" in out
+
+
+def test_render_preserves_json_examples() -> None:
+    """JSON schema blocks in prompt bodies (e.g. `{"k": "v"}`) must NOT
+    be touched unless the key is an actual sub. Backward-compat regression
+    guard for the str.replace → regex refactor."""
+    template = 'OUTPUT JSON: { "ticker": "<symbol>", "answer": "..." }'
+    out = _render(template, ticker_json='unused')
+    assert out == template

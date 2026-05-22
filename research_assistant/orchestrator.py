@@ -72,16 +72,17 @@ def _render(template: str, **subs: Any) -> str:
     """
     Substitute `{key}` placeholders in a prompt template.
 
-    Uses literal `.replace()` rather than `str.format()` so that JSON schema
-    examples inside the prompt body (e.g. `{ "ticker": "<symbol>", ... }`)
-    don't get interpreted as format substitution fields and KeyError.
-    Only the named placeholders in `subs` are substituted; everything else
-    in the template is preserved verbatim.
+    Single-pass via regex so that values containing `{other_key}` strings
+    (e.g. persisted user content that survives into a future prompt's
+    dossier_context block) are NOT re-scanned for further substitution.
+    Only `{key}` for `key` in `subs` is substituted; other brace-wrapped
+    content (e.g. JSON schema examples like `{ "ticker": "<symbol>", ... }`
+    or unmatched placeholders) is preserved verbatim.
     """
-    result = template
-    for key, value in subs.items():
-        result = result.replace("{" + key + "}", str(value))
-    return result
+    if not subs:
+        return template
+    pattern = re.compile(r"\{(" + "|".join(re.escape(k) for k in subs) + r")\}")
+    return pattern.sub(lambda m: str(subs[m.group(1)]), template)
 
 
 async def _stage_2_thesis(
@@ -291,7 +292,6 @@ class ProbeResult:
     evidence_anchors: list[dict]
     closes_questions: list[str]
     new_open_questions: list[str]
-    critique_text: str = ""        # populated only when deep=True
     chain_id: str = ""
     cost_usd: float = 0.0
 
@@ -349,7 +349,6 @@ async def probe_ticker(
     ticker_data: dict,
     headlines: list[dict],
     base: Path,
-    deep: bool = False,
     client: Optional[ClaudeClient] = None,
 ) -> ProbeResult:
     """Run a focused probe against an existing dossier.
@@ -403,37 +402,6 @@ async def probe_ticker(
     new_qs = list(stage_2.get("new_open_questions", []))
     anchors = list(stage_2.get("evidence_anchors", []))
 
-    critique_text = ""
-    if deep:
-        # Optional Skeptic pass over the probe answer. Reuses the Stage 3
-        # prompt — it tolerates any thesis-shaped input.
-        thesis_for_skeptic = {
-            "ticker": symbol,
-            "thesis_text": answer,
-            "conviction_score": 0.5,
-            "key_drivers": [],
-            "risks": [],
-            "evidence_anchors": anchors,
-            "ticker_data": ticker_data,
-        }
-        stage_3, s3_meta = await _stage_3_skeptic(client, world_state, thesis_for_skeptic)
-        append_stage_event(
-            chain_id=chain,
-            stage_id="stage_3_skeptic",
-            model=s3_meta.model if s3_meta else "unknown",
-            tokens_in=s3_meta.input_tokens if s3_meta else 0,
-            tokens_out=s3_meta.output_tokens if s3_meta else 0,
-            cost_usd=s3_meta.cost_usd if s3_meta else 0.0,
-            latency_ms=s3_meta.latency_ms if s3_meta else 0,
-            parsed=stage_3,
-            raw_response=s3_meta.text if s3_meta else None,
-            traces_base=traces_base,
-            error=None if stage_3 else "Stage 3 JSON parse failed",
-            symbol=symbol,
-        )
-        if stage_3 is not None:
-            critique_text = stage_3.get("critique_text", "")
-
     # Update dossier: drop closed questions, append new ones, append probe ledger entry.
     ts = datetime.now(timezone.utc).isoformat()
     dossier.open_questions = [q for q in dossier.open_questions if q not in closes]
@@ -466,7 +434,6 @@ async def probe_ticker(
         evidence_anchors=anchors,
         closes_questions=closes,
         new_open_questions=new_qs,
-        critique_text=critique_text,
         chain_id=chain,
         cost_usd=client.cost.total_usd,
     )

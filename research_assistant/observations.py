@@ -25,6 +25,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 
+SCHEMA_VERSION = 1
+
+
 @dataclass
 class Observation:
     ts: str
@@ -32,6 +35,7 @@ class Observation:
     symbol: str
     chain_id: str
     thesis: str
+    schema_version: int = SCHEMA_VERSION
     conviction: Optional[float] = None
     regime: Optional[str] = None
     drivers: list[str] = field(default_factory=list)
@@ -39,6 +43,16 @@ class Observation:
     flagged_risks: list[str] = field(default_factory=list)
     open_questions: list[str] = field(default_factory=list)
     anchors: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # anchors round-trip through JSON; downstream consumers (#5 read-phase,
+        # #7 derived views) call `a.get("claim", ...)`. A bare-string anchor
+        # would TypeError silently at read time. Catch the contract violation
+        # at write time so the failure happens at the producer, not the consumer.
+        if not all(isinstance(a, dict) for a in self.anchors):
+            raise TypeError(
+                f"Observation.anchors must be list[dict]; got: {self.anchors!r}"
+            )
 
 
 _VALID_KINDS = frozenset({"brief", "research", "probe"})
@@ -85,7 +99,13 @@ def read_observations(
             line = raw.strip()
             if not line:
                 continue
-            payload = json.loads(line)
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                # Tolerate a single corrupted record without losing the rest
+                # of the history. Mirrors trace JSONL reader behavior in
+                # cli._load_anchors_from_chain.
+                continue
             events.append(Observation(**{k: v for k, v in payload.items() if k in _KNOWN_FIELDS}))
     if limit is not None and limit < len(events):
         events = events[-limit:]

@@ -49,20 +49,35 @@ def _setup_logging(quiet: bool) -> None:
 def _load_dotenv() -> None:
     """Populate os.environ from a `.env` file in the project root, if present.
 
-    Walks from CWD upward looking for `.env`. Lines are `KEY=VALUE`; surrounding
-    quotes on the value are stripped. Existing env vars take precedence."""
+    Searches the first ancestor of CWD that looks like a project root
+    (contains pyproject.toml or .git/); falls back to CWD itself.
+    Existing env vars take precedence (via os.environ.setdefault).
+
+    Parser:
+    - Skips blank lines and #-comments
+    - Honors shell-style `export KEY=VALUE` by stripping the leading
+      `export` keyword
+    - Strips exactly one matching outer quote pair on the value
+      (preserves nested quotes)
+    """
     for parent in (Path.cwd(), *Path.cwd().parents):
+        if not ((parent / "pyproject.toml").exists() or (parent / ".git").exists()):
+            continue
         candidate = parent / ".env"
         if candidate.is_file():
             for raw in candidate.read_text().splitlines():
                 line = raw.strip()
                 if not line or line.startswith("#") or "=" not in line:
                     continue
+                if line.startswith("export ") or line.startswith("export\t"):
+                    line = line[len("export"):].lstrip()
                 key, _, value = line.partition("=")
                 key = key.strip()
-                value = value.strip().strip('"').strip("'")
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                    value = value[1:-1]
                 os.environ.setdefault(key, value)
-            return
+        return
 
 
 def _load_prior_universe_snapshot(cache_path: Path) -> list[str]:
@@ -145,13 +160,19 @@ async def _cmd_research(args: argparse.Namespace) -> int:
     # Run the mini-cascade
     if not args.quiet:
         print("Running Stage 2 (thesis) + Stage 3 (Skeptic)…", file=sys.stderr)
-    result = await research_ticker(
-        symbol,
-        world_state=world_state,
-        ticker_data=ticker_data,
-        headlines=headlines,
-        base=base,
-    )
+    try:
+        result = await research_ticker(
+            symbol,
+            world_state=world_state,
+            ticker_data=ticker_data,
+            headlines=headlines,
+            base=base,
+        )
+    except RuntimeError as exc:
+        # research_ticker embeds the chain_id in stage-parse failure messages
+        # so the user can `python -m research_assistant trace <chain>`.
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     if args.json:
         print(json.dumps(dataclasses.asdict(result), indent=2, default=str))
@@ -262,8 +283,7 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
         world_state = await build_world_state_input(adapter)
 
     if not args.quiet:
-        deep_note = " + Stage 3 Skeptic" if args.deep else ""
-        print(f"Running probe (Sonnet){deep_note}…", file=sys.stderr)
+        print("Running probe (Sonnet)…", file=sys.stderr)
 
     try:
         result = await probe_ticker(
@@ -273,9 +293,13 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
             ticker_data=ticker_data,
             headlines=headlines,
             base=base,
-            deep=args.deep,
         )
     except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except RuntimeError as exc:
+        # probe_ticker embeds the chain_id in the message (see orchestrator);
+        # surface it so the user can `python -m research_assistant trace <chain>`.
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
@@ -311,9 +335,6 @@ def _render_probe_result(result) -> str:
         lines.append("**New open questions (appended to dossier):**")
         for q in result.new_open_questions:
             lines.append(f"- {q}")
-        lines.append("")
-    if result.critique_text:
-        lines.append(f"**Skeptic critique:** {result.critique_text}")
         lines.append("")
     lines.append(f"**Cost so far this session:** ${result.cost_usd:.4f}")
     lines.append("")
@@ -494,7 +515,7 @@ def _load_anchors_from_chain(
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if event.get("stage_id") != "stage_2_thesis":
+            if event.get("stage_id") not in ("stage_2_thesis", "stage_2_probe"):
                 continue
             if target is not None:
                 event_symbol = event.get("symbol")
@@ -606,11 +627,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     pp.add_argument("ticker", help="Stock symbol — must already have a dossier")
     pp.add_argument("question", help="Focused question to answer against the dossier")
-    pp.add_argument(
-        "--deep",
-        action="store_true",
-        help="Also run Stage 3 Skeptic over the probe answer",
-    )
 
     pb = sub.add_parser("brief", help="Morning summary over watchlist + dynamic universe")
     pb.add_argument("--refresh", action="store_true", help="Bypass today's cache and rebuild")

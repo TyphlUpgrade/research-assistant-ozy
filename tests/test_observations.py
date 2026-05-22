@@ -41,7 +41,7 @@ def _obs(symbol: str = "NVDA", **kw) -> Observation:
         risks=["r1"],
         flagged_risks=["fr1"],
         open_questions=["q1"],
-        anchors=["a1"],
+        anchors=[{"claim": "x", "source": "y"}],
     )
     defaults.update(kw)
     return Observation(**defaults)
@@ -69,7 +69,7 @@ def test_round_trip_preserves_fields(tmp_path: Path) -> None:
         risks=["r1"],
         flagged_risks=["fr1", "fr2"],
         open_questions=["q1", "q2", "q3"],
-        anchors=["a1"],
+        anchors=[{"claim": "x", "source": "y"}],
         conviction=0.42,
     )
     append_observation(original, tmp_path)
@@ -130,6 +130,29 @@ def test_separate_tickers_have_separate_files(tmp_path: Path) -> None:
     ionq = read_observations("IONQ", tmp_path)
     assert [e.thesis for e in nvda] == ["nvda thesis"]
     assert [e.thesis for e in ionq] == ["ionq thesis"]
+
+
+def test_anchors_must_be_list_of_dicts(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="Observation.anchors must be list\\[dict\\]"):
+        _obs(anchors=["bare-string-anchor"])
+
+
+def test_schema_version_persists_to_jsonl(tmp_path: Path) -> None:
+    append_observation(_obs(), tmp_path)
+    raw = (tmp_path / "tickers" / "NVDA" / "observations.jsonl").read_text().strip()
+    payload = json.loads(raw)
+    assert payload["schema_version"] == 1
+
+
+def test_read_skips_malformed_jsonl_line(tmp_path: Path) -> None:
+    append_observation(_obs(thesis="good1"), tmp_path)
+    # Corrupt the file by appending a non-JSON line in the middle
+    path = tmp_path / "tickers" / "NVDA" / "observations.jsonl"
+    with open(path, "a") as f:
+        f.write("{this is not valid json\n")
+    append_observation(_obs(thesis="good2"), tmp_path)
+    events = read_observations("NVDA", tmp_path)
+    assert [e.thesis for e in events] == ["good1", "good2"]
 
 
 @pytest.mark.asyncio

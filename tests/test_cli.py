@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -44,19 +45,21 @@ def test_parser_probe_subcommand() -> None:
     assert ns.cmd == "probe"
     assert ns.ticker == "IONQ"
     assert ns.question == "What is the catalyst?"
-    assert ns.deep is False
-
-
-def test_parser_probe_deep_flag() -> None:
-    parser = cli._build_parser()
-    ns = parser.parse_args(["probe", "IONQ", "Q?", "--deep"])
-    assert ns.deep is True
 
 
 def test_parser_probe_requires_question() -> None:
     parser = cli._build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["probe", "IONQ"])
+
+
+def test_parser_probe_deep_flag_removed() -> None:
+    """Post-remediation: --deep was dropped per architect + code-review
+    feedback (Skeptic over a zero-information thesis was contract-unsafe).
+    Pin the removal so it doesn't silently come back."""
+    parser = cli._build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["probe", "IONQ", "Q?", "--deep"])
 
 
 def test_parser_brief_with_drilldown() -> None:
@@ -312,6 +315,23 @@ def test_load_anchors_skips_corrupt_jsonl_lines(tmp_path: Path) -> None:
     assert len(result) == 2
 
 
+def test_load_anchors_includes_probe_events(tmp_path: Path) -> None:
+    """Defender's anchor corpus must include stage_2_probe events. Pins
+    the post-remediation fix: prior to it, /probe-sourced citations were
+    silently dropped, causing Defender to over-fire on probe citations
+    in user pushback."""
+    traces = tmp_path / "traces"
+    chain = "20260522T000000-probe"
+    _append_trace_event(traces, chain,
+        anchors=[{"claim": "probe-only fact", "source": "yfinance:fetch_news:IONQ:item_0"}],
+        symbol="IONQ",
+        stage_id="stage_2_probe",
+    )
+    result = cli._load_anchors_from_chain(traces, chain)
+    assert len(result) == 1
+    assert result[0]["claim"] == "probe-only fact"
+
+
 def test_defender_check_brief_scoping_uses_ticker(tmp_path: Path, capsys) -> None:
     """End-to-end: a TSLA pushback citing "+24% 30d" must NOT verify against
     the NVDA anchor (also "+24% 30d") when --ticker TSLA scopes the corpus."""
@@ -502,3 +522,70 @@ def test_main_generic_exception_returns_1(monkeypatch, tmp_path: Path) -> None:
 
     rc = cli.main(["--base", str(tmp_path), "trace", "x"])
     assert rc == 1
+
+
+# ---------------------------------------------------------------------------
+# _load_dotenv — .env autoload behavior
+# ---------------------------------------------------------------------------
+
+def _make_project_root(root: Path, env_content: str) -> Path:
+    """Build a fake project root with a marker (pyproject.toml) and .env."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "pyproject.toml").write_text("[project]\nname = 'fake'\n")
+    (root / ".env").write_text(env_content)
+    return root
+
+
+def test_load_dotenv_basic_key_value(tmp_path, monkeypatch) -> None:
+    proj = _make_project_root(tmp_path / "proj", "FOO_BASIC=bar\n")
+    monkeypatch.chdir(proj)
+    monkeypatch.delenv("FOO_BASIC", raising=False)
+    cli._load_dotenv()
+    assert os.environ.get("FOO_BASIC") == "bar"
+
+
+def test_load_dotenv_honors_export_keyword(tmp_path, monkeypatch) -> None:
+    """Shell-convention `export KEY=val` must produce env var `KEY`, not
+    `export KEY`. Pin the post-remediation parser fix."""
+    proj = _make_project_root(tmp_path / "proj", "export FOO_EXPORT=baz\n")
+    monkeypatch.chdir(proj)
+    monkeypatch.delenv("FOO_EXPORT", raising=False)
+    monkeypatch.delenv("export FOO_EXPORT", raising=False)
+    cli._load_dotenv()
+    assert os.environ.get("FOO_EXPORT") == "baz"
+    assert os.environ.get("export FOO_EXPORT") is None
+
+
+def test_load_dotenv_strips_only_matching_outer_quotes(tmp_path, monkeypatch) -> None:
+    """KEY=\"'mixed'\" preserves the inner single-quote pair; only the outer
+    double-quote pair is stripped. Pin the post-remediation quote handling."""
+    proj = _make_project_root(tmp_path / "proj", 'FOO_QUOTE="\'mixed\'"\n')
+    monkeypatch.chdir(proj)
+    monkeypatch.delenv("FOO_QUOTE", raising=False)
+    cli._load_dotenv()
+    assert os.environ.get("FOO_QUOTE") == "'mixed'"
+
+
+def test_load_dotenv_setdefault_preserves_existing_env(tmp_path, monkeypatch) -> None:
+    """A real env var must win over a .env value. Setdefault, not overwrite."""
+    proj = _make_project_root(tmp_path / "proj", "FOO_PREEXIST=from_dotenv\n")
+    monkeypatch.chdir(proj)
+    monkeypatch.setenv("FOO_PREEXIST", "from_real_env")
+    cli._load_dotenv()
+    assert os.environ.get("FOO_PREEXIST") == "from_real_env"
+
+
+def test_load_dotenv_bounds_walk_at_project_root(tmp_path, monkeypatch) -> None:
+    """If a .env exists upstream of CWD but no project marker exists in
+    between, _load_dotenv must NOT pick it up. Pin the post-remediation
+    ancestor-walk bound."""
+    parent = tmp_path / "upstream"
+    parent.mkdir()
+    (parent / ".env").write_text("FOO_UPSTREAM=should_not_load\n")
+    # No pyproject.toml or .git here — not a project root.
+    sub = parent / "sub"
+    sub.mkdir()
+    monkeypatch.chdir(sub)
+    monkeypatch.delenv("FOO_UPSTREAM", raising=False)
+    cli._load_dotenv()
+    assert os.environ.get("FOO_UPSTREAM") is None
