@@ -113,28 +113,43 @@ citations it has no way to validate.
 
 ## 3. EDGAR Form 4 insider transactions
 
-Status: **OPEN** — second-highest priority. Best academic alpha
-evidence in the candidate set; directly closes Open Questions the
-cascade is already generating ("What is the current insider
-transaction profile?" — NVDA + IONQ dossiers, 2026-05-18 to
-2026-05-22; ATM-dilution thesis check from today's run).
+Status: **PARTIAL** — parser + aggregation shipped 2026-05-22 in
+`research_assistant/edgar.py` (extends #1's `EdgarClient`) +
+`tests/test_edgar.py` (19 new tests).
 
-Gate: **Stage 1 (filter)** + **`/research` Stage 2 only** + **`/probe`**.
+Shipped:
+- `parse_form4(xml)` over stdlib ElementTree — handles SEC's
+  `<value>`-wrapper convention, HTML-entity decoding, multiple
+  reporting owners (joint filings), empty/relationship-only filings.
+  Splits non-derivative (common stock) and derivative (options /
+  RSUs) tables.
+- `Form4Transaction.net_dollars` — signed by acquired/disposed code;
+  $0-price entries (grants, exercises) contribute $0 (no yfinance
+  backfill per scope decision).
+- `EdgarClient.fetch_form4(filing)` — strict `form_type=="4"` check.
+- `aggregate_insider_activity(filings, window_days=90, as_of=)` →
+  `InsiderActivitySummary` with per-officer rollup (sorted by
+  |net $|), separated `code_mix` vs `deriv_code_mix`, window
+  filtering on `period_of_report`.
+- `stage_1_line()` — one-liner matching the spec format
+  ("insider net flow last 90d: -$42.0M / 4 sales / 0 buys").
+- `stage_2_block()` — 3-line enrichment block: counts + net $ +
+  latest tx date / code mix / top-3 officers by absolute $ impact.
 
-Surfaces:
-- **Stage 1 filter:** 1-line per candidate ("insider net flow last
-  90d: -$42M / 4 sales / 0 buys"). Decisional, not narrative-affecting.
-  Disqualifies names with severe insider selling before they reach
-  brief Stage 2.
-- **`/research` Stage 2 enrichment:** compressed 3-line summary
-  ("3 sales last 90d, net -2.1% of insider holdings, codes 100% S,
-  latest 2026-05-19; CFO held flat, CEO sold $18M") in the Stage 2
-  prompt for the committed ticker.
-- **`/probe`:** full historical insider lookup with per-officer
-  breakdown.
+Remaining for full closure:
+- **Stage 1 filter wiring** — `brief.py` Stage 1 batched-Haiku
+  prompt should consume `stage_1_line()` per candidate.
+- **`/research` Stage 2 wiring** — orchestrator should fetch the
+  committed ticker's Form 4 window and inject `stage_2_block()` into
+  the Stage 2 thesis prompt.
+- **`/probe` wiring** — per-officer breakdown surface for full
+  historical lookup.
 
-Adapter-side compression is non-negotiable; transaction-code parsing
-(P / S / A / M) is the failure mode to guard against.
+All three integrations layer on top of the shipped parser without
+adapter changes.
+
+Gate (when fully wired): **Stage 1 (filter)** + **`/research`
+Stage 2 only** + **`/probe`**.
 
 ## 4. Polymarket odds
 
