@@ -113,9 +113,8 @@ citations it has no way to validate.
 
 ## 3. EDGAR Form 4 insider transactions
 
-Status: **PARTIAL** — parser + aggregation shipped 2026-05-22 in
-`research_assistant/edgar.py` (extends #1's `EdgarClient`) +
-`tests/test_edgar.py` (19 new tests).
+Status: **CLOSED** — all three wiring surfaces shipped 2026-05-22.
+Parser + aggregation + Stage 1 / Stage 2 / `/probe` integration all live.
 
 Shipped:
 - `parse_form4(xml)` over stdlib ElementTree — handles SEC's
@@ -136,30 +135,27 @@ Shipped:
 - `stage_2_block()` — 3-line enrichment block: counts + net $ +
   latest tx date / code mix / top-3 officers by absolute $ impact.
 
-Wiring progress:
-- **`/research` Stage 2** — SHIPPED 2026-05-22.
-  `load_insider_activity(symbol)` in `edgar.py` fetches + aggregates
-  in parallel with `load_ticker_data` / `load_headlines`.
-  `orchestrator.research_ticker` accepts an optional
-  `insider_activity` kwarg; `_stage_2_thesis` injects
-  `stage_2_block()` into the new `{insider_activity_block}` slot in
-  `stage_2_thesis.txt`. Graceful degrade: EDGAR failure / unknown
-  CIK → None → "(insider activity unavailable …)" placeholder;
-  empty window → "(no Form 4 filings last 90d)". Source rule list
-  in the prompt extended with `edgar:form4:aggregate`.
-- **`/probe`** — SHIPPED 2026-05-22. Same wiring pattern as Stage 2.
-  `probe_ticker` and `_stage_2_probe` accept the kwarg; `probe.txt`
-  gains the `{insider_activity_block}` slot. CLI `_cmd_probe` now
-  fetches yfinance + EDGAR in one `asyncio.gather`. Operator can now
-  ask *"are insiders selling?"* on any dossier and get a structured
-  answer.
-- **Stage 1 filter (brief)** — OPEN. `brief.py` Stage 1 batched-
-  Haiku prompt should consume `stage_1_line()` per candidate. Cost
-  caveat: ~30 universe tickers × ~6 HTTP/s cap = ~5 min worst-case
-  per brief without parallelism work.
+Wiring (all shipped 2026-05-22):
+- **`/research` Stage 2** — `load_insider_activity(symbol)` runs in
+  parallel with `load_ticker_data` / `load_headlines`.
+  `_stage_2_thesis` injects `stage_2_block()` into the new
+  `{insider_activity_block}` slot in `stage_2_thesis.txt`. Source rule
+  list extended with `edgar:form4:aggregate`.
+- **`/probe`** — same wiring pattern as Stage 2 in `probe_ticker` /
+  `_stage_2_probe` / `probe.txt`.
+- **Stage 1 brief filter** — `load_insider_activities_batch(universe)`
+  fans out across the universe through a shared `EdgarClient`
+  (CIK ticker-index amortized to one HTTP call). `build_brief`
+  injects an `insider_summary` line per candidate; `stage_1_filter.txt`
+  gains a severe-insider-selling gate (net ≤ -$10M AND ≥3 sales AND
+  0 buys → cap `intrinsic_score` at 0.4 unless an explicit bullish
+  catalyst dominates). Graceful degrade per-ticker: unavailable /
+  no Form 4 last 90d strings are neutral.
 
-The remaining Stage 1 integration layers on top of
-`load_insider_activity` without adapter changes.
+Graceful degrade: at every surface, `None` summary maps to
+"(insider data unavailable)" while `total_filings=0` maps to
+"(no Form 4 last 90d)" so Stage 1/Stage 2/probe can distinguish
+"data missing" from "no activity".
 
 Gate (when fully wired): **Stage 1 (filter)** + **`/research`
 Stage 2 only** + **`/probe`**.

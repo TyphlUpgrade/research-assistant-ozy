@@ -20,6 +20,7 @@ from research_assistant.edgar import (
     InsiderActivitySummary,
     OfficerActivity,
 )
+from research_assistant.brief import _insider_summary_line, build_brief
 from research_assistant.dossier_io import Dossier, write_dossier_atomic
 from research_assistant.orchestrator import (
     _format_insider_activity_block,
@@ -308,6 +309,126 @@ async def test_probe_prompt_includes_insider_block() -> None:
     prompt = captured["prompt"]
     assert "INSIDER_ACTIVITY" in prompt
     assert summary.stage_2_block() in prompt
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 brief candidate-line injection
+# ---------------------------------------------------------------------------
+
+def test_insider_summary_line_none() -> None:
+    assert _insider_summary_line(None) == "(insider data unavailable)"
+
+
+def test_insider_summary_line_empty_window() -> None:
+    s = _summary(
+        total_filings=0, buys_count=0, sales_count=0, net_dollars=0.0,
+        code_mix={}, deriv_code_mix={}, by_officer=[],
+        latest_transaction_date=None,
+    )
+    assert _insider_summary_line(s) == "(no Form 4 last 90d)"
+
+
+def test_insider_summary_line_populated() -> None:
+    s = _summary()
+    line = _insider_summary_line(s)
+    assert line == s.stage_1_line()
+    assert "insider net flow last 90d" in line
+
+
+@pytest.mark.asyncio
+async def test_build_brief_injects_insider_summary_into_candidates(
+    tmp_path: Path,
+) -> None:
+    """End-to-end Stage 1 wiring: build_brief should merge insider_summary
+    into each candidate dict before sending to _stage_1_filter."""
+    captured: dict = {}
+
+    async def fake_stage_0(client, ctx):
+        return {"regime": "bull-trending", "regime_confidence": 0.7}
+
+    async def fake_stage_1(client, ws, candidates):
+        captured["candidates"] = candidates
+        return {"results": [
+            {"ticker": c["ticker"], "intrinsic_score": 0.6, "reason": "ok"}
+            for c in candidates
+        ]}
+
+    # No Stage 2 survivors — keep the test fast and focused on the Stage 1 surface
+    async def fake_stage_2_thesis(client, ws, td, s1, h, insider_activity=None):
+        return None, None
+
+    nvda_summary = _summary(
+        total_filings=4, buys_count=0, sales_count=4, net_dollars=-42_000_000,
+        code_mix={"S": 4}, deriv_code_mix={}, by_officer=[],
+        latest_transaction_date="2026-05-19",
+    )
+    insider_activities = {
+        "NVDA": nvda_summary,
+        "AAPL": None,                       # EDGAR failure → "unavailable"
+        "TSLA": _summary(                   # empty window → "no Form 4 last 90d"
+            total_filings=0, buys_count=0, sales_count=0, net_dollars=0.0,
+            code_mix={}, deriv_code_mix={}, by_officer=[],
+            latest_transaction_date=None,
+        ),
+    }
+    watchlist_data = {
+        "NVDA": {"price": 150.0, "recent_return_5d": 0.05},
+        "AAPL": {"price": 200.0, "recent_return_5d": 0.02},
+        "TSLA": {"price": 250.0, "recent_return_5d": -0.01},
+    }
+
+    with patch("research_assistant.brief._stage_0_world_state", fake_stage_0), \
+         patch("research_assistant.brief._stage_1_filter", fake_stage_1), \
+         patch("research_assistant.orchestrator._stage_2_thesis", fake_stage_2_thesis):
+        await build_brief(
+            market_context={},
+            universe=["NVDA", "AAPL", "TSLA"],
+            watchlist_tickers_with_data=watchlist_data,
+            headlines_per_ticker={"NVDA": [], "AAPL": [], "TSLA": []},
+            research_base=tmp_path,
+            insider_activities=insider_activities,
+        )
+
+    candidates = {c["ticker"]: c for c in captured["candidates"]}
+    assert candidates["NVDA"]["insider_summary"] == nvda_summary.stage_1_line()
+    assert "-$42.0M / 4 sales / 0 buys" in candidates["NVDA"]["insider_summary"]
+    assert candidates["AAPL"]["insider_summary"] == "(insider data unavailable)"
+    assert candidates["TSLA"]["insider_summary"] == "(no Form 4 last 90d)"
+
+
+@pytest.mark.asyncio
+async def test_build_brief_default_insider_activities_unavailable(
+    tmp_path: Path,
+) -> None:
+    """When insider_activities is not provided (legacy callers), each
+    candidate gets '(insider data unavailable)' — preserves the failure-
+    mode signal rather than silently omitting the field."""
+    captured: dict = {}
+
+    async def fake_stage_0(client, ctx):
+        return {"regime": "bull-trending"}
+
+    async def fake_stage_1(client, ws, candidates):
+        captured["candidates"] = candidates
+        return {"results": [
+            {"ticker": c["ticker"], "intrinsic_score": 0.6, "reason": "ok"}
+            for c in candidates
+        ]}
+
+    async def fake_stage_2_thesis(client, ws, td, s1, h, insider_activity=None):
+        return None, None
+
+    with patch("research_assistant.brief._stage_0_world_state", fake_stage_0), \
+         patch("research_assistant.brief._stage_1_filter", fake_stage_1), \
+         patch("research_assistant.orchestrator._stage_2_thesis", fake_stage_2_thesis):
+        await build_brief(
+            market_context={},
+            universe=["NVDA"],
+            watchlist_tickers_with_data={"NVDA": {"price": 150.0}},
+            headlines_per_ticker={"NVDA": []},
+            research_base=tmp_path,
+        )
+    assert captured["candidates"][0]["insider_summary"] == "(insider data unavailable)"
 
 
 @pytest.mark.asyncio

@@ -31,6 +31,7 @@ from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from research_assistant.claude_sdk import ClaudeClient
+from research_assistant.edgar import InsiderActivitySummary
 from research_assistant.observations import Observation, append_observation, now_iso
 from research_assistant.orchestrator import _load_prompt, _render, _chain_id
 from research_assistant.trace_renderer import append_stage_event
@@ -160,6 +161,19 @@ async def _stage_2_for_survivor(
 # Brief builder
 # ---------------------------------------------------------------------------
 
+def _insider_summary_line(
+    summary: Optional[InsiderActivitySummary],
+) -> str:
+    """Stage 1 candidate-line rendering for FOLLOWUPS #3.
+    None → unavailable; empty window → distinct neutral string; populated
+    → stage_1_line() (e.g. 'insider net flow last 90d: -$42.0M / 4 sales / 0 buys')."""
+    if summary is None:
+        return "(insider data unavailable)"
+    if summary.total_filings == 0:
+        return f"(no Form 4 last {summary.window_days}d)"
+    return summary.stage_1_line()
+
+
 async def build_brief(
     *,
     market_context: dict,
@@ -168,6 +182,9 @@ async def build_brief(
     headlines_per_ticker: dict[str, list[dict]],
     research_base: Path,
     client: Optional[ClaudeClient] = None,
+    insider_activities: Optional[
+        dict[str, Optional[InsiderActivitySummary]]
+    ] = None,
 ) -> Brief:
     """
     Build the morning brief. Caller provides pre-loaded market context +
@@ -181,6 +198,11 @@ async def build_brief(
         headlines_per_ticker: dict of {ticker: [headline_dicts]}
         research_base: path to `.research/` directory
         client: optional ClaudeClient (cost continuity across stages)
+        insider_activities: optional dict of {ticker: Optional[InsiderActivitySummary]}
+            from `load_insider_activities_batch` (FOLLOWUPS #3). When provided,
+            each Stage 1 candidate gains an `insider_summary` line so Haiku
+            can gate on severe insider selling. None values per-ticker are
+            tolerated (graceful degrade per failed ticker).
 
     Returns:
         Brief with world_state + ranked items. Cached to
@@ -198,8 +220,15 @@ async def build_brief(
         raise RuntimeError("Stage 0 (world state) JSON parse failed")
 
     # Stage 1 — batched filter
+    insider_activities = insider_activities or {}
     candidates = [
-        {"ticker": ticker, **data}
+        {
+            "ticker": ticker,
+            **data,
+            "insider_summary": _insider_summary_line(
+                insider_activities.get(ticker.upper())
+            ),
+        }
         for ticker, data in watchlist_tickers_with_data.items()
     ]
     stage_1 = await _stage_1_filter(client, world_state, candidates)

@@ -21,7 +21,9 @@ WORLD_STATE: See system context for current regime, macro_signals, and spread_si
 
 CANDIDATES (from `.research/watchlist.txt`; each entry has `ticker`, `price`,
 `recent_return_5d`, `volume_ratio`, optional `sector`, `return_30d`,
-`return_90d`, optional `earnings_within_days`):
+`return_90d`, optional `earnings_within_days`, and `insider_summary`
+— a compressed Form 4 line per FOLLOWUPS #3, e.g.
+"insider net flow last 90d: -$42.0M / 4 sales / 0 buys"):
 {candidates_json}
 
 INSTRUCTIONS:
@@ -43,6 +45,12 @@ INSTRUCTIONS:
 - Tickers contradicting the regime call (e.g. defensive sector in bull-trending
   regime, or high-beta growth in panic regime) without an explicit catalyst →
   cap `intrinsic_score` at 0.4.
+- INSIDER SELLING gate (FOLLOWUPS #3): when `insider_summary` shows severe
+  net selling (net flow ≤ -$10M AND sales_count ≥ 3 AND buys_count = 0),
+  cap `intrinsic_score` at 0.4 unless an explicit bullish catalyst (return_30d
+  > 20% on rising volume, earnings beat, regime tailwind) dominates. State the
+  insider signal in `reason` so the operator sees it. An "(insider data
+  unavailable)" or "(no Form 4 last 90d)" summary is neutral — do NOT penalize.
 
 OUTPUT — STRICT JSON (no commentary, no markdown fences):
 

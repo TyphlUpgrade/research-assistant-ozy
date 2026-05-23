@@ -38,6 +38,7 @@ from research_assistant.edgar import (
     _RateLimiter,
     _relationship_label,
     aggregate_insider_activity,
+    load_insider_activities_batch,
     load_insider_activity,
     parse_form4,
 )
@@ -994,6 +995,56 @@ async def test_load_insider_activity_no_filings_returns_zero_summary() -> None:
     assert summary is not None
     assert summary.total_filings == 0
     assert summary.window_days == 90
+
+
+@pytest.mark.asyncio
+async def test_load_insider_activities_batch_amortizes_ticker_index() -> None:
+    """Three tickers should share one company_tickers.json fetch
+    (lazy CIK cache amortizes across calls on the shared client)."""
+    submissions = _make_form4_submissions([])
+    ticker_index_hits = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal ticker_index_hits
+        url = str(request.url)
+        if url.startswith("https://www.sec.gov/files/company_tickers.json"):
+            ticker_index_hits += 1
+            return httpx.Response(200, json=_TICKER_INDEX_BODY, request=request)
+        if url.startswith("https://data.sec.gov/submissions/"):
+            return httpx.Response(200, json=submissions, request=request)
+        return httpx.Response(404, request=request)
+
+    async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+        result = await load_insider_activities_batch(
+            ["NVDA", "AAPL", "CRM"], client=client, as_of=date(2026, 5, 22),
+        )
+    assert ticker_index_hits == 1
+    assert set(result.keys()) == {"NVDA", "AAPL", "CRM"}
+    for sym, summary in result.items():
+        assert summary is not None
+        assert summary.total_filings == 0
+
+
+@pytest.mark.asyncio
+async def test_load_insider_activities_batch_per_ticker_failure_isolated() -> None:
+    """One bogus ticker → None in the dict; other tickers still populate."""
+    submissions = _make_form4_submissions([])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.startswith("https://www.sec.gov/files/company_tickers.json"):
+            return httpx.Response(200, json=_TICKER_INDEX_BODY, request=request)
+        if url.startswith("https://data.sec.gov/submissions/"):
+            return httpx.Response(200, json=submissions, request=request)
+        return httpx.Response(404, request=request)
+
+    async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+        result = await load_insider_activities_batch(
+            ["NVDA", "BOGUS"], client=client, as_of=date(2026, 5, 22),
+        )
+    assert result["BOGUS"] is None
+    assert result["NVDA"] is not None
+    assert result["NVDA"].total_filings == 0
 
 
 @pytest.mark.asyncio

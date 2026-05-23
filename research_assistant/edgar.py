@@ -747,6 +747,46 @@ INSIDER_DEFAULT_WINDOW_DAYS = 90
 INSIDER_DEFAULT_MAX_FILINGS = 25
 
 
+async def load_insider_activities_batch(
+    symbols: list[str],
+    *,
+    window_days: int = INSIDER_DEFAULT_WINDOW_DAYS,
+    max_filings_per_ticker: int = INSIDER_DEFAULT_MAX_FILINGS,
+    client: Optional[EdgarClient] = None,
+    as_of: Optional[date] = None,
+) -> dict[str, Optional[InsiderActivitySummary]]:
+    """Batch version of `load_insider_activity` for /brief's universe scan.
+
+    Shares one EdgarClient across all tickers so the CIK ticker-index is
+    fetched once and reused. Symbols are fanned out via `asyncio.gather`;
+    the client's rate limiter serializes outbound requests naturally.
+
+    Returns a dict keyed by uppercase symbol. Each value is the
+    InsiderActivitySummary (which may itself be empty — total_filings=0)
+    or None when the per-ticker load failed (graceful degrade).
+    """
+    owns_client = client is None
+    if client is None:
+        client = EdgarClient()
+    try:
+        results = await asyncio.gather(
+            *[
+                load_insider_activity(
+                    s,
+                    window_days=window_days,
+                    max_filings=max_filings_per_ticker,
+                    client=client,
+                    as_of=as_of,
+                )
+                for s in symbols
+            ],
+        )
+        return {s.upper(): r for s, r in zip(symbols, results)}
+    finally:
+        if owns_client:
+            await client.close()
+
+
 async def load_insider_activity(
     symbol: str,
     *,

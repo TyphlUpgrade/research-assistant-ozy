@@ -379,6 +379,7 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
         build_world_state_input,
         load_watchlist_data,
     )
+    from research_assistant.edgar import load_insider_activities_batch
     from research_assistant.universe import discover_universe
 
     base = _resolve_base(args.base)
@@ -442,14 +443,22 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
         market_context = await build_world_state_input(
             adapter, watchlist_news_for=news_seed,
         )
-        tickers_with_data, headlines_per_ticker = await load_watchlist_data(
-            universe, adapter
+        if not args.quiet:
+            print(
+                f"Fetching Form 4 insider activity for {len(universe)} tickers "
+                f"(~{len(universe) // 5 + 1}s at 5 req/sec)…",
+                file=sys.stderr,
+            )
+        (tickers_with_data, headlines_per_ticker), insider_activities = await asyncio.gather(
+            load_watchlist_data(universe, adapter),
+            load_insider_activities_batch(universe),
         )
         brief = await build_brief(
             market_context=market_context,
             universe=universe,
             watchlist_tickers_with_data=tickers_with_data,
             headlines_per_ticker=headlines_per_ticker,
+            insider_activities=insider_activities,
             research_base=base,
         )
 
