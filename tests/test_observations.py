@@ -159,7 +159,7 @@ def test_read_skips_malformed_jsonl_line(tmp_path: Path) -> None:
 async def test_research_ticker_emits_research_observation(tmp_path: Path) -> None:
     """research_ticker must append a kind="research" event after the dossier
     write — pins FOLLOWUPS #1 brief→/research integration."""
-    async def fake_stage_2(client, ws, td, s1, h, insider_activity=None):
+    async def fake_stage_2(client, ws, td, s1, h, insider_activity=None, institutional_ownership=None):
         return {
             "ticker": "AAPL",
             "thesis_text": "Mocked Stage 2 thesis.",

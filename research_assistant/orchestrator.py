@@ -33,7 +33,7 @@ from research_assistant.dossier_io import (
     read_dossier,
     write_dossier_atomic,
 )
-from research_assistant.edgar import InsiderActivitySummary
+from research_assistant.edgar import InsiderActivitySummary, InstitutionalOwnership
 from research_assistant.observations import Observation, append_observation
 from research_assistant.trace_renderer import append_stage_event
 from ozymandias.intelligence.claude_json import parse_claude_response
@@ -100,6 +100,22 @@ def _format_insider_activity_block(
     return insider_activity.stage_2_block()
 
 
+def _format_institutional_ownership_block(
+    ownership: Optional[InstitutionalOwnership],
+) -> str:
+    """Render an InstitutionalOwnership into the
+    {institutional_ownership_block} slot (FOLLOWUPS #5). Mirrors the
+    None/empty/populated three-state pattern used for insider activity."""
+    if ownership is None:
+        return "(institutional ownership unavailable — no tracked-fund 13F coverage)"
+    if ownership.funds_holding == 0 and ownership.funds_holding_prior == 0:
+        return (
+            f"(no tracked-fund 13F positions in {ownership.ticker} as of "
+            f"{ownership.period or 'last quarter'})"
+        )
+    return ownership.stage_2_line()
+
+
 async def _stage_2_thesis(
     client: ClaudeClient,
     world_state: dict,
@@ -107,6 +123,7 @@ async def _stage_2_thesis(
     stage_1_result: dict,
     headlines: list[dict],
     insider_activity: Optional[InsiderActivitySummary] = None,
+    institutional_ownership: Optional[InstitutionalOwnership] = None,
 ) -> tuple[Optional[dict], Optional[CallResult]]:
     """
     Invoke Stage 2 (Sonnet thesis). Returns (parsed_json, call_metadata).
@@ -120,6 +137,7 @@ async def _stage_2_thesis(
         stage_1_json=json.dumps(stage_1_result, indent=2),
         headlines_json=json.dumps(headlines, indent=2),
         insider_activity_block=_format_insider_activity_block(insider_activity),
+        institutional_ownership_block=_format_institutional_ownership_block(institutional_ownership),
     )
     system = f"WORLD_STATE for this session:\n{json.dumps(world_state, indent=2)}"
     result = await client.call(prompt, model="claude-sonnet-4-6", system=system)
@@ -157,6 +175,7 @@ async def research_ticker(
     base: Path,
     client: Optional[ClaudeClient] = None,
     insider_activity: Optional[InsiderActivitySummary] = None,
+    institutional_ownership: Optional[InstitutionalOwnership] = None,
 ) -> ResearchResult:
     """
     Run the mini-cascade for one ticker. Stage 2 thesis + Stage 3 Skeptic,
@@ -195,6 +214,7 @@ async def research_ticker(
     stage_2, s2_meta = await _stage_2_thesis(
         client, world_state, ticker_data, stage_1_placeholder, headlines,
         insider_activity=insider_activity,
+        institutional_ownership=institutional_ownership,
     )
     traces_base = base / "traces"
     append_stage_event(
@@ -350,6 +370,7 @@ async def _stage_2_probe(
     dossier_context: str,
     focused_question: str,
     insider_activity: Optional[InsiderActivitySummary] = None,
+    institutional_ownership: Optional[InstitutionalOwnership] = None,
 ) -> tuple[Optional[dict], Optional[CallResult]]:
     """Invoke the probe stage (Sonnet, dossier-scoped focused answer).
     Returns (parsed_json, call_metadata)."""
@@ -361,6 +382,7 @@ async def _stage_2_probe(
         dossier_context=dossier_context,
         focused_question=focused_question,
         insider_activity_block=_format_insider_activity_block(insider_activity),
+        institutional_ownership_block=_format_institutional_ownership_block(institutional_ownership),
     )
     system = f"WORLD_STATE for this session:\n{json.dumps(world_state, indent=2)}"
     result = await client.call(prompt, model="claude-sonnet-4-6", system=system)
@@ -377,6 +399,7 @@ async def probe_ticker(
     base: Path,
     client: Optional[ClaudeClient] = None,
     insider_activity: Optional[InsiderActivitySummary] = None,
+    institutional_ownership: Optional[InstitutionalOwnership] = None,
 ) -> ProbeResult:
     """Run a focused probe against an existing dossier.
 
@@ -413,6 +436,7 @@ async def probe_ticker(
     stage_2, s2_meta = await _stage_2_probe(
         client, world_state, ticker_data, headlines, dossier_context, question,
         insider_activity=insider_activity,
+        institutional_ownership=institutional_ownership,
     )
     append_stage_event(
         chain_id=chain,

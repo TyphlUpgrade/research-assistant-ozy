@@ -57,6 +57,9 @@ RECENT_HEADLINES (annotated by absorption stage):
 INSIDER_ACTIVITY (Form 4 filings, compressed; per FOLLOWUPS #3):
 {insider_activity_block}
 
+INSTITUTIONAL_OWNERSHIP (Form 13F across curated tracked funds; per FOLLOWUPS #5):
+{institutional_ownership_block}
+
 NEWS REACTIVITY DISCIPLINE:
 - "fresh_likely_priced_in" headlines (<2h old) indicate the market HAS ALREADY MOVED on this news.
   Treat them as RISK signals (chase risk), NOT confirmation signals.
@@ -85,6 +88,10 @@ was driven by...", an anchor entry might be:
   - "edgar:form4:aggregate" for any claim drawn from the
     INSIDER_ACTIVITY block above (counts, net flow $, code mix,
     per-officer breakdown)
+  - "edgar:13f:aggregate" for any claim drawn from the
+    INSTITUTIONAL_OWNERSHIP block above (fund counts, total $/shares,
+    new/exited positions, per-fund breakdown). 45-day reporting lag —
+    fundamental signal, not catalyst-timing.
   - "world_state" for regime-derived inferences
   - "dossier:state" / "dossier:ledger:<chain_id>" when citing prior
     dossier content (the dossier IS authoritative for what the system

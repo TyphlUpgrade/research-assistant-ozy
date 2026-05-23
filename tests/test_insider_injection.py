@@ -17,13 +17,16 @@ from unittest.mock import patch
 import pytest
 
 from research_assistant.edgar import (
+    FundPosition,
     InsiderActivitySummary,
+    InstitutionalOwnership,
     OfficerActivity,
 )
 from research_assistant.brief import _insider_summary_line, build_brief
 from research_assistant.dossier_io import Dossier, write_dossier_atomic
 from research_assistant.orchestrator import (
     _format_insider_activity_block,
+    _format_institutional_ownership_block,
     _stage_2_probe,
     _stage_2_thesis,
     probe_ticker,
@@ -97,7 +100,7 @@ async def test_research_ticker_forwards_insider_activity(tmp_path: Path) -> None
     _stage_2_thesis without dropping or transforming it."""
     captured: dict = {}
 
-    async def fake_stage_2(client, ws, td, s1, h, insider_activity=None):
+    async def fake_stage_2(client, ws, td, s1, h, insider_activity=None, institutional_ownership=None):
         captured["insider_activity"] = insider_activity
         return {
             "ticker": "NVDA",
@@ -142,7 +145,7 @@ async def test_research_ticker_default_insider_activity_is_none(
     callers) get None forwarded — preserving the graceful-degrade signal."""
     captured: dict = {}
 
-    async def fake_stage_2(client, ws, td, s1, h, insider_activity=None):
+    async def fake_stage_2(client, ws, td, s1, h, insider_activity=None, institutional_ownership=None):
         captured["insider_activity"] = insider_activity
         return {
             "ticker": "NVDA",
@@ -257,7 +260,7 @@ async def test_probe_ticker_forwards_insider_activity(tmp_path: Path) -> None:
     write_dossier_atomic(Dossier(symbol="NVDA", state_md="prior thesis"), tmp_path)
     captured: dict = {}
 
-    async def fake_probe(client, ws, td, h, dc, q, insider_activity=None):
+    async def fake_probe(client, ws, td, h, dc, q, insider_activity=None, institutional_ownership=None):
         captured["insider_activity"] = insider_activity
         return {
             "ticker": "NVDA", "answer": "ans",
@@ -429,6 +432,202 @@ async def test_build_brief_default_insider_activities_unavailable(
             research_base=tmp_path,
         )
     assert captured["candidates"][0]["insider_summary"] == "(insider data unavailable)"
+
+
+# ---------------------------------------------------------------------------
+# FOLLOWUPS #5 — institutional ownership (13F) injection
+# ---------------------------------------------------------------------------
+
+def _ownership(**overrides) -> InstitutionalOwnership:
+    defaults = dict(
+        ticker="NVDA", issuer_match="NVIDIA",
+        period="2026-03-31", prior_period="2025-12-31",
+        funds_tracked=5, funds_holding=2, funds_holding_prior=1,
+        new_positions=1, exited_positions=0,
+        total_shares=21e6, total_value_usd=3.2e9,
+        positions=[
+            FundPosition(manager_cik="01", manager_name="BlackRock",
+                         shares=12e6, value_usd=1.8e9, title_of_class="COM"),
+            FundPosition(manager_cik="02", manager_name="Vanguard",
+                         shares=9e6, value_usd=1.4e9, title_of_class="COM"),
+        ],
+    )
+    defaults.update(overrides)
+    return InstitutionalOwnership(**defaults)
+
+
+def test_format_ownership_block_none_signals_unavailable() -> None:
+    out = _format_institutional_ownership_block(None)
+    assert "unavailable" in out.lower()
+
+
+def test_format_ownership_block_empty_signals_no_positions() -> None:
+    s = _ownership(
+        funds_holding=0, funds_holding_prior=0, new_positions=0,
+        exited_positions=0, total_shares=0, total_value_usd=0, positions=[],
+    )
+    out = _format_institutional_ownership_block(s)
+    assert "no tracked-fund 13F positions" in out
+    assert "unavailable" not in out.lower()
+
+
+def test_format_ownership_block_populated_uses_stage_2_line() -> None:
+    s = _ownership()
+    out = _format_institutional_ownership_block(s)
+    assert out == s.stage_2_line()
+    assert "BlackRock $1.8B" in out
+
+
+@pytest.mark.asyncio
+async def test_research_ticker_forwards_institutional_ownership(tmp_path: Path) -> None:
+    captured: dict = {}
+
+    async def fake_stage_2(client, ws, td, s1, h, insider_activity=None, institutional_ownership=None):
+        captured["institutional_ownership"] = institutional_ownership
+        return {
+            "ticker": "NVDA", "thesis_text": "t", "conviction_score": 0.5,
+            "key_drivers": ["d"], "risks": ["r"], "open_questions": [],
+            "evidence_anchors": [
+                {"claim": "d", "source": "x"},
+                {"claim": "r", "source": "y"},
+            ],
+        }, None
+
+    async def fake_stage_3(client, ws, twd, model="x"):
+        return {
+            "ticker": "NVDA", "critique_text": "c", "adjusted_score": 0.5,
+            "flagged_risks": [], "open_questions_added": [],
+            "news_reactivity_flag": False,
+        }, None
+
+    ownership = _ownership()
+    with patch("research_assistant.orchestrator._stage_2_thesis", fake_stage_2), \
+         patch("research_assistant.orchestrator._stage_3_skeptic", fake_stage_3):
+        await research_ticker(
+            "NVDA",
+            world_state={}, ticker_data={"price": 150.0}, headlines=[],
+            base=tmp_path, institutional_ownership=ownership,
+        )
+    assert captured["institutional_ownership"] is ownership
+
+
+@pytest.mark.asyncio
+async def test_probe_ticker_forwards_institutional_ownership(tmp_path: Path) -> None:
+    write_dossier_atomic(Dossier(symbol="NVDA", state_md="prior thesis"), tmp_path)
+    captured: dict = {}
+
+    async def fake_probe(client, ws, td, h, dc, q, insider_activity=None, institutional_ownership=None):
+        captured["institutional_ownership"] = institutional_ownership
+        return {
+            "ticker": "NVDA", "answer": "ans",
+            "evidence_anchors": [{"claim": "ans", "source": "x"}],
+            "closes_questions": [], "new_open_questions": [],
+        }, None
+
+    ownership = _ownership()
+    with patch("research_assistant.orchestrator._stage_2_probe", fake_probe):
+        await probe_ticker(
+            "NVDA", "who holds the most?",
+            world_state={}, ticker_data={"price": 150.0}, headlines=[],
+            base=tmp_path, institutional_ownership=ownership,
+        )
+    assert captured["institutional_ownership"] is ownership
+
+
+@pytest.mark.asyncio
+async def test_stage_2_prompt_includes_institutional_block() -> None:
+    captured: dict = {}
+
+    class _FakeClient:
+        async def call(self, prompt, *, model, system=None):
+            captured["prompt"] = prompt
+
+            class _Result:
+                text = '{"ticker":"NVDA","thesis_text":"t","conviction_score":0.5,"key_drivers":["d"],"risks":["r"],"open_questions":[],"evidence_anchors":[{"claim":"d","source":"x"},{"claim":"r","source":"y"}]}'
+                input_tokens = 0
+                output_tokens = 0
+                cost_usd = 0.0
+                latency_ms = 0
+                model = "claude-sonnet-4-6"
+
+            return _Result()
+
+    ownership = _ownership()
+    parsed, _ = await _stage_2_thesis(
+        _FakeClient(),
+        world_state={"regime": "bull-trending"},
+        ticker_data={"price": 150.0},
+        stage_1_result={"ticker": "NVDA"},
+        headlines=[],
+        institutional_ownership=ownership,
+    )
+    assert parsed is not None
+    prompt = captured["prompt"]
+    assert "INSTITUTIONAL_OWNERSHIP" in prompt
+    assert ownership.stage_2_line() in prompt
+    # source-rule list line picked up too
+    assert "edgar:13f:aggregate" in prompt
+
+
+@pytest.mark.asyncio
+async def test_probe_prompt_includes_institutional_block() -> None:
+    captured: dict = {}
+
+    class _FakeClient:
+        async def call(self, prompt, *, model, system=None):
+            captured["prompt"] = prompt
+
+            class _Result:
+                text = '{"ticker":"NVDA","answer":"a","evidence_anchors":[{"claim":"a","source":"x"}],"closes_questions":[],"new_open_questions":[]}'
+                input_tokens = 0
+                output_tokens = 0
+                cost_usd = 0.0
+                latency_ms = 0
+                model = "claude-sonnet-4-6"
+
+            return _Result()
+
+    ownership = _ownership()
+    parsed, _ = await _stage_2_probe(
+        _FakeClient(),
+        world_state={}, ticker_data={"price": 150.0}, headlines=[],
+        dossier_context="", focused_question="who holds the most?",
+        institutional_ownership=ownership,
+    )
+    assert parsed is not None
+    prompt = captured["prompt"]
+    assert "INSTITUTIONAL_OWNERSHIP" in prompt
+    assert ownership.stage_2_line() in prompt
+    assert "edgar:13f:aggregate" in prompt
+
+
+@pytest.mark.asyncio
+async def test_stage_2_prompt_institutional_default_none_substitutes() -> None:
+    captured: dict = {}
+
+    class _FakeClient:
+        async def call(self, prompt, *, model, system=None):
+            captured["prompt"] = prompt
+
+            class _Result:
+                text = '{"ticker":"NVDA","thesis_text":"t","conviction_score":0.5,"key_drivers":["d"],"risks":["r"],"open_questions":[],"evidence_anchors":[{"claim":"d","source":"x"},{"claim":"r","source":"y"}]}'
+                input_tokens = 0
+                output_tokens = 0
+                cost_usd = 0.0
+                latency_ms = 0
+                model = "claude-sonnet-4-6"
+
+            return _Result()
+
+    await _stage_2_thesis(
+        _FakeClient(),
+        world_state={}, ticker_data={"price": 150.0},
+        stage_1_result={"ticker": "NVDA"}, headlines=[],
+    )
+    prompt = captured["prompt"]
+    assert "{institutional_ownership_block}" not in prompt
+    # Default None → unavailable placeholder for both blocks
+    assert "institutional ownership unavailable" in prompt.lower()
 
 
 @pytest.mark.asyncio

@@ -44,6 +44,9 @@ RECENT_HEADLINES (annotated by absorption stage):
 INSIDER_ACTIVITY (Form 4 filings, compressed; per FOLLOWUPS #3):
 {insider_activity_block}
 
+INSTITUTIONAL_OWNERSHIP (Form 13F across curated tracked funds; per FOLLOWUPS #5):
+{institutional_ownership_block}
+
 NEWS REACTIVITY DISCIPLINE:
 - "fresh_likely_priced_in" headlines (<2h old) indicate the market HAS ALREADY MOVED on this news.
   Treat them as RISK signals (chase risk), NOT entry signals. Discount conviction_score by >= 0.10
@@ -96,6 +99,10 @@ Use:
     fields directly present in the TICKER_DATA input block
   - "edgar:form4:aggregate" for any claim drawn from the INSIDER_ACTIVITY
     block above (counts, net flow $, code mix, per-officer breakdown)
+  - "edgar:13f:aggregate" for any claim drawn from the
+    INSTITUTIONAL_OWNERSHIP block above (fund counts, total $/shares,
+    new/exited positions, per-fund breakdown). Note the 45-day reporting
+    lag — 13F flow is fundamental signal, not catalyst-timing.
   - "world_state" for regime-derived inferences (sector tailwind, dispersion, etc.)
   - "no_fetch" ONLY as a last resort for inferences without ANY data source —
     if you use this, drop conviction_score by at least 0.1 and consider whether

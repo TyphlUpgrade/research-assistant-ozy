@@ -125,20 +125,27 @@ async def _cmd_research(args: argparse.Namespace) -> int:
         load_headlines,
         load_ticker_data,
     )
-    from research_assistant.edgar import load_insider_activity
+    from research_assistant.edgar import (
+        load_insider_activity,
+        load_institutional_ownership,
+    )
     from research_assistant.orchestrator import research_ticker
 
     base = _resolve_base(args.base)
     symbol = args.ticker.upper()
     adapter = YFinanceAdapter()
 
-    # Load market data + insider activity in parallel
+    # Load market data + insider activity + institutional ownership in parallel
     if not args.quiet:
-        print(f"Loading {symbol} data (yfinance + EDGAR Form 4)…", file=sys.stderr)
-    ticker_data, headlines, insider_activity = await asyncio.gather(
+        print(
+            f"Loading {symbol} data (yfinance + EDGAR Form 4 + 13F)…",
+            file=sys.stderr,
+        )
+    ticker_data, headlines, insider_activity, institutional_ownership = await asyncio.gather(
         load_ticker_data(symbol, adapter),
         load_headlines(symbol, adapter, max_items=5),
         load_insider_activity(symbol),
+        load_institutional_ownership(symbol),
     )
     if ticker_data.get("_data_quality") != "ok":
         print(
@@ -172,6 +179,7 @@ async def _cmd_research(args: argparse.Namespace) -> int:
             headlines=headlines,
             base=base,
             insider_activity=insider_activity,
+            institutional_ownership=institutional_ownership,
         )
     except RuntimeError as exc:
         # research_ticker embeds the chain_id in stage-parse failure messages
@@ -259,7 +267,10 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
         load_headlines,
         load_ticker_data,
     )
-    from research_assistant.edgar import load_insider_activity
+    from research_assistant.edgar import (
+        load_insider_activity,
+        load_institutional_ownership,
+    )
     from research_assistant.orchestrator import probe_ticker
 
     base = _resolve_base(args.base)
@@ -267,11 +278,15 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
     adapter = YFinanceAdapter()
 
     if not args.quiet:
-        print(f"Loading {symbol} data (yfinance + EDGAR Form 4)…", file=sys.stderr)
-    ticker_data, headlines, insider_activity = await asyncio.gather(
+        print(
+            f"Loading {symbol} data (yfinance + EDGAR Form 4 + 13F)…",
+            file=sys.stderr,
+        )
+    ticker_data, headlines, insider_activity, institutional_ownership = await asyncio.gather(
         load_ticker_data(symbol, adapter),
         load_headlines(symbol, adapter, max_items=5),
         load_insider_activity(symbol),
+        load_institutional_ownership(symbol),
     )
     if ticker_data.get("_data_quality") != "ok":
         print(
@@ -303,6 +318,7 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
             headlines=headlines,
             base=base,
             insider_activity=insider_activity,
+            institutional_ownership=institutional_ownership,
         )
     except FileNotFoundError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

@@ -192,9 +192,8 @@ Anchors are stable
 
 ## 5. EDGAR 13F institutional filings
 
-Status: **PARTIAL** — adapter + per-stock aggregation shipped
-2026-05-23 in `research_assistant/edgar/form13f.py` +
-`tests/test_edgar_13f.py` (22 tests).
+Status: **CLOSED** — adapter + aggregation + Stage 2 + `/probe`
+wiring all shipped 2026-05-23.
 
 Shipped:
 - `parse_13f(xml)` — namespace-stripped ElementTree parse of
@@ -218,15 +217,21 @@ Shipped:
 - `DEFAULT_TRACKED_FUNDS` starter list (BlackRock, Vanguard, State
   Street, Berkshire, FMR). Operator-configurable per call.
 
-Remaining for full closure:
-- `/research` Stage 2 wiring — inject `stage_2_line()` into
-  `stage_2_thesis.txt` alongside the Form 4 block (same pattern as
-  FOLLOWUPS #3 Stage 2 wiring).
-- `/probe` wiring — same pattern as #3's probe surface.
+Wiring (all shipped 2026-05-23):
+- **`/research` Stage 2** — `load_institutional_ownership(symbol)`
+  runs in `asyncio.gather` alongside yfinance + Form 4. `research_ticker`
+  / `_stage_2_thesis` accept the new `institutional_ownership` kwarg;
+  `_format_institutional_ownership_block` injects `stage_2_line()` into
+  the new `{institutional_ownership_block}` slot in `stage_2_thesis.txt`.
+- **`/probe`** — same pattern in `probe_ticker` / `_stage_2_probe` /
+  `probe.txt`.
+- Source-rule lists in both prompts extended with
+  `edgar:13f:aggregate` and note the 45-day reporting lag (fundamental
+  signal, not catalyst-timing).
 
-Gate (when fully wired): **`/research` Stage 2 only** + **`/probe`**.
-45-day reporting lag means 13F is best for fundamental theses, not
-catalyst-driven trades — keep Stage 1 off the universe scan.
+Gate: **`/research` Stage 2 only** + **`/probe`**. Stage 1 (brief)
+intentionally excluded — 45-day lag makes 13F flow useless for
+catalyst-driven brief filtering.
 
 ## 6. Watchlist-vs-universe persistence gate
 
