@@ -192,19 +192,41 @@ Anchors are stable
 
 ## 5. EDGAR 13F institutional filings
 
-Status: **OPEN** — paired with #3 (Form 4) for full ownership signature.
+Status: **PARTIAL** — adapter + per-stock aggregation shipped
+2026-05-23 in `research_assistant/edgar/form13f.py` +
+`tests/test_edgar_13f.py` (22 tests).
 
-Gate: **`/research` Stage 2 only** + **`/probe`**.
+Shipped:
+- `parse_13f(xml)` — namespace-stripped ElementTree parse of
+  infotable.xml. Normalizes pre-2023 $thousands → post-2023
+  $whole-dollars based on derived `period_of_report`. Handles SH and
+  PRN share-type entries.
+- `_quarter_end_for_filing_date` — derives period deterministically
+  (13F-HRs due 45d after quarter end), avoiding a second HTTP fetch
+  per filing for the cover form.
+- `aggregate_institutional_ownership(current, prior, *, ticker,
+  issuer_match)` — flips per-fund holdings into per-stock view;
+  computes new_positions, exited_positions, funds_holding (current
+  and prior). Consolidates multi-class entries per manager.
+- `EdgarClient.fetch_13f(filing)` retrieves `infotable.xml` at the
+  deterministic archive URL.
+- `load_institutional_ownership(ticker, *, tracked_funds=, issuer_match=)`
+  fetches latest 2 quarters per tracked fund via `asyncio.gather`,
+  auto-derives `issuer_match` from SEC submissions.json's company
+  name (stripping common suffixes — "NVIDIA CORPORATION" → "NVIDIA").
+  Graceful degrade per fund.
+- `DEFAULT_TRACKED_FUNDS` starter list (BlackRock, Vanguard, State
+  Street, Berkshire, FMR). Operator-configurable per call.
 
-Pairs with #3: insiders + institutions = full ownership picture. 45-
-day lag makes it weaker than #3 standalone (best for fundamental
-theses, not catalyst-driven trades).
+Remaining for full closure:
+- `/research` Stage 2 wiring — inject `stage_2_line()` into
+  `stage_2_thesis.txt` alongside the Form 4 block (same pattern as
+  FOLLOWUPS #3 Stage 2 wiring).
+- `/probe` wiring — same pattern as #3's probe surface.
 
-Adapter-side compression to ≤1 line per ticker ("5 new positions
->100K shares last quarter, 2 exited, net concentration index 0.42").
-Per-stock aggregation requires flipping the per-fund 13F orientation
-— non-trivial; pre-aggregated free sources (13F.info) may be the
-cheapest path.
+Gate (when fully wired): **`/research` Stage 2 only** + **`/probe`**.
+45-day reporting lag means 13F is best for fundamental theses, not
+catalyst-driven trades — keep Stage 1 off the universe scan.
 
 ## 6. Watchlist-vs-universe persistence gate
 
