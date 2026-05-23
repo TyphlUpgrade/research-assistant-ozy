@@ -96,20 +96,27 @@ Surfaced incidents:
 
 ## 2. Bare-citation suppression floor (closes v1 #2)
 
-Status: **PARTIAL** — Defender closes the typed-anchor-corpus subset
-(`research_assistant/orchestrator.py:357`,
-`tests/test_defender_heuristic.py`,
-`tests/test_quality_contract.py:199`).
+Status: **CLOSED** — shipped 2026-05-23.
 
-Remaining: bare-citation suppression floor in the quality-contract
-enforcement layer — today the floor is a known-weak heuristic per the
-existing test marker.
+Shipped:
+- `research_assistant/quality_contract.py` — new module exporting
+  `passes_depth_floor(text, window=80)`. Tightened from the v1 regex
+  by requiring a substance signal (%, $, ISO date, Q[1-4], FY, 3+
+  digit number) within 80 chars of any depth term (10-K, 10-Q, 8-K,
+  transcript, segment, etc.). Closes the *"See the 10-K for risk
+  factors."* known-weakness gap.
+- `tests/test_quality_contract.py` — consumes
+  `passes_depth_floor` from source; the prior
+  `test_depth_floor_known_weakness_acknowledged` test is replaced by
+  `test_depth_floor_suppresses_bare_citation` (asserts bare citations
+  NOW fail) plus mixed / adjacent-substance / ISO-date coverage.
+- `tests/test_defender_heuristic.py` — Defender hardening tests
+  covering the new `edgar:form4:aggregate` and `edgar:8-K:...:para_N`
+  anchor sources. Verified that pushback citing resolved insider $
+  figures does NOT fire Defender; fake $ figures still do.
 
-Sequenced between #1 (EDGAR client) and #3 (Form 4) because once new
-data sources start producing fresh anchor strings (e.g.
-`edgar:8-K:0001234567-26-000045:para_17`), the typed-anchor-corpus
-verification path must be hardened before Defender encounters
-citations it has no way to validate.
+The full LLM-evaluator upgrade (structured per-axis grading) is
+tracked separately as #10.
 
 ## 3. EDGAR Form 4 insider transactions
 

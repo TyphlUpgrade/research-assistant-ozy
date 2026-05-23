@@ -9,8 +9,8 @@ named-pass-criterion) assertions per Critic iter1 requirement:
   2. BACKBONE — Defender heuristic + Defender subagent both behave correctly
                 under user pushback without new evidence.
   3. DEPTH    — Stage 2 output must reference fundamentals/filings depth, not
-                headline summarization. v1 regex floor — KNOWN WEAK per Open
-                Follow-up #3 (v1.x adds evaluator LLM).
+                headline summarization. Regex floor with substance co-occurrence
+                gate (FOLLOWUPS #2). Full evaluator-LLM upgrade remains as #10.
   4. VISIBILITY — every cascade run produces a trace; every claim cites an
                 anchor; orphan claims surface as [NO ANCHOR — visibility regression].
 
@@ -233,27 +233,24 @@ class TestAxis2Backbone:
 # AXIS 3 — DEPTH (filings/transcripts/segment-data references)
 # ---------------------------------------------------------------------------
 
-# KNOWN-WEAK v1 floor per Open Follow-up #3. v1.x adds an evaluator LLM
-# to grade actual content depth. For v1, regex is the regression gate.
+# FOLLOWUPS #2 tightened the floor: a depth term (10-K, transcript, segment,
+# etc.) must co-occur within `passes_depth_floor`'s substance window of a
+# concrete signal (%, $, ISO date, Q[1-4], FY, 3+ digit number). Bare
+# citations like "See the 10-K." now fail.
+#
+# Full evaluator-LLM upgrade (structured per-axis grading) remains as #10.
 
-_DEPTH_FLOOR_PATTERNS = re.compile(
-    r"(S-1|10-Q|10-K|10-Q|10K|"            # filings
-    r"earnings\s+call|transcript|"          # transcripts
-    r"segment|revenue\s+by|"                # segment breakdown
-    r"guidance|forward\s+P/?E|"             # forward-looking metrics
-    r"risk\s+factor|management's\s+discussion)",
-    re.IGNORECASE,
-)
+from research_assistant.quality_contract import passes_depth_floor
 
 
 class TestAxis3Depth:
     """
-    v1 floor: regex check for filings/transcripts/segment references in
-    Stage 2 thesis_text. KNOWN WEAK — passes on "see the 10-K" without
-    substance. v1.x scheduled to add evaluator-LLM grading.
+    Tightened v1 floor (FOLLOWUPS #2): depth term + substance co-occurrence
+    within an 80-char window. Bare citations no longer pass.
 
-    Pass criterion: stage_2.thesis_text matches at least one depth pattern.
-    Fail = headline-summary level output.
+    Pass criterion: stage_2.thesis_text contains at least one depth term
+    backed by a substance signal nearby.
+    Fail = headline-summary OR bare-citation level output.
     """
 
     def test_depth_floor_passes_on_filings_reference(self) -> None:
@@ -261,37 +258,48 @@ class TestAxis3Depth:
             "NVDA Q2 10-Q segment table shows data-center revenue +27% QoQ. "
             "Earnings call transcript notes Hopper-Blackwell transition smooth."
         )
-        assert _DEPTH_FLOOR_PATTERNS.search(thesis) is not None
+        assert passes_depth_floor(thesis)
 
     def test_depth_floor_passes_on_transcript_reference(self) -> None:
         thesis = (
             "Per the Q3 earnings call, services growth re-accelerated. "
             "Management's discussion of forward P/E suggests room."
         )
-        assert _DEPTH_FLOOR_PATTERNS.search(thesis) is not None
+        assert passes_depth_floor(thesis)
 
     def test_depth_floor_fails_on_headline_summary(self) -> None:
-        """The class of output v1.x evaluator must catch."""
+        """The class of output the evaluator (#10) will eventually grade."""
         thesis = (
             "Apple is doing great. The stock has been going up. "
             "I think there's more upside. Analysts are bullish."
         )
-        assert _DEPTH_FLOOR_PATTERNS.search(thesis) is None, (
+        assert not passes_depth_floor(thesis), (
             "Headline-summary thesis should NOT pass the depth floor"
         )
 
-    def test_depth_floor_known_weakness_acknowledged(self) -> None:
+    def test_depth_floor_suppresses_bare_citation(self) -> None:
         """
-        Documented known floor: 'see the 10-K' passes regex without substance.
-        v1.x adds evaluator. Test exists to make the known weakness explicit
-        in the regression suite — fail this if the regex is ever tightened
-        without first shipping the evaluator.
+        FOLLOWUPS #2 closure: 'See the 10-K for risk factors.' previously
+        passed the regex by mentioning a depth term. The tightened floor
+        requires a substance signal (%, $, date, quarter, etc.) within
+        80 chars of the depth term.
         """
-        weak_pass = "See the 10-K for risk factors."
-        assert _DEPTH_FLOOR_PATTERNS.search(weak_pass) is not None, (
-            "v1 regex floor is known-weak; intentionally accepts shallow citations. "
-            "v1.x evaluator-LLM upgrade closes this."
+        bare = "See the 10-K for risk factors."
+        assert not passes_depth_floor(bare), (
+            "Bare-citation thesis must fail the depth floor (FOLLOWUPS #2)"
         )
+
+    def test_depth_floor_passes_when_bare_mention_paired_with_substance(self) -> None:
+        """Mixed thesis with one bare reference + substance elsewhere still
+        passes — at least one depth match is substantively anchored."""
+        mixed = "See the 10-K. Services revenue grew 18% last quarter."
+        assert passes_depth_floor(mixed)
+
+    def test_depth_floor_passes_when_substance_immediately_adjacent(self) -> None:
+        assert passes_depth_floor("10-K filing details 5.2% margin compression.")
+
+    def test_depth_floor_passes_on_iso_date_near_8k(self) -> None:
+        assert passes_depth_floor("The 8-K filed 2026-05-19 confirms the catalyst.")
 
 
 # ---------------------------------------------------------------------------

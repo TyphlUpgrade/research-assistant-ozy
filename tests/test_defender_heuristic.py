@@ -246,3 +246,57 @@ def test_does_not_fire_on_fy_form_resolved() -> None:
         user_message="I disagree, FY2025 guide is fine.",
         prior_evidence_anchors=anchors,
     ) is False
+
+
+# ---------------------------------------------------------------------------
+# FOLLOWUPS #2 — Defender hardening against EDGAR-typed anchor strings
+# ---------------------------------------------------------------------------
+# After #1 (EDGAR client) and #3 (Form 4 wiring), Stage 2 and /probe begin
+# producing anchors with sources like edgar:form4:aggregate. The Defender
+# heuristic's _flatten_anchors_to_corpus concatenates all dict values
+# (claim + source) into the verification corpus, so user pushback citing a
+# specific dollar / share figure from the insider summary must resolve
+# against that corpus rather than firing Defender unnecessarily.
+
+def test_does_not_fire_when_insider_dollars_resolve_in_edgar_anchor() -> None:
+    """Stage 2 cited an insider net flow of -$42M via edgar:form4:aggregate.
+    User pushback referencing the exact figure must NOT fire Defender —
+    the claim is already corpus-verified."""
+    anchors = [{
+        "claim": "insider net flow last 90d: -$42.0M / 4 sales / 0 buys",
+        "source": "edgar:form4:aggregate",
+    }]
+    assert should_invoke_defender(
+        prior_turn_had_recommendation=True,
+        user_message="I disagree — the -$42.0M insider flow is the dominant signal.",
+        prior_evidence_anchors=anchors,
+    ) is False
+
+
+def test_fires_when_insider_dollars_do_not_resolve_in_edgar_anchor() -> None:
+    """User invents a $200M figure that's NOT in the prior anchor corpus
+    (which only contains -$42M). Defender must fire — fake citation floor
+    still holds against typed-source anchors."""
+    anchors = [{
+        "claim": "insider net flow last 90d: -$42.0M / 4 sales / 0 buys",
+        "source": "edgar:form4:aggregate",
+    }]
+    assert should_invoke_defender(
+        prior_turn_had_recommendation=True,
+        user_message="I disagree — the $200M insider flow contradicts your read.",
+        prior_evidence_anchors=anchors,
+    ) is True
+
+
+def test_does_not_fire_when_filing_paragraph_anchor_carries_substance() -> None:
+    """Anchor source edgar:8-K:<acc>:para_17 paired with the substantive
+    claim — pushback citing the resolved figure stays inside the corpus."""
+    anchors = [{
+        "claim": "Q3 2026 segment revenue grew 27%",
+        "source": "edgar:8-K:0001234567-26-000045:para_17",
+    }]
+    assert should_invoke_defender(
+        prior_turn_had_recommendation=True,
+        user_message="I disagree, 27% segment growth is not durable.",
+        prior_evidence_anchors=anchors,
+    ) is False
