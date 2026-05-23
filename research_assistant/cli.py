@@ -259,6 +259,7 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
         load_headlines,
         load_ticker_data,
     )
+    from research_assistant.edgar import load_insider_activity
     from research_assistant.orchestrator import probe_ticker
 
     base = _resolve_base(args.base)
@@ -266,8 +267,12 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
     adapter = YFinanceAdapter()
 
     if not args.quiet:
-        print(f"Loading {symbol} data via yfinance…", file=sys.stderr)
-    ticker_data = await load_ticker_data(symbol, adapter)
+        print(f"Loading {symbol} data (yfinance + EDGAR Form 4)…", file=sys.stderr)
+    ticker_data, headlines, insider_activity = await asyncio.gather(
+        load_ticker_data(symbol, adapter),
+        load_headlines(symbol, adapter, max_items=5),
+        load_insider_activity(symbol),
+    )
     if ticker_data.get("_data_quality") != "ok":
         print(
             f"ERROR: insufficient yfinance data for {symbol} "
@@ -275,7 +280,6 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    headlines = await load_headlines(symbol, adapter, max_items=5)
 
     world_state: dict
     today_cache = base / "briefs" / f"{ticker_data.get('_date_et', '')}.json"
@@ -298,6 +302,7 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
             ticker_data=ticker_data,
             headlines=headlines,
             base=base,
+            insider_activity=insider_activity,
         )
     except FileNotFoundError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

@@ -54,6 +54,9 @@ TICKER_DATA:
 RECENT_HEADLINES (annotated by absorption stage):
 {headlines_json}
 
+INSIDER_ACTIVITY (Form 4 filings, compressed; per FOLLOWUPS #3):
+{insider_activity_block}
+
 NEWS REACTIVITY DISCIPLINE:
 - "fresh_likely_priced_in" headlines (<2h old) indicate the market HAS ALREADY MOVED on this news.
   Treat them as RISK signals (chase risk), NOT confirmation signals.
@@ -79,6 +82,9 @@ was driven by...", an anchor entry might be:
   - "yfinance:fetch_quote:<TICKER>" for current quote-level data
   - "yfinance:fetch_news:<TICKER>:item_<N>" for specific headlines
   - "TICKER_DATA:daily_signals" / "TICKER_DATA:weekly_rsi_14" / etc.
+  - "edgar:form4:aggregate" for any claim drawn from the
+    INSIDER_ACTIVITY block above (counts, net flow $, code mix,
+    per-officer breakdown)
   - "world_state" for regime-derived inferences
   - "dossier:state" / "dossier:ledger:<chain_id>" when citing prior
     dossier content (the dossier IS authoritative for what the system

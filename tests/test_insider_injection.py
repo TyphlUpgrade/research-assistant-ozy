@@ -20,9 +20,12 @@ from research_assistant.edgar import (
     InsiderActivitySummary,
     OfficerActivity,
 )
+from research_assistant.dossier_io import Dossier, write_dossier_atomic
 from research_assistant.orchestrator import (
     _format_insider_activity_block,
+    _stage_2_probe,
     _stage_2_thesis,
+    probe_ticker,
     research_ticker,
 )
 
@@ -235,6 +238,101 @@ async def test_stage_2_prompt_when_insider_none() -> None:
         _FakeClient(),
         world_state={}, ticker_data={"price": 150.0},
         stage_1_result={"ticker": "NVDA"}, headlines=[],
+    )
+    prompt = captured["prompt"]
+    assert "{insider_activity_block}" not in prompt
+    assert "unavailable" in prompt.lower()
+
+
+# ---------------------------------------------------------------------------
+# /probe injection
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_probe_ticker_forwards_insider_activity(tmp_path: Path) -> None:
+    """probe_ticker MUST pass its insider_activity kwarg through to
+    _stage_2_probe without dropping or transforming it."""
+    # probe_ticker requires an existing dossier
+    write_dossier_atomic(Dossier(symbol="NVDA", state_md="prior thesis"), tmp_path)
+    captured: dict = {}
+
+    async def fake_probe(client, ws, td, h, dc, q, insider_activity=None):
+        captured["insider_activity"] = insider_activity
+        return {
+            "ticker": "NVDA", "answer": "ans",
+            "evidence_anchors": [{"claim": "ans", "source": "x"}],
+            "closes_questions": [], "new_open_questions": [],
+        }, None
+
+    summary = _summary()
+    with patch("research_assistant.orchestrator._stage_2_probe", fake_probe):
+        await probe_ticker(
+            "NVDA", "are insiders selling?",
+            world_state={}, ticker_data={"price": 150.0}, headlines=[],
+            base=tmp_path, insider_activity=summary,
+        )
+    assert captured["insider_activity"] is summary
+
+
+@pytest.mark.asyncio
+async def test_probe_prompt_includes_insider_block() -> None:
+    """End-to-end probe prompt render must contain the stage_2_block()
+    output verbatim — same placeholder/template wiring as Stage 2."""
+    captured: dict = {}
+
+    class _FakeClient:
+        async def call(self, prompt, *, model, system=None):
+            captured["prompt"] = prompt
+
+            class _Result:
+                text = '{"ticker":"NVDA","answer":"a","evidence_anchors":[{"claim":"a","source":"x"}],"closes_questions":[],"new_open_questions":[]}'
+                input_tokens = 0
+                output_tokens = 0
+                cost_usd = 0.0
+                latency_ms = 0
+                model = "claude-sonnet-4-6"
+
+            return _Result()
+
+    summary = _summary()
+    parsed, _ = await _stage_2_probe(
+        _FakeClient(),
+        world_state={"regime": "bull-trending"},
+        ticker_data={"price": 150.0},
+        headlines=[],
+        dossier_context="## DOSSIER STATE\n(empty)",
+        focused_question="are insiders selling?",
+        insider_activity=summary,
+    )
+    assert parsed is not None
+    prompt = captured["prompt"]
+    assert "INSIDER_ACTIVITY" in prompt
+    assert summary.stage_2_block() in prompt
+
+
+@pytest.mark.asyncio
+async def test_probe_prompt_when_insider_none() -> None:
+    """Default-None path: placeholder is substituted, no '{...}' leakage."""
+    captured: dict = {}
+
+    class _FakeClient:
+        async def call(self, prompt, *, model, system=None):
+            captured["prompt"] = prompt
+
+            class _Result:
+                text = '{"ticker":"NVDA","answer":"a","evidence_anchors":[{"claim":"a","source":"x"}],"closes_questions":[],"new_open_questions":[]}'
+                input_tokens = 0
+                output_tokens = 0
+                cost_usd = 0.0
+                latency_ms = 0
+                model = "claude-sonnet-4-6"
+
+            return _Result()
+
+    await _stage_2_probe(
+        _FakeClient(),
+        world_state={}, ticker_data={"price": 150.0}, headlines=[],
+        dossier_context="", focused_question="q?",
     )
     prompt = captured["prompt"]
     assert "{insider_activity_block}" not in prompt

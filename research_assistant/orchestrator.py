@@ -349,6 +349,7 @@ async def _stage_2_probe(
     headlines: list[dict],
     dossier_context: str,
     focused_question: str,
+    insider_activity: Optional[InsiderActivitySummary] = None,
 ) -> tuple[Optional[dict], Optional[CallResult]]:
     """Invoke the probe stage (Sonnet, dossier-scoped focused answer).
     Returns (parsed_json, call_metadata)."""
@@ -359,6 +360,7 @@ async def _stage_2_probe(
         headlines_json=json.dumps(headlines, indent=2),
         dossier_context=dossier_context,
         focused_question=focused_question,
+        insider_activity_block=_format_insider_activity_block(insider_activity),
     )
     system = f"WORLD_STATE for this session:\n{json.dumps(world_state, indent=2)}"
     result = await client.call(prompt, model="claude-sonnet-4-6", system=system)
@@ -374,12 +376,19 @@ async def probe_ticker(
     headlines: list[dict],
     base: Path,
     client: Optional[ClaudeClient] = None,
+    insider_activity: Optional[InsiderActivitySummary] = None,
 ) -> ProbeResult:
     """Run a focused probe against an existing dossier.
 
     Raises FileNotFoundError if no dossier exists for `symbol` — probe is the
     cold-start entry point against a SAVED dossier, not a way to create one.
     Use `/research <TICKER>` first if no dossier is present.
+
+    Args:
+        insider_activity: optional Form 4 aggregate for the trailing window
+            (FOLLOWUPS #3). Same semantics as research_ticker: None means
+            EDGAR fetch failed or ticker not in SEC universe; empty summary
+            means no activity in window.
 
     Side effects (atomic w.r.t. dossier write):
       * appends a kind="probe" ledger entry citing the chain_id
@@ -402,7 +411,8 @@ async def probe_ticker(
 
     dossier_context = _format_dossier_context(dossier)
     stage_2, s2_meta = await _stage_2_probe(
-        client, world_state, ticker_data, headlines, dossier_context, question
+        client, world_state, ticker_data, headlines, dossier_context, question,
+        insider_activity=insider_activity,
     )
     append_stage_event(
         chain_id=chain,

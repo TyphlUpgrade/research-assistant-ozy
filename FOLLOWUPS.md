@@ -147,15 +147,19 @@ Wiring progress:
   CIK → None → "(insider activity unavailable …)" placeholder;
   empty window → "(no Form 4 filings last 90d)". Source rule list
   in the prompt extended with `edgar:form4:aggregate`.
+- **`/probe`** — SHIPPED 2026-05-22. Same wiring pattern as Stage 2.
+  `probe_ticker` and `_stage_2_probe` accept the kwarg; `probe.txt`
+  gains the `{insider_activity_block}` slot. CLI `_cmd_probe` now
+  fetches yfinance + EDGAR in one `asyncio.gather`. Operator can now
+  ask *"are insiders selling?"* on any dossier and get a structured
+  answer.
 - **Stage 1 filter (brief)** — OPEN. `brief.py` Stage 1 batched-
   Haiku prompt should consume `stage_1_line()` per candidate. Cost
   caveat: ~30 universe tickers × ~6 HTTP/s cap = ~5 min worst-case
   per brief without parallelism work.
-- **`/probe`** — OPEN. Per-officer breakdown surface for full
-  historical lookup.
 
-Both remaining integrations layer on top of `load_insider_activity`
-without adapter changes.
+The remaining Stage 1 integration layers on top of
+`load_insider_activity` without adapter changes.
 
 Gate (when fully wired): **Stage 1 (filter)** + **`/research`
 Stage 2 only** + **`/probe`**.
