@@ -816,13 +816,19 @@ def test_aggregate_by_officer_sorted_by_abs_dollars() -> None:
 
 
 def test_aggregate_window_filters_old_filings() -> None:
-    """Filings whose period_of_report falls outside the window are dropped."""
+    """Filings whose period_of_report falls outside the window are dropped
+    from the transaction-window aggregate. The old filing's filing_date
+    (2025-01-15) also falls outside the disclosure window, so it doesn't
+    contribute there either."""
     in_window = _parse(_FORM4_NVDA_CEO_SALE, accession="A1", filing_date="2026-05-19")
     old = _parse(_FORM4_OLD_PRE_WINDOW, accession="A0", filing_date="2025-01-15")
     s = aggregate_insider_activity([in_window, old], window_days=90, as_of=date(2026, 5, 22))
     assert s.total_filings == 1
     assert s.sales_count == 1   # the OLD 999999-share sale must NOT appear
     assert s.net_dollars == pytest.approx(-18_000_000)
+    assert s.disclosed_filings_count == 1
+    assert s.late_disclosure_count == 0
+    assert s.latest_disclosure_date == "2026-05-19"
 
 
 def test_aggregate_empty_list_returns_zero_summary() -> None:
@@ -834,6 +840,41 @@ def test_aggregate_empty_list_returns_zero_summary() -> None:
     assert s.code_mix == {}
     assert s.by_officer == []
     assert s.latest_transaction_date is None
+    assert s.disclosed_filings_count == 0
+    assert s.late_disclosure_count == 0
+    assert s.late_disclosure_officers == 0
+    assert s.latest_disclosure_date is None
+
+
+def test_aggregate_surfaces_late_disclosure_cluster() -> None:
+    """A burst of insiders late-filing in the window for pre-window trades
+    is itself signal. The TE case: 4 distinct officers filed Form 4s in
+    May 2026 for transactions dated Jan 2026 (outside the 90d window).
+    Even though total_filings is 0 for the trade window, the late-
+    disclosure metrics surface the behavioral cluster."""
+    late_owner_a = _parse(
+        _FORM4_OLD_PRE_WINDOW, accession="LATE_A", filing_date="2026-05-11",
+    )
+    late_owner_b = _parse(
+        _FORM4_OLD_PRE_WINDOW, accession="LATE_B", filing_date="2026-05-12",
+    )
+    # Force distinct owner CIKs by mutating after parse — the fixture shares
+    # one owner CIK, but real late-disclosure clusters are by definition
+    # multi-officer; we test that the distinct-officer count is right.
+    late_owner_b.owners[0].cik = "0009999998"
+    late_owner_c = _parse(
+        _FORM4_OLD_PRE_WINDOW, accession="LATE_C", filing_date="2026-05-12",
+    )
+    late_owner_c.owners[0].cik = "0009999997"
+    s = aggregate_insider_activity(
+        [late_owner_a, late_owner_b, late_owner_c],
+        window_days=90, as_of=date(2026, 5, 22),
+    )
+    assert s.total_filings == 0   # nothing transacted in window
+    assert s.disclosed_filings_count == 3
+    assert s.late_disclosure_count == 3
+    assert s.late_disclosure_officers == 3
+    assert s.latest_disclosure_date == "2026-05-12"
 
 
 def test_aggregate_form4_with_no_owner_still_counts_transactions() -> None:
@@ -903,6 +944,65 @@ def test_stage_2_block_renders_three_lines() -> None:
     assert lines[1].startswith("codes: ")
     assert "S×1" in lines[1] and "P×1" in lines[1] and "A×1" in lines[1]
     assert lines[2] == "top: President & CEO -$18.0M; EVP & CFO $1.4M"
+
+
+def test_stage_1_line_appends_late_disclosure_clause() -> None:
+    """When late-disclosure activity is present, stage_1_line surfaces it
+    as a `· N late-disclosed (M officers)` suffix so Stage 1 can weight
+    the cluster signal alongside the transaction-window totals."""
+    s = InsiderActivitySummary(
+        window_days=90, window_start="2026-02-21", window_end="2026-05-22",
+        total_filings=4, buys_count=0, sales_count=4,
+        net_dollars=-42_000_000, code_mix={"S": 4}, deriv_code_mix={},
+        by_officer=[], latest_transaction_date="2026-05-19",
+        disclosed_filings_count=10, late_disclosure_count=6,
+        late_disclosure_officers=5, latest_disclosure_date="2026-05-18",
+    )
+    assert s.stage_1_line() == (
+        "insider net flow last 90d: -$42.0M / 4 sales / 0 buys"
+        " · 6 late-disclosed (5 officers)"
+    )
+
+
+def test_stage_2_block_appends_disclosure_line_when_late() -> None:
+    """stage_2_block adds a `disclosure: ...` line when late-disclosure
+    filings exist, so /research and /probe surface the cluster pattern."""
+    s = InsiderActivitySummary(
+        window_days=90, window_start="2026-02-21", window_end="2026-05-22",
+        total_filings=1, buys_count=0, sales_count=1,
+        net_dollars=-500_000, code_mix={"S": 1}, deriv_code_mix={},
+        by_officer=[
+            OfficerActivity(
+                cik="11", name="CFO", relationship="Chief Financial Officer",
+                sales_count=1, net_dollars=-500_000,
+            ),
+        ],
+        latest_transaction_date="2026-05-06",
+        disclosed_filings_count=10, late_disclosure_count=6,
+        late_disclosure_officers=5, latest_disclosure_date="2026-05-18",
+    )
+    out = s.stage_2_block()
+    assert out.splitlines()[-1] == (
+        "disclosure: 10 filed in window "
+        "(6 late for pre-window trades, 5 officers)"
+    )
+
+
+def test_render_for_prompt_surfaces_late_only_disclosure() -> None:
+    """A summary with zero transaction-window activity but non-zero
+    disclosure-window activity must NOT degrade to the `(no Form 4
+    filings…)` empty message — the late-disclosure cluster is the signal."""
+    s = InsiderActivitySummary(
+        window_days=90, window_start="2026-02-21", window_end="2026-05-22",
+        total_filings=0, buys_count=0, sales_count=0, net_dollars=0.0,
+        code_mix={}, deriv_code_mix={}, by_officer=[],
+        latest_transaction_date=None,
+        disclosed_filings_count=3, late_disclosure_count=3,
+        late_disclosure_officers=3, latest_disclosure_date="2026-05-12",
+    )
+    out = InsiderActivitySummary.render_for_prompt(s)
+    assert "no Form 4 filings" not in out
+    assert "3 late for pre-window trades" in out
 
 
 def test_stage_2_block_omits_top_when_no_dollar_moves() -> None:
