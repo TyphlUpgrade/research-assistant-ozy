@@ -71,7 +71,7 @@ class TestAxis1Factual:
         captured_stage_2_prompt = {}
 
         async def fake_stage_2_thesis(
-            client, world_state, td, stage_1, headlines
+            client, world_state, td, stage_1, headlines, insider_activity=None,
         ):
             captured_stage_2_prompt["ticker_data"] = td
             captured_stage_2_prompt["headlines"] = headlines
@@ -122,7 +122,7 @@ class TestAxis1Factual:
         contain no concrete numbers either. Guards against hallucination
         in the rendering layer.
         """
-        async def fake_stage_2(client, ws, td, s1, h):
+        async def fake_stage_2(client, ws, td, s1, h, insider_activity=None):
             return {
                 "ticker": "AAPL",
                 "thesis_text": "Qualitative thesis with no numbers.",

@@ -136,17 +136,26 @@ Shipped:
 - `stage_2_block()` — 3-line enrichment block: counts + net $ +
   latest tx date / code mix / top-3 officers by absolute $ impact.
 
-Remaining for full closure:
-- **Stage 1 filter wiring** — `brief.py` Stage 1 batched-Haiku
-  prompt should consume `stage_1_line()` per candidate.
-- **`/research` Stage 2 wiring** — orchestrator should fetch the
-  committed ticker's Form 4 window and inject `stage_2_block()` into
-  the Stage 2 thesis prompt.
-- **`/probe` wiring** — per-officer breakdown surface for full
+Wiring progress:
+- **`/research` Stage 2** — SHIPPED 2026-05-22.
+  `load_insider_activity(symbol)` in `edgar.py` fetches + aggregates
+  in parallel with `load_ticker_data` / `load_headlines`.
+  `orchestrator.research_ticker` accepts an optional
+  `insider_activity` kwarg; `_stage_2_thesis` injects
+  `stage_2_block()` into the new `{insider_activity_block}` slot in
+  `stage_2_thesis.txt`. Graceful degrade: EDGAR failure / unknown
+  CIK → None → "(insider activity unavailable …)" placeholder;
+  empty window → "(no Form 4 filings last 90d)". Source rule list
+  in the prompt extended with `edgar:form4:aggregate`.
+- **Stage 1 filter (brief)** — OPEN. `brief.py` Stage 1 batched-
+  Haiku prompt should consume `stage_1_line()` per candidate. Cost
+  caveat: ~30 universe tickers × ~6 HTTP/s cap = ~5 min worst-case
+  per brief without parallelism work.
+- **`/probe`** — OPEN. Per-officer breakdown surface for full
   historical lookup.
 
-All three integrations layer on top of the shipped parser without
-adapter changes.
+Both remaining integrations layer on top of `load_insider_activity`
+without adapter changes.
 
 Gate (when fully wired): **Stage 1 (filter)** + **`/research`
 Stage 2 only** + **`/probe`**.

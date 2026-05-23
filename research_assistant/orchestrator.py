@@ -33,6 +33,7 @@ from research_assistant.dossier_io import (
     read_dossier,
     write_dossier_atomic,
 )
+from research_assistant.edgar import InsiderActivitySummary
 from research_assistant.observations import Observation, append_observation
 from research_assistant.trace_renderer import append_stage_event
 from ozymandias.intelligence.claude_json import parse_claude_response
@@ -85,12 +86,27 @@ def _render(template: str, **subs: Any) -> str:
     return pattern.sub(lambda m: str(subs[m.group(1)]), template)
 
 
+def _format_insider_activity_block(
+    insider_activity: Optional[InsiderActivitySummary],
+) -> str:
+    """Render an InsiderActivitySummary into the {insider_activity_block}
+    slot. Distinguishes "no data available" (None — EDGAR fetch failed or
+    ticker not in SEC universe) from "no activity in window" (empty
+    summary) so Stage 2 can weight the signal appropriately."""
+    if insider_activity is None:
+        return "(insider activity unavailable — EDGAR fetch failed or ticker not in SEC universe)"
+    if insider_activity.total_filings == 0:
+        return f"(no Form 4 filings last {insider_activity.window_days}d)"
+    return insider_activity.stage_2_block()
+
+
 async def _stage_2_thesis(
     client: ClaudeClient,
     world_state: dict,
     ticker_data: dict,
     stage_1_result: dict,
     headlines: list[dict],
+    insider_activity: Optional[InsiderActivitySummary] = None,
 ) -> tuple[Optional[dict], Optional[CallResult]]:
     """
     Invoke Stage 2 (Sonnet thesis). Returns (parsed_json, call_metadata).
@@ -103,6 +119,7 @@ async def _stage_2_thesis(
         ticker_json=json.dumps(ticker_data, indent=2),
         stage_1_json=json.dumps(stage_1_result, indent=2),
         headlines_json=json.dumps(headlines, indent=2),
+        insider_activity_block=_format_insider_activity_block(insider_activity),
     )
     system = f"WORLD_STATE for this session:\n{json.dumps(world_state, indent=2)}"
     result = await client.call(prompt, model="claude-sonnet-4-6", system=system)
@@ -139,6 +156,7 @@ async def research_ticker(
     headlines: list[dict],
     base: Path,
     client: Optional[ClaudeClient] = None,
+    insider_activity: Optional[InsiderActivitySummary] = None,
 ) -> ResearchResult:
     """
     Run the mini-cascade for one ticker. Stage 2 thesis + Stage 3 Skeptic,
@@ -154,6 +172,11 @@ async def research_ticker(
         headlines: list of {title, publisher, age_hours, absorption_stage}
         base: research data dir (.research/)
         client: optional ClaudeClient to reuse (cost tracking continuity)
+        insider_activity: optional Form 4 aggregate for the trailing window
+            (FOLLOWUPS #3). None means EDGAR fetch failed or ticker is not
+            in the SEC universe; an empty summary (total_filings=0) means
+            no activity in the window — both are signal worth distinguishing
+            in the prompt.
 
     Returns:
         ResearchResult with full Stage 2 + Stage 3 output.
@@ -170,7 +193,8 @@ async def research_ticker(
         "reason": "single-ticker on-demand DD (Stage 1 batched filter skipped)",
     }
     stage_2, s2_meta = await _stage_2_thesis(
-        client, world_state, ticker_data, stage_1_placeholder, headlines
+        client, world_state, ticker_data, stage_1_placeholder, headlines,
+        insider_activity=insider_activity,
     )
     traces_base = base / "traces"
     append_stage_event(

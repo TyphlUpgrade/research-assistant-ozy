@@ -740,6 +740,74 @@ def aggregate_insider_activity(
 
 
 # ---------------------------------------------------------------------------
+# High-level loader: ticker → InsiderActivitySummary
+# ---------------------------------------------------------------------------
+
+INSIDER_DEFAULT_WINDOW_DAYS = 90
+INSIDER_DEFAULT_MAX_FILINGS = 25
+
+
+async def load_insider_activity(
+    symbol: str,
+    *,
+    window_days: int = INSIDER_DEFAULT_WINDOW_DAYS,
+    max_filings: int = INSIDER_DEFAULT_MAX_FILINGS,
+    client: Optional[EdgarClient] = None,
+    as_of: Optional[date] = None,
+) -> Optional[InsiderActivitySummary]:
+    """Fetch + aggregate Form 4 activity for `symbol` over the trailing
+    `window_days` window. Returns None on any failure so the caller can
+    gracefully degrade (matches the yfinance pattern in data_loader).
+
+    Args:
+        symbol: ticker (case-insensitive).
+        window_days: trailing window for the aggregation summary.
+        max_filings: hard cap on Form 4 XML fetches per call. Bounds the
+            rate-limit cost; older filings beyond the cap are dropped.
+        client: reuse an existing EdgarClient when called inside a loop;
+            otherwise a one-shot client is created and closed.
+        as_of: reference date for the window (defaults to today).
+    """
+    owns_client = client is None
+    if client is None:
+        client = EdgarClient()
+    try:
+        cik = await client.resolve_cik(symbol)
+        if cik is None:
+            log.info("EDGAR: no CIK for %s (foreign issuer / OTC / delisted)", symbol)
+            return None
+        as_of = as_of or date.today()
+        since = (as_of - timedelta(days=window_days)).isoformat()
+        filings = await client.list_filings(cik, "4", since=since, limit=max_filings)
+        if not filings:
+            return aggregate_insider_activity(
+                [], window_days=window_days, as_of=as_of,
+            )
+        parsed = await asyncio.gather(
+            *[client.fetch_form4(f) for f in filings],
+            return_exceptions=True,
+        )
+        good: list[Form4Filing] = []
+        for f, result in zip(filings, parsed):
+            if isinstance(result, Exception):
+                log.warning(
+                    "EDGAR: Form 4 parse/fetch failed for %s (%s): %s",
+                    symbol, f.accession_number, result,
+                )
+                continue
+            good.append(result)
+        return aggregate_insider_activity(
+            good, window_days=window_days, as_of=as_of,
+        )
+    except Exception as exc:
+        log.warning("EDGAR: load_insider_activity failed for %s: %s", symbol, exc)
+        return None
+    finally:
+        if owns_client:
+            await client.close()
+
+
+# ---------------------------------------------------------------------------
 # CLI smoke entry
 # ---------------------------------------------------------------------------
 

@@ -16,7 +16,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import httpx
 import pytest
@@ -38,6 +38,7 @@ from research_assistant.edgar import (
     _RateLimiter,
     _relationship_label,
     aggregate_insider_activity,
+    load_insider_activity,
     parse_form4,
 )
 
@@ -853,3 +854,177 @@ def test_relationship_label_priority() -> None:
 
     nothing = Form4Owner(cik="1", name="X")
     assert _relationship_label(nothing) == "Insider"
+
+
+# ---------------------------------------------------------------------------
+# load_insider_activity — high-level loader
+# ---------------------------------------------------------------------------
+
+def _form4_routes(
+    *,
+    ticker_index: dict = _TICKER_INDEX_BODY,
+    submissions_cik: str = "0001045810",
+    submissions: Optional[dict] = None,
+    xml_bodies: Optional[dict[str, str]] = None,
+) -> dict:
+    """Build a {url-prefix: (status, body)} route map for a typical
+    load_insider_activity flow: ticker index → submissions JSON → N
+    Form 4 XML fetches."""
+    routes: dict = {
+        "https://www.sec.gov/files/company_tickers.json": (200, ticker_index),
+    }
+    if submissions is not None:
+        routes[f"https://data.sec.gov/submissions/CIK{submissions_cik}.json"] = (
+            200, submissions,
+        )
+    for url, body in (xml_bodies or {}).items():
+        routes[url] = (200, body)
+    return routes
+
+
+def _make_form4_submissions(accessions_to_docs: list[tuple[str, str, str]]) -> dict:
+    """Build a submissions JSON payload with N Form 4 filings.
+    accessions_to_docs: list of (accession, filing_date, primary_document)."""
+    return {
+        "cik": "0001045810",
+        "filings": {
+            "recent": {
+                "accessionNumber": [a for a, _, _ in accessions_to_docs],
+                "form": ["4"] * len(accessions_to_docs),
+                "filingDate": [d for _, d, _ in accessions_to_docs],
+                "primaryDocument": [doc for _, _, doc in accessions_to_docs],
+            }
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_load_insider_activity_aggregates_filings() -> None:
+    filings = [
+        ("0001045810-26-000045", "2026-05-19", "form4_ceo.xml"),
+        ("0001045810-26-000040", "2026-04-10", "form4_cfo.xml"),
+    ]
+    submissions = _make_form4_submissions(filings)
+    f_ceo = Filing(
+        accession_number=filings[0][0], form_type="4", filing_date=filings[0][1],
+        cik="0001045810", primary_document=filings[0][2],
+    )
+    f_cfo = Filing(
+        accession_number=filings[1][0], form_type="4", filing_date=filings[1][1],
+        cik="0001045810", primary_document=filings[1][2],
+    )
+    routes = _form4_routes(
+        submissions=submissions,
+        xml_bodies={
+            f_ceo.archive_url: _FORM4_NVDA_CEO_SALE,
+            f_cfo.archive_url: _FORM4_NVDA_CFO_BUY_AND_GRANT,
+        },
+    )
+    handler = _make_handler(routes)
+    async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+        summary = await load_insider_activity(
+            "NVDA", client=client, as_of=date(2026, 5, 22),
+        )
+    assert summary is not None
+    assert summary.total_filings == 2
+    assert summary.sales_count == 1
+    assert summary.buys_count == 1
+    assert summary.net_dollars == pytest.approx(-18_000_000 + 1_400_000)
+
+
+@pytest.mark.asyncio
+async def test_load_insider_activity_unknown_ticker_returns_none() -> None:
+    routes = _form4_routes()
+    handler = _make_handler(routes)
+    async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+        result = await load_insider_activity("BOGUS", client=client)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_load_insider_activity_network_failure_returns_none() -> None:
+    """Graceful degrade: HTTP 500 from EDGAR must not propagate to caller."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="server error", request=request)
+    async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+        result = await load_insider_activity("NVDA", client=client)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_load_insider_activity_respects_max_filings_cap() -> None:
+    """When submissions has more filings than max_filings, only the cap
+    is fetched."""
+    many = [
+        (f"0001045810-26-{i:06d}", "2026-05-01", f"form4_{i}.xml")
+        for i in range(10)
+    ]
+    submissions = _make_form4_submissions(many)
+    fetch_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.startswith("https://www.sec.gov/files/company_tickers.json"):
+            return httpx.Response(200, json=_TICKER_INDEX_BODY, request=request)
+        if url.startswith("https://data.sec.gov/submissions/"):
+            return httpx.Response(200, json=submissions, request=request)
+        if url.startswith("https://www.sec.gov/Archives/"):
+            fetch_calls.append(url)
+            return httpx.Response(200, text=_FORM4_NVDA_CEO_SALE, request=request)
+        return httpx.Response(404, request=request)
+
+    async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+        await load_insider_activity(
+            "NVDA", max_filings=3, client=client, as_of=date(2026, 5, 22),
+        )
+    assert len(fetch_calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_load_insider_activity_no_filings_returns_zero_summary() -> None:
+    """Ticker in SEC universe but no Form 4 filings in window → empty
+    summary (distinct from None which means EDGAR fetch failed)."""
+    submissions = _make_form4_submissions([])
+    routes = _form4_routes(submissions=submissions)
+    handler = _make_handler(routes)
+    async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+        summary = await load_insider_activity(
+            "NVDA", client=client, as_of=date(2026, 5, 22),
+        )
+    assert summary is not None
+    assert summary.total_filings == 0
+    assert summary.window_days == 90
+
+
+@pytest.mark.asyncio
+async def test_load_insider_activity_skips_parse_failures() -> None:
+    """If one Form 4 XML is malformed, the loader logs and continues —
+    other filings still contribute to the aggregate."""
+    filings = [
+        ("0001045810-26-000045", "2026-05-19", "good.xml"),
+        ("0001045810-26-000040", "2026-04-10", "bad.xml"),
+    ]
+    submissions = _make_form4_submissions(filings)
+    good = Filing(
+        accession_number=filings[0][0], form_type="4", filing_date=filings[0][1],
+        cik="0001045810", primary_document=filings[0][2],
+    )
+    bad = Filing(
+        accession_number=filings[1][0], form_type="4", filing_date=filings[1][1],
+        cik="0001045810", primary_document=filings[1][2],
+    )
+    routes = _form4_routes(
+        submissions=submissions,
+        xml_bodies={
+            good.archive_url: _FORM4_NVDA_CEO_SALE,
+            bad.archive_url: "not valid xml <>",
+        },
+    )
+    handler = _make_handler(routes)
+    async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+        summary = await load_insider_activity(
+            "NVDA", client=client, as_of=date(2026, 5, 22),
+        )
+    assert summary is not None
+    assert summary.total_filings == 1
+    assert summary.sales_count == 1
