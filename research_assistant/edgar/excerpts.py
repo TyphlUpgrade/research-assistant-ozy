@@ -94,6 +94,18 @@ class FilingExcerpts:
             lines.append("")
         return "\n".join(lines).rstrip()
 
+    @classmethod
+    def render_for_prompt(cls, excerpts: Optional["FilingExcerpts"]) -> str:
+        """Three-state prompt rendering. None here means the operator
+        did not opt in via --filing — distinct from empty (fetch
+        succeeded but no keyword matches)."""
+        if excerpts is None:
+            return (
+                "(no filing excerpts requested — pass --filing <FORM> to "
+                "/probe to fetch on demand)"
+            )
+        return excerpts.render_block()
+
 
 def extract_keywords(question: str) -> list[str]:
     """Tokenize `question`; drop stopwords and tokens shorter than 3

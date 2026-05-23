@@ -39,14 +39,13 @@ from research_assistant.edgar import (
     InstitutionalOwnership,
 )
 from research_assistant.observations import Observation, append_observation
+from research_assistant.prompts import chain_id as _chain_id
+from research_assistant.prompts import load_prompt as _load_prompt
+from research_assistant.prompts import render as _render
 from research_assistant.trace_renderer import append_stage_event
 from ozymandias.intelligence.claude_json import parse_claude_response
 
 log = logging.getLogger(__name__)
-
-
-# Prompt file locations relative to research-repo root
-PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts" / "research-v1.0.0"
 
 
 @dataclass
@@ -67,70 +66,10 @@ class ResearchResult:
     cost_usd: float
 
 
-def _load_prompt(stem: str) -> str:
-    """Load a research-v1.0.0 prompt template (text with {placeholder} slots)."""
-    path = PROMPTS_DIR / f"{stem}.txt"
-    return path.read_text()
-
-
-def _render(template: str, **subs: Any) -> str:
-    """
-    Substitute `{key}` placeholders in a prompt template.
-
-    Single-pass via regex so that values containing `{other_key}` strings
-    (e.g. persisted user content that survives into a future prompt's
-    dossier_context block) are NOT re-scanned for further substitution.
-    Only `{key}` for `key` in `subs` is substituted; other brace-wrapped
-    content (e.g. JSON schema examples like `{ "ticker": "<symbol>", ... }`
-    or unmatched placeholders) is preserved verbatim.
-    """
-    if not subs:
-        return template
-    pattern = re.compile(r"\{(" + "|".join(re.escape(k) for k in subs) + r")\}")
-    return pattern.sub(lambda m: str(subs[m.group(1)]), template)
-
-
-def _format_insider_activity_block(
-    insider_activity: Optional[InsiderActivitySummary],
-) -> str:
-    """Render an InsiderActivitySummary into the {insider_activity_block}
-    slot. Distinguishes "no data available" (None — EDGAR fetch failed or
-    ticker not in SEC universe) from "no activity in window" (empty
-    summary) so Stage 2 can weight the signal appropriately."""
-    if insider_activity is None:
-        return "(insider activity unavailable — EDGAR fetch failed or ticker not in SEC universe)"
-    if insider_activity.total_filings == 0:
-        return f"(no Form 4 filings last {insider_activity.window_days}d)"
-    return insider_activity.stage_2_block()
-
-
-def _format_institutional_ownership_block(
-    ownership: Optional[InstitutionalOwnership],
-) -> str:
-    """Render an InstitutionalOwnership into the
-    {institutional_ownership_block} slot (FOLLOWUPS #5). Mirrors the
-    None/empty/populated three-state pattern used for insider activity."""
-    if ownership is None:
-        return "(institutional ownership unavailable — no tracked-fund 13F coverage)"
-    if ownership.funds_holding == 0 and ownership.funds_holding_prior == 0:
-        return (
-            f"(no tracked-fund 13F positions in {ownership.ticker} as of "
-            f"{ownership.period or 'last quarter'})"
-        )
-    return ownership.stage_2_line()
-
-
-def _format_filing_excerpts_block(
-    excerpts: Optional[FilingExcerpts],
-) -> str:
-    """Render a FilingExcerpts into the {filing_excerpts_block} slot
-    (FOLLOWUPS #1 — /probe full-text path). When None, the operator did
-    not opt in via --filing; when empty, the fetch succeeded but no
-    paragraphs matched. Populated case lists each excerpt as
-    [edgar:<form>:<acc>:para_N] followed by the paragraph text."""
-    if excerpts is None:
-        return "(no filing excerpts requested — pass --filing <FORM> to /probe to fetch on demand)"
-    return excerpts.render_block()
+# Prompt-block rendering for each EDGAR data source is owned by the
+# dataclass itself via `render_for_prompt(cls, optional_instance)`. The
+# orchestrator just calls those classmethods — keeps the "what does
+# Stage 2 see when EDGAR is down?" decision in one place per source.
 
 
 # Matches the FilingText.anchor format: edgar:<form>:<accession>:para_<n>.
@@ -194,8 +133,8 @@ async def _stage_2_thesis(
         ticker_json=json.dumps(ticker_data, indent=2),
         stage_1_json=json.dumps(stage_1_result, indent=2),
         headlines_json=json.dumps(headlines, indent=2),
-        insider_activity_block=_format_insider_activity_block(insider_activity),
-        institutional_ownership_block=_format_institutional_ownership_block(institutional_ownership),
+        insider_activity_block=InsiderActivitySummary.render_for_prompt(insider_activity),
+        institutional_ownership_block=InstitutionalOwnership.render_for_prompt(institutional_ownership),
     )
     system = f"WORLD_STATE for this session:\n{json.dumps(world_state, indent=2)}"
     result = await client.call(prompt, model="claude-sonnet-4-6", system=system)
@@ -216,12 +155,6 @@ async def _stage_3_skeptic(
     system = f"WORLD_STATE for this session:\n{json.dumps(world_state, indent=2)}"
     result = await client.call(prompt, model=model, system=system)
     return parse_claude_response(result.text), result
-
-
-def _chain_id() -> str:
-    """Generate a chain ID for the cascade trace (date + epoch-ms hex)."""
-    now = datetime.now(timezone.utc)
-    return f"{now.strftime('%Y%m%dT%H%M%S')}-{int(now.timestamp()*1000) & 0xFFFFFF:06x}"
 
 
 async def research_ticker(
@@ -440,9 +373,9 @@ async def _stage_2_probe(
         headlines_json=json.dumps(headlines, indent=2),
         dossier_context=dossier_context,
         focused_question=focused_question,
-        insider_activity_block=_format_insider_activity_block(insider_activity),
-        institutional_ownership_block=_format_institutional_ownership_block(institutional_ownership),
-        filing_excerpts_block=_format_filing_excerpts_block(filing_excerpts),
+        insider_activity_block=InsiderActivitySummary.render_for_prompt(insider_activity),
+        institutional_ownership_block=InstitutionalOwnership.render_for_prompt(institutional_ownership),
+        filing_excerpts_block=FilingExcerpts.render_for_prompt(filing_excerpts),
     )
     system = f"WORLD_STATE for this session:\n{json.dumps(world_state, indent=2)}"
     result = await client.call(prompt, model="claude-sonnet-4-6", system=system)

@@ -169,6 +169,23 @@ class InsiderActivitySummary:
             lines.append("top: " + "; ".join(officer_strs))
         return "\n".join(lines)
 
+    @classmethod
+    def render_for_prompt(cls, summary: Optional["InsiderActivitySummary"]) -> str:
+        """Three-state prompt rendering: None (EDGAR fetch failed or
+        ticker not in SEC universe) / empty (no Form 4 in window) /
+        populated (full stage_2_block). Single source of truth for how
+        the cascade sees insider-activity signal across /research and
+        /probe — was previously split between this dataclass and an
+        orchestrator-side helper."""
+        if summary is None:
+            return (
+                "(insider activity unavailable — EDGAR fetch failed or "
+                "ticker not in SEC universe)"
+            )
+        if summary.total_filings == 0:
+            return f"(no Form 4 filings last {summary.window_days}d)"
+        return summary.stage_2_block()
+
 
 def _fmt_dollars(amount: float) -> str:
     """Compact human dollar formatting: $1.2B / $42M / $850K / $200."""

@@ -32,10 +32,14 @@ from research_assistant.dossier_io import Dossier, write_dossier_atomic
 from research_assistant.orchestrator import (
     _enrich_anchors_with_filing_text,
     _flatten_anchors_to_corpus,
-    _format_filing_excerpts_block,
     probe_ticker,
     should_invoke_defender,
 )
+
+# The three-state prompt-block rendering for filing excerpts now lives
+# as a classmethod on FilingExcerpts; alias keeps the existing test
+# names readable.
+_format_filing_excerpts_block = FilingExcerpts.render_for_prompt
 
 
 # ---------------------------------------------------------------------------

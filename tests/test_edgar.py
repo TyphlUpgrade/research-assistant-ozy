@@ -33,16 +33,17 @@ from research_assistant.edgar import (
     Form4Transaction,
     InsiderActivitySummary,
     OfficerActivity,
-    _extract_paragraphs,
-    _fmt_dollars,
-    _RateLimiter,
-    _relationship_label,
     aggregate_insider_activity,
     fetch_form4,
     load_insider_activities_batch,
     load_insider_activity,
     parse_form4,
 )
+# Underscore-prefixed internals are imported from impl modules directly
+# rather than re-exported from the package — keeps the public surface
+# honest about what's public.
+from research_assistant.edgar.client import _extract_paragraphs, _RateLimiter
+from research_assistant.edgar.form4 import _fmt_dollars, _relationship_label
 
 
 # ---------------------------------------------------------------------------

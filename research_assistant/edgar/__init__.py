@@ -9,7 +9,9 @@ Modules:
 
 Public surface re-exported here so callers can `from research_assistant.edgar
 import EdgarClient, load_insider_activity` without caring about the internal
-split. Names prefixed with `_` are private but re-exported for the test suite.
+split. Underscore-prefixed internals (e.g. `_RateLimiter`, `_fmt_dollars`)
+are intentionally NOT re-exported — tests that need them import from the
+implementation modules directly so the package's `__all__` stays honest.
 """
 from research_assistant.edgar.client import (
     DEFAULT_RATE_LIMIT_PER_SEC,
@@ -17,8 +19,6 @@ from research_assistant.edgar.client import (
     EdgarClient,
     Filing,
     FilingText,
-    _extract_paragraphs,
-    _RateLimiter,
 )
 from research_assistant.edgar.form4 import (
     INSIDER_DEFAULT_MAX_FILINGS,
@@ -28,8 +28,6 @@ from research_assistant.edgar.form4 import (
     Form4Transaction,
     InsiderActivitySummary,
     OfficerActivity,
-    _fmt_dollars,
-    _relationship_label,
     aggregate_insider_activity,
     fetch_form4,
     load_insider_activities_batch,

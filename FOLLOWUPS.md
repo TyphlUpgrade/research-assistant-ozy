@@ -146,7 +146,9 @@ Shipped:
 - `Form4Transaction.net_dollars` — signed by acquired/disposed code;
   $0-price entries (grants, exercises) contribute $0 (no yfinance
   backfill per scope decision).
-- `EdgarClient.fetch_form4(filing)` — strict `form_type=="4"` check.
+- `form4.fetch_form4(client, filing)` — free function (inverted from
+  a client method post-review to keep `EdgarClient` free of
+  form-type knowledge); strict `form_type=="4"` check.
 - `aggregate_insider_activity(filings, window_days=90, as_of=)` →
   `InsiderActivitySummary` with per-officer rollup (sorted by
   |net $|), separated `code_mix` vs `deriv_code_mix`, window
@@ -221,8 +223,9 @@ Shipped:
   issuer_match)` — flips per-fund holdings into per-stock view;
   computes new_positions, exited_positions, funds_holding (current
   and prior). Consolidates multi-class entries per manager.
-- `EdgarClient.fetch_13f(filing)` retrieves `infotable.xml` at the
-  deterministic archive URL.
+- `form13f.fetch_13f(client, filing)` (free function, symmetric with
+  `fetch_form4`) retrieves `infotable.xml` at the deterministic
+  archive URL.
 - `load_institutional_ownership(ticker, *, tracked_funds=, issuer_match=)`
   fetches latest 2 quarters per tracked fund via `asyncio.gather`,
   auto-derives `issuer_match` from SEC submissions.json's company

@@ -155,6 +155,22 @@ class InstitutionalOwnership:
             return head + tail + "."
         return head + "."
 
+    @classmethod
+    def render_for_prompt(cls, ownership: Optional["InstitutionalOwnership"]) -> str:
+        """Three-state prompt rendering: None / no-positions / populated.
+        Mirrors `InsiderActivitySummary.render_for_prompt`."""
+        if ownership is None:
+            return (
+                "(institutional ownership unavailable — no tracked-fund "
+                "13F coverage)"
+            )
+        if ownership.funds_holding == 0 and ownership.funds_holding_prior == 0:
+            return (
+                f"(no tracked-fund 13F positions in {ownership.ticker} as "
+                f"of {ownership.period or 'last quarter'})"
+            )
+        return ownership.stage_2_line()
+
 
 def _fmt_dollars(amount: float) -> str:
     sign = "-" if amount < 0 else ""

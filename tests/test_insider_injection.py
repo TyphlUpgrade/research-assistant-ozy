@@ -25,13 +25,18 @@ from research_assistant.edgar import (
 from research_assistant.brief import _insider_summary_line, build_brief
 from research_assistant.dossier_io import Dossier, write_dossier_atomic
 from research_assistant.orchestrator import (
-    _format_insider_activity_block,
-    _format_institutional_ownership_block,
     _stage_2_probe,
     _stage_2_thesis,
     probe_ticker,
     research_ticker,
 )
+
+# The three-state prompt-block rendering used to live as
+# _format_*_block helpers on the orchestrator; it now lives as
+# `render_for_prompt` classmethods on the dataclasses. These aliases
+# keep the existing test names readable.
+_format_insider_activity_block = InsiderActivitySummary.render_for_prompt
+_format_institutional_ownership_block = InstitutionalOwnership.render_for_prompt
 
 
 def _summary(**overrides) -> InsiderActivitySummary:

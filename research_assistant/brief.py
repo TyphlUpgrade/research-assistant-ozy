@@ -33,7 +33,9 @@ from zoneinfo import ZoneInfo
 from research_assistant.claude_sdk import ClaudeClient
 from research_assistant.edgar import InsiderActivitySummary
 from research_assistant.observations import Observation, append_observation, now_iso
-from research_assistant.orchestrator import _load_prompt, _render, _chain_id
+from research_assistant.prompts import chain_id as _chain_id
+from research_assistant.prompts import load_prompt as _load_prompt
+from research_assistant.prompts import render as _render
 from research_assistant.trace_renderer import append_stage_event
 from ozymandias.intelligence.claude_json import parse_claude_response
 
