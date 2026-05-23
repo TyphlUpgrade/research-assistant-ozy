@@ -31,6 +31,7 @@ from research_assistant.edgar import (
     parse_13f,
 )
 from research_assistant.edgar.form13f import (
+    _load_fund_last_two_quarters,
     _quarter_end_for_filing_date,
     _resolve_issuer_match,
     _value_multiplier,
@@ -672,6 +673,77 @@ async def test_load_institutional_ownership_per_fund_failure_graceful() -> None:
 # ---------------------------------------------------------------------------
 # Defaults sanity
 # ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_load_fund_last_two_quarters_drops_stale_prior() -> None:
+    """A filer who skipped a quarter has a "second most recent" 13F that
+    is 4+ quarters back. Without the freshness check, that ancient
+    filing would become the comparison base, producing phantom
+    new/exited counters. The guard drops priors > 110 days from
+    current."""
+    submissions = {
+        "cik": "0001364742",
+        "filings": {
+            "recent": {
+                "accessionNumber": [
+                    "0001364742-26-000005",   # current: filed 2026-05-15 → Q1
+                    "0001364742-25-000080",   # "prior": filed 2025-05-15 → Q1 2025 (4 quarters back)
+                ],
+                "form": ["13F-HR", "13F-HR"],
+                "filingDate": ["2026-05-15", "2025-05-15"],
+                "primaryDocument": ["primary_doc.xml", "primary_doc.xml"],
+            }
+        },
+    }
+    routes = {
+        "https://data.sec.gov/submissions/CIK0001364742.json": (200, submissions),
+        _archive_url("0001364742", "0001364742-26-000005"):
+            (200, _INFOTABLE_NVDA_AAPL_2026Q1),
+        _archive_url("0001364742", "0001364742-25-000080"):
+            (200, _INFOTABLE_BLACKROCK_2025Q4),   # body irrelevant; the period date is
+    }
+    handler = _make_handler(routes)
+    async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+        current, prior = await _load_fund_last_two_quarters(
+            client, TrackedFund(cik="0001364742", name="BlackRock"),
+        )
+    assert current is not None
+    # current period = 2026-03-31; "prior" period = 2025-03-31 = 365d apart → dropped
+    assert prior is None
+
+
+@pytest.mark.asyncio
+async def test_load_fund_last_two_quarters_keeps_adjacent_prior() -> None:
+    """Healthy filer with consecutive quarters: prior must be retained."""
+    submissions = {
+        "cik": "0001364742",
+        "filings": {
+            "recent": {
+                "accessionNumber": [
+                    "0001364742-26-000005",   # current: filed 2026-05-15 → Q1 2026
+                    "0001364742-26-000001",   # prior: filed 2026-02-14 → Q4 2025 (~91d apart)
+                ],
+                "form": ["13F-HR", "13F-HR"],
+                "filingDate": ["2026-05-15", "2026-02-14"],
+                "primaryDocument": ["primary_doc.xml", "primary_doc.xml"],
+            }
+        },
+    }
+    routes = {
+        "https://data.sec.gov/submissions/CIK0001364742.json": (200, submissions),
+        _archive_url("0001364742", "0001364742-26-000005"):
+            (200, _INFOTABLE_NVDA_AAPL_2026Q1),
+        _archive_url("0001364742", "0001364742-26-000001"):
+            (200, _INFOTABLE_BLACKROCK_2025Q4),
+    }
+    handler = _make_handler(routes)
+    async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+        current, prior = await _load_fund_last_two_quarters(
+            client, TrackedFund(cik="0001364742", name="BlackRock"),
+        )
+    assert current is not None
+    assert prior is not None
+
 
 def test_default_tracked_funds_has_entries() -> None:
     """Starter list should be non-empty so the loader does something

@@ -148,20 +148,18 @@ async def load_filing_excerpts(
 
         keywords = extract_keywords(question)
         hits: list[tuple[str, str]] = []
-        seen_anchors: set[str] = set()
         if keywords:
-            for kw in keywords:
-                # `text.search` returns up to max_hits per call; we ask for
-                # the full budget each time and dedupe across keywords.
-                for anchor, para in filing_text.search(kw, max_hits=max_paragraphs):
-                    if anchor in seen_anchors:
-                        continue
-                    seen_anchors.add(anchor)
-                    hits.append((anchor, para))
+            # Single pass over paragraphs: include any paragraph that
+            # contains any keyword. O(N) instead of the per-keyword loop's
+            # O(N × K) — important for 10-K-sized filings with thousands
+            # of paragraphs.
+            keywords_lower = [kw.lower() for kw in keywords]
+            for i, para in enumerate(filing_text.paragraphs):
+                para_lower = para.lower()
+                if any(kw in para_lower for kw in keywords_lower):
+                    hits.append((filing_text.anchor(i), para))
                     if len(hits) >= max_paragraphs:
                         break
-                if len(hits) >= max_paragraphs:
-                    break
 
         return FilingExcerpts(
             ticker=ticker.upper(),

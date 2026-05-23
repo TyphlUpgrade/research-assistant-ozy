@@ -184,7 +184,11 @@ class EdgarClient:
     async def close(self) -> None:
         await self._http.aclose()
 
-    async def _get(self, url: str) -> httpx.Response:
+    async def get(self, url: str) -> httpx.Response:
+        """Rate-limited GET. Public primitive — form-specific loaders
+        (form4, form13f, excerpts) call this directly rather than going
+        through form-aware client methods, which keeps `EdgarClient`
+        free of form-type knowledge."""
         await self._rate_limiter.acquire()
         response = await self._http.get(url)
         response.raise_for_status()
@@ -194,7 +198,7 @@ class EdgarClient:
         if self._cik_cache is not None:
             return self._cik_cache
         log.info("Loading SEC ticker → CIK index from %s", TICKER_INDEX_URL)
-        response = await self._get(TICKER_INDEX_URL)
+        response = await self.get(TICKER_INDEX_URL)
         raw = response.json()
         # company_tickers.json is keyed by integer-string indices; each value
         # is {"cik_str": int, "ticker": "AAPL", "title": "Apple Inc."}.
@@ -236,7 +240,7 @@ class EdgarClient:
         """
         cik = cik.zfill(10)
         url = SUBMISSIONS_URL.format(cik=cik)
-        response = await self._get(url)
+        response = await self.get(url)
         payload = response.json()
         recent = payload.get("filings", {}).get("recent", {})
         accessions = recent.get("accessionNumber", [])
@@ -262,8 +266,13 @@ class EdgarClient:
 
     async def fetch_filing(self, filing: Filing) -> FilingText:
         """Fetch a filing's primary document, strip HTML, and return
-        paragraph-anchored body text."""
-        response = await self._get(filing.archive_url)
+        paragraph-anchored body text.
+
+        Form-specific parsers (Form 4, 13F) live as free functions in
+        their respective sibling modules (`form4.fetch_form4`,
+        `form13f.fetch_13f`) so this client stays free of form-type
+        knowledge."""
+        response = await self.get(filing.archive_url)
         body = response.text
         paragraphs = _extract_paragraphs(body, filing.primary_document)
         return FilingText(
@@ -272,25 +281,6 @@ class EdgarClient:
             filing_date=filing.filing_date,
             cik=filing.cik,
             paragraphs=paragraphs,
-        )
-
-    async def fetch_form4(self, filing: Filing):
-        """Fetch a Form 4 filing and parse its structured XML.
-
-        `parse_form4` is imported lazily to avoid a circular import:
-        `form4` depends on this module's `EdgarClient` (via the
-        high-level loaders), and this method depends on `form4.parse_form4`.
-        Lazy import keeps the package import graph acyclic."""
-        if filing.form_type != "4":
-            raise ValueError(
-                f"fetch_form4 requires form_type='4', got {filing.form_type!r}"
-            )
-        response = await self._get(filing.archive_url)
-        from research_assistant.edgar.form4 import parse_form4  # circular-import guard
-        return parse_form4(
-            response.text,
-            accession_number=filing.accession_number,
-            filing_date=filing.filing_date,
         )
 
 

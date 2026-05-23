@@ -418,15 +418,23 @@ def _infotable_url(filing: Filing) -> str:
     )
 
 
-async def _fetch_one_13f(
+async def fetch_13f(
     client: EdgarClient,
     filing: Filing,
     *,
-    manager_name: str,
+    manager_name: str = "",
 ) -> Form13FFiling:
-    """Fetch + parse one 13F-HR's information table."""
+    """Fetch + parse one 13F-HR's information table.
+
+    Symmetric with `form4.fetch_form4` — both are free functions taking
+    a client, keeping `EdgarClient` itself free of form-type knowledge."""
+    if filing.form_type not in ("13F-HR", "13F-NT"):
+        raise ValueError(
+            f"fetch_13f requires form_type='13F-HR' or '13F-NT', got "
+            f"{filing.form_type!r}"
+        )
     url = _infotable_url(filing)
-    response = await client._get(url)
+    response = await client.get(url)
     return parse_13f(
         response.text,
         accession_number=filing.accession_number,
@@ -436,12 +444,21 @@ async def _fetch_one_13f(
     )
 
 
+_PRIOR_QUARTER_MIN_DAYS = 60
+_PRIOR_QUARTER_MAX_DAYS = 110
+
+
 async def _load_fund_last_two_quarters(
     client: EdgarClient,
     fund: TrackedFund,
 ) -> tuple[Optional[Form13FFiling], Optional[Form13FFiling]]:
     """Fetch a fund's two most-recent 13F-HRs. Returns (current, prior).
-    Either may be None on graceful-degrade failure."""
+    Either may be None on graceful-degrade failure.
+
+    `prior` is dropped if its period_of_report is not 60-110 days before
+    `current`'s. A filer who skipped a quarter would otherwise produce
+    phantom new/exited counters when the next-most-recent 13F is 4+
+    quarters back."""
     try:
         filings = await client.list_filings(fund.cik, "13F-HR", limit=2)
     except Exception as exc:
@@ -453,7 +470,7 @@ async def _load_fund_last_two_quarters(
 
     async def _safe_fetch(filing: Filing) -> Optional[Form13FFiling]:
         try:
-            return await _fetch_one_13f(client, filing, manager_name=fund.name)
+            return await fetch_13f(client, filing, manager_name=fund.name)
         except Exception as exc:
             log.warning("EDGAR: 13F fetch failed for %s (%s): %s",
                         fund.name, filing.accession_number, exc)
@@ -465,6 +482,20 @@ async def _load_fund_last_two_quarters(
     current, prior = await asyncio.gather(
         _safe_fetch(filings[0]), _safe_fetch(filings[1]),
     )
+    if current is not None and prior is not None:
+        try:
+            cur_d = date.fromisoformat(current.period_of_report)
+            prior_d = date.fromisoformat(prior.period_of_report)
+            days_apart = (cur_d - prior_d).days
+            if not (_PRIOR_QUARTER_MIN_DAYS <= days_apart <= _PRIOR_QUARTER_MAX_DAYS):
+                log.info(
+                    "EDGAR 13F: %s prior period is %dd from current "
+                    "(expected ~91); dropping to avoid phantom deltas",
+                    fund.name, days_apart,
+                )
+                prior = None
+        except ValueError:
+            prior = None
     return current, prior
 
 
@@ -480,7 +511,7 @@ async def _resolve_issuer_match(
         return None
     try:
         from research_assistant.edgar.client import SUBMISSIONS_URL
-        response = await client._get(SUBMISSIONS_URL.format(cik=cik))
+        response = await client.get(SUBMISSIONS_URL.format(cik=cik))
         payload = response.json()
         name = payload.get("name") or ""
         # 13F infotables use uppercase issuer names; case-insensitive match

@@ -38,6 +38,7 @@ from research_assistant.edgar import (
     _RateLimiter,
     _relationship_label,
     aggregate_insider_activity,
+    fetch_form4,
     load_insider_activities_batch,
     load_insider_activity,
     parse_form4,
@@ -692,7 +693,7 @@ async def test_fetch_form4_parses_xml() -> None:
     )
     handler = _make_handler({filing.archive_url: (200, _FORM4_NVDA_CEO_SALE)})
     async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
-        f = await client.fetch_form4(filing)
+        f = await fetch_form4(client, filing)
     assert f.issuer_ticker == "NVDA"
     assert f.primary_owner.officer_title == "President & CEO"
 
@@ -710,7 +711,7 @@ async def test_fetch_form4_rejects_wrong_form_type() -> None:
         transport=httpx.MockTransport(lambda r: httpx.Response(200, text=""))
     ) as client:
         with pytest.raises(ValueError, match="fetch_form4 requires form_type='4'"):
-            await client.fetch_form4(filing)
+            await fetch_form4(client, filing)
 
 
 # --- aggregation -----------------------------------------------------------

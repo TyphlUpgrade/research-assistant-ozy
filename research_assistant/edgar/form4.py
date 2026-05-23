@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Optional
 
-from research_assistant.edgar.client import EdgarClient
+from research_assistant.edgar.client import EdgarClient, Filing
 
 log = logging.getLogger(__name__)
 
@@ -326,6 +326,29 @@ def _xml_float_or_none(parent: Optional[ET.Element], path: str) -> Optional[floa
 
 
 # ---------------------------------------------------------------------------
+# Form 4 fetch (free function — inverted from a client method to keep
+# EdgarClient free of form-type knowledge; the lazy-import workaround
+# in the old EdgarClient.fetch_form4 was a symptom of that inversion.)
+# ---------------------------------------------------------------------------
+
+async def fetch_form4(client: EdgarClient, filing: Filing) -> Form4Filing:
+    """Fetch + parse one Form 4 filing.
+
+    Strict form_type check stays here (not on EdgarClient) so the client
+    primitive itself doesn't gain form-aware behavior."""
+    if filing.form_type != "4":
+        raise ValueError(
+            f"fetch_form4 requires form_type='4', got {filing.form_type!r}"
+        )
+    response = await client.get(filing.archive_url)
+    return parse_form4(
+        response.text,
+        accession_number=filing.accession_number,
+        filing_date=filing.filing_date,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Insider activity aggregation
 # ---------------------------------------------------------------------------
 
@@ -511,7 +534,7 @@ async def load_insider_activity(
                 [], window_days=window_days, as_of=as_of,
             )
         parsed = await asyncio.gather(
-            *[client.fetch_form4(f) for f in filings],
+            *[fetch_form4(client, f) for f in filings],
             return_exceptions=True,
         )
         good: list[Form4Filing] = []

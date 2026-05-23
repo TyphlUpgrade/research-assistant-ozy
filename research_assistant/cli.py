@@ -126,6 +126,7 @@ async def _cmd_research(args: argparse.Namespace) -> int:
         load_ticker_data,
     )
     from research_assistant.edgar import (
+        EdgarClient,
         load_insider_activity,
         load_institutional_ownership,
     )
@@ -135,18 +136,23 @@ async def _cmd_research(args: argparse.Namespace) -> int:
     symbol = args.ticker.upper()
     adapter = YFinanceAdapter()
 
-    # Load market data + insider activity + institutional ownership in parallel
+    # Load market data + insider activity + institutional ownership in
+    # parallel. One shared EdgarClient per command keeps the 5 req/sec
+    # rate budget honest (independent clients would let each loader
+    # have its own bucket, exceeding SEC's declared ceiling) AND
+    # amortizes the 1MB company_tickers.json fetch across all loaders.
     if not args.quiet:
         print(
             f"Loading {symbol} data (yfinance + EDGAR Form 4 + 13F)…",
             file=sys.stderr,
         )
-    ticker_data, headlines, insider_activity, institutional_ownership = await asyncio.gather(
-        load_ticker_data(symbol, adapter),
-        load_headlines(symbol, adapter, max_items=5),
-        load_insider_activity(symbol),
-        load_institutional_ownership(symbol),
-    )
+    async with EdgarClient() as edgar:
+        ticker_data, headlines, insider_activity, institutional_ownership = await asyncio.gather(
+            load_ticker_data(symbol, adapter),
+            load_headlines(symbol, adapter, max_items=5),
+            load_insider_activity(symbol, client=edgar),
+            load_institutional_ownership(symbol, client=edgar),
+        )
     if ticker_data.get("_data_quality") != "ok":
         print(
             f"ERROR: insufficient yfinance data for {symbol} "
@@ -268,6 +274,7 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
         load_ticker_data,
     )
     from research_assistant.edgar import (
+        EdgarClient,
         load_filing_excerpts,
         load_insider_activity,
         load_institutional_ownership,
@@ -285,23 +292,26 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
             sources += f" + {filing_form} excerpts"
         print(f"Loading {symbol} data ({sources})…", file=sys.stderr)
 
-    # Filing-excerpt fetch is opt-in via --filing; otherwise gather a
-    # placeholder None so the asyncio.gather shape stays uniform.
-    async def _maybe_excerpts():
-        if not filing_form:
-            return None
-        return await load_filing_excerpts(symbol, filing_form, args.question)
+    # One shared EdgarClient across all loaders (see /research above for
+    # rationale). Filing-excerpt fetch is opt-in via --filing.
+    async with EdgarClient() as edgar:
+        async def _maybe_excerpts():
+            if not filing_form:
+                return None
+            return await load_filing_excerpts(
+                symbol, filing_form, args.question, client=edgar,
+            )
 
-    (
-        ticker_data, headlines, insider_activity,
-        institutional_ownership, filing_excerpts,
-    ) = await asyncio.gather(
-        load_ticker_data(symbol, adapter),
-        load_headlines(symbol, adapter, max_items=5),
-        load_insider_activity(symbol),
-        load_institutional_ownership(symbol),
-        _maybe_excerpts(),
-    )
+        (
+            ticker_data, headlines, insider_activity,
+            institutional_ownership, filing_excerpts,
+        ) = await asyncio.gather(
+            load_ticker_data(symbol, adapter),
+            load_headlines(symbol, adapter, max_items=5),
+            load_insider_activity(symbol, client=edgar),
+            load_institutional_ownership(symbol, client=edgar),
+            _maybe_excerpts(),
+        )
     if ticker_data.get("_data_quality") != "ok":
         print(
             f"ERROR: insufficient yfinance data for {symbol} "
@@ -480,10 +490,14 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
                 f"(~{len(universe) // 5 + 1}s at 5 req/sec)…",
                 file=sys.stderr,
             )
-        (tickers_with_data, headlines_per_ticker), insider_activities = await asyncio.gather(
-            load_watchlist_data(universe, adapter),
-            load_insider_activities_batch(universe),
-        )
+        # Shared EdgarClient across the whole batch so the CIK ticker
+        # index is fetched once for all 30 tickers.
+        from research_assistant.edgar import EdgarClient
+        async with EdgarClient() as edgar:
+            (tickers_with_data, headlines_per_ticker), insider_activities = await asyncio.gather(
+                load_watchlist_data(universe, adapter),
+                load_insider_activities_batch(universe, client=edgar),
+            )
         brief = await build_brief(
             market_context=market_context,
             universe=universe,
