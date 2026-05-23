@@ -126,6 +126,9 @@ class InsiderActivitySummary:
     window_days: int
     window_start: str
     window_end: str
+    # Transaction-window metrics: filings whose period_of_report (the trade
+    # date) falls in the window. These describe activity that *happened*
+    # recently.
     total_filings: int
     buys_count: int
     sales_count: int
@@ -134,22 +137,42 @@ class InsiderActivitySummary:
     deriv_code_mix: dict[str, int]           # derivative codes
     by_officer: list[OfficerActivity]        # sorted by abs(net_dollars) desc
     latest_transaction_date: Optional[str]
+    # Disclosure-window metrics: filings whose filing_date falls in the
+    # window regardless of transaction date. Cluster late-disclosures
+    # (multiple insiders catching up on old trades in the same week) are
+    # themselves a behavioral signal — often tied to a near-term catalyst.
+    disclosed_filings_count: int = 0
+    late_disclosure_count: int = 0           # disclosed in window, transacted before
+    late_disclosure_officers: int = 0        # distinct CIKs across late filings
+    latest_disclosure_date: Optional[str] = None
 
     def stage_1_line(self) -> str:
         """One-line filter summary for batched Stage 1 Haiku prompts.
         Format mirrors the FOLLOWUPS #3 example:
-        "insider net flow last 90d: -$42M / 4 sales / 0 buys"."""
-        return (
+        "insider net flow last 90d: -$42M / 4 sales / 0 buys"
+
+        When late-disclosure activity is present, an additional clause
+        surfaces the cluster signal so Stage 1 can weight it."""
+        line = (
             f"insider net flow last {self.window_days}d: "
             f"{_fmt_dollars(self.net_dollars)} / "
             f"{self.sales_count} sales / {self.buys_count} buys"
         )
+        if self.late_disclosure_count > 0:
+            line += (
+                f" · {self.late_disclosure_count} late-disclosed "
+                f"({self.late_disclosure_officers} officers)"
+            )
+        return line
 
     def stage_2_block(self) -> str:
         """Multi-line Stage 2 enrichment block (committed-ticker DD).
 
         Includes counts, net $, code mix, latest transaction date, and the
-        top-3 officers ranked by absolute dollar impact."""
+        top-3 officers ranked by absolute dollar impact. When late-
+        disclosure filings exist, a fourth line surfaces the count and
+        distinct-officer span — a coordinated cluster is alpha-relevant
+        even though the underlying transactions are pre-window."""
         lines: list[str] = []
         head = (
             f"{self.sales_count} sales / {self.buys_count} buys last "
@@ -167,6 +190,12 @@ class InsiderActivitySummary:
                 f"{o.relationship} {_fmt_dollars(o.net_dollars)}" for o in top
             ]
             lines.append("top: " + "; ".join(officer_strs))
+        if self.late_disclosure_count > 0:
+            lines.append(
+                f"disclosure: {self.disclosed_filings_count} filed in window "
+                f"({self.late_disclosure_count} late for pre-window trades, "
+                f"{self.late_disclosure_officers} officers)"
+            )
         return "\n".join(lines)
 
     @classmethod
@@ -182,7 +211,7 @@ class InsiderActivitySummary:
                 "(insider activity unavailable — EDGAR fetch failed or "
                 "ticker not in SEC universe)"
             )
-        if summary.total_filings == 0:
+        if summary.total_filings == 0 and summary.disclosed_filings_count == 0:
             return f"(no Form 4 filings last {summary.window_days}d)"
         return summary.stage_2_block()
 
@@ -400,19 +429,43 @@ def aggregate_insider_activity(
 ) -> InsiderActivitySummary:
     """Compress a list of Form 4 filings into a per-window summary.
 
-    Filings are filtered to those whose `period_of_report` falls inside
-    [as_of - window_days, as_of]. Transactions are attributed to the
-    filing's primary_owner.
+    Two windows, both [as_of - window_days, as_of]:
+      - Transaction window: filings whose `period_of_report` falls inside.
+        Drives buys/sales/net_dollars/by_officer — the "what happened"
+        view that's been here since v1.
+      - Disclosure window: filings whose `filing_date` falls inside.
+        Drives disclosed_filings_count and the late_disclosure_* signal.
+        A cluster of insiders late-filing in the same week is itself
+        alpha-relevant even though the underlying transactions are old.
+
+    Transactions are attributed to the filing's primary_owner.
     """
     as_of = as_of or date.today()
     window_start = (as_of - timedelta(days=window_days)).isoformat()
     window_end = as_of.isoformat()
 
-    def _in_window(f: Form4Filing) -> bool:
+    def _tx_in_window(f: Form4Filing) -> bool:
         anchor = f.period_of_report or f.filing_date
         return bool(anchor) and window_start <= anchor <= window_end
 
-    in_window = [f for f in filings if _in_window(f)]
+    def _disclosed_in_window(f: Form4Filing) -> bool:
+        return bool(f.filing_date) and window_start <= f.filing_date <= window_end
+
+    in_window = [f for f in filings if _tx_in_window(f)]
+    disclosed = [f for f in filings if _disclosed_in_window(f)]
+    # "Late" = disclosed in window but transactions occurred before window.
+    # A filing with no period_of_report falls back to filing_date in
+    # _tx_in_window, so it's never classified as late — that's correct
+    # (we have no evidence the underlying trade is old).
+    late = [
+        f for f in disclosed
+        if f.period_of_report and f.period_of_report < window_start
+    ]
+    latest_disclosure_date = max((f.filing_date for f in disclosed), default=None)
+    late_disclosure_officers = len({
+        f.primary_owner.cik for f in late
+        if f.primary_owner is not None and f.primary_owner.cik
+    })
 
     buys_count = 0
     sales_count = 0
@@ -485,6 +538,10 @@ def aggregate_insider_activity(
         code_mix=code_mix,
         deriv_code_mix=deriv_code_mix,
         by_officer=by_officer_sorted,
+        disclosed_filings_count=len(disclosed),
+        late_disclosure_count=len(late),
+        late_disclosure_officers=late_disclosure_officers,
+        latest_disclosure_date=latest_disclosure_date,
         latest_transaction_date=latest_tx,
     )
 
