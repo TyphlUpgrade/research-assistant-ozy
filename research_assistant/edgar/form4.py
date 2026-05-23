@@ -360,39 +360,48 @@ def aggregate_insider_activity(
     latest_tx: Optional[str] = None
 
     for f in in_window:
+        # Top-line counters accumulate for every filing in the window.
+        # Per-officer attribution is gated on having an owner — an empty
+        # <reportingOwner> (rare but possible from malformed XML) must not
+        # silently drop the transactions from buys/sales/net_dollars.
         owner = f.primary_owner
-        if owner is None:
-            continue
-        oa = by_officer.setdefault(
-            owner.cik,
-            OfficerActivity(
-                cik=owner.cik,
-                name=owner.name,
-                relationship=_relationship_label(owner),
-            ),
-        )
+        oa: Optional[OfficerActivity] = None
+        if owner is not None:
+            oa = by_officer.setdefault(
+                owner.cik,
+                OfficerActivity(
+                    cik=owner.cik,
+                    name=owner.name,
+                    relationship=_relationship_label(owner),
+                ),
+            )
         for t in f.non_derivative:
             if not t.code:
                 continue
             code_mix[t.code] = code_mix.get(t.code, 0) + 1
             if t.code == _BUY_CODE:
                 buys_count += 1
-                oa.buys_count += 1
+                if oa is not None:
+                    oa.buys_count += 1
             elif t.code == _SALE_CODE:
                 sales_count += 1
-                oa.sales_count += 1
-            else:
+                if oa is not None:
+                    oa.sales_count += 1
+            elif oa is not None:
                 oa.other_count += 1
             tx_value = t.net_dollars
             net_dollars += tx_value
-            oa.net_dollars += tx_value
-            sign = 1 if t.acquired_disposed == "A" else -1
-            oa.net_shares += sign * t.shares
-            if t.date:
-                if oa.latest_transaction_date is None or t.date > oa.latest_transaction_date:
+            if oa is not None:
+                oa.net_dollars += tx_value
+                sign = 1 if t.acquired_disposed == "A" else -1
+                oa.net_shares += sign * t.shares
+                if t.date and (
+                    oa.latest_transaction_date is None
+                    or t.date > oa.latest_transaction_date
+                ):
                     oa.latest_transaction_date = t.date
-                if latest_tx is None or t.date > latest_tx:
-                    latest_tx = t.date
+            if t.date and (latest_tx is None or t.date > latest_tx):
+                latest_tx = t.date
         for t in f.derivative:
             if not t.code:
                 continue

@@ -300,3 +300,48 @@ def test_does_not_fire_when_filing_paragraph_anchor_carries_substance() -> None:
         user_message="I disagree, 27% segment growth is not durable.",
         prior_evidence_anchors=anchors,
     ) is False
+
+
+def test_corpus_allowlist_excludes_metadata_fields() -> None:
+    """Regression: _flatten_anchors_to_corpus previously iterated ALL
+    dict.values(), so any future anchor metadata field (retrieved_at,
+    cost_usd, cik, etc.) leaked into Defender's verification corpus and
+    could resolve fake citation tokens. The allowlist restricts the
+    corpus to {claim, source, para_text, quote}."""
+    anchors = [{
+        "claim": "DC revenue grew 12%",
+        "source": "edgar:form4:aggregate",
+        "retrieved_at": "2026-05-23T14:00Z",   # ISO date — must NOT count
+        "cost_usd": 0.0042,
+        "cik": "0001045810",
+    }]
+    # User invents a citation matching the leaked metadata. Without the
+    # allowlist, "2026-05-23" would substring-match retrieved_at and
+    # Defender would falsely consider the citation verified.
+    assert should_invoke_defender(
+        prior_turn_had_recommendation=True,
+        user_message="I disagree — the 2026-05-23 print shows a regression.",
+        prior_evidence_anchors=anchors,
+    ) is True
+    # The real `claim` field still resolves legitimate pushback
+    assert should_invoke_defender(
+        prior_turn_had_recommendation=True,
+        user_message="I disagree — 12% growth was not sustainable.",
+        prior_evidence_anchors=anchors,
+    ) is False
+
+
+def test_corpus_allowlist_includes_para_text() -> None:
+    """The orchestrator's enrichment writes filing paragraph text into
+    `para_text`; that field IS in the allowlist so Defender resolves
+    pushback citing the paragraph content."""
+    anchors = [{
+        "claim": "segment revenue",
+        "source": "edgar:10-K:ACC:para_42",
+        "para_text": "Data center segment revenue grew 27% year-over-year.",
+    }]
+    assert should_invoke_defender(
+        prior_turn_had_recommendation=True,
+        user_message="I disagree — 27% YoY growth is unsustainable.",
+        prior_evidence_anchors=anchors,
+    ) is False

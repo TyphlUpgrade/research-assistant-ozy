@@ -305,6 +305,7 @@ def aggregate_institutional_ownership(
     *,
     ticker: str,
     issuer_match: str,
+    funds_tracked: Optional[int] = None,
 ) -> InstitutionalOwnership:
     """Flip per-fund holdings into a per-stock view for `ticker`.
 
@@ -314,6 +315,13 @@ def aggregate_institutional_ownership(
 
     Diff against `prior_filings` (matched by manager_cik) yields
     new_positions / exited_positions / funds_holding_prior.
+
+    `funds_tracked` should be the caller's universe size (e.g.
+    `len(tracked_funds)`) so the Stage 2 summary line can render
+    "8 of 20" coverage rather than "8 of 8" (which would collapse the
+    denominator to the numerator after per-fund filtering). Falls back
+    to the larger of the two filing list lengths when omitted —
+    preserves backward-compat for callers that don't yet pass it.
     """
     needle = issuer_match.lower().strip()
     period = current_filings[0].period_of_report if current_filings else ""
@@ -374,7 +382,10 @@ def aggregate_institutional_ownership(
         issuer_match=issuer_match,
         period=period,
         prior_period=prior_period,
-        funds_tracked=max(len(current_filings), len(prior_filings)),
+        funds_tracked=(
+            funds_tracked if funds_tracked is not None
+            else max(len(current_filings), len(prior_filings))
+        ),
         funds_holding=len(current_holders),
         funds_holding_prior=len(prior_holders),
         new_positions=new_positions,
@@ -475,8 +486,13 @@ async def _resolve_issuer_match(
         # 13F infotables use uppercase issuer names; case-insensitive match
         # works regardless. Strip common corporate suffixes for a tighter
         # substring (issuer might be "NVIDIA CORP" while SEC name is
-        # "NVIDIA CORPORATION").
-        for suffix in (" CORPORATION", " CORP", " INC", " INC.", " LTD", ", INC.", " PLC"):
+        # "NVIDIA CORPORATION"). Order longest-first so " INC." is checked
+        # before " INC" — otherwise "APPLE INC." → "APPLE." (with stray
+        # period) and the substring match against 13F text "APPLE INC"
+        # silently misses.
+        for suffix in (
+            ", INC.", " CORPORATION", " INC.", " CORP", " INC", " LTD", " PLC",
+        ):
             if name.upper().endswith(suffix):
                 name = name[: -len(suffix)]
                 break
@@ -537,6 +553,7 @@ async def load_institutional_ownership(
         return aggregate_institutional_ownership(
             current_filings, prior_filings,
             ticker=ticker, issuer_match=match,
+            funds_tracked=len(tracked_funds),
         )
     finally:
         if owns_client:

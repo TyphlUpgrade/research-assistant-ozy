@@ -770,6 +770,32 @@ def test_aggregate_empty_list_returns_zero_summary() -> None:
     assert s.latest_transaction_date is None
 
 
+def test_aggregate_form4_with_no_owner_still_counts_transactions() -> None:
+    """Regression: a Form 4 with an empty <reportingOwner> previously
+    `continue`d in the aggregation loop, silently dropping ALL its
+    transactions from top-line buys/sales/net_dollars/code_mix in
+    addition to the (correct) by-officer attribution gating."""
+    sale = Form4Transaction(
+        date="2026-05-19", code="S", shares=10_000, price_per_share=150.00,
+        acquired_disposed="D", security_title="Common Stock",
+    )
+    orphan = Form4Filing(
+        accession_number="A-NOWNER", filing_date="2026-05-19",
+        period_of_report="2026-05-19", issuer_cik="0001045810",
+        issuer_ticker="NVDA", owners=[],   # ← no reporting owner
+        non_derivative=[sale],
+    )
+    s = aggregate_insider_activity([orphan], as_of=date(2026, 5, 22))
+    # Top-line counters MUST reflect the transaction
+    assert s.total_filings == 1
+    assert s.sales_count == 1
+    assert s.net_dollars == pytest.approx(-1_500_000)
+    assert s.code_mix == {"S": 1}
+    assert s.latest_transaction_date == "2026-05-19"
+    # by_officer is correctly empty — there's no owner to attribute to
+    assert s.by_officer == []
+
+
 # --- summary rendering -----------------------------------------------------
 
 def test_stage_1_line_matches_spec_format() -> None:

@@ -32,6 +32,7 @@ from research_assistant.edgar import (
 )
 from research_assistant.edgar.form13f import (
     _quarter_end_for_filing_date,
+    _resolve_issuer_match,
     _value_multiplier,
 )
 
@@ -482,6 +483,94 @@ def _archive_url(cik: str, accession: str) -> str:
         f"https://www.sec.gov/Archives/edgar/data/{cik_no_zeros}/"
         f"{acc_no_dashes}/infotable.xml"
     )
+
+
+@pytest.mark.asyncio
+async def test_resolve_issuer_match_strips_inc_dot_cleanly() -> None:
+    """Regression: suffix-strip order put ' INC' before ' INC.' so
+    'APPLE INC.' previously became 'APPLE.' (trailing period broke the
+    substring match against 13F infotables that print 'APPLE INC').
+    Verified directly against _resolve_issuer_match to avoid the
+    loader's `no tracked_funds` short-circuit."""
+    aapl_submissions = {
+        "cik": "0000320193", "name": "Apple Inc.",
+        "filings": {"recent": {"accessionNumber": [], "form": [],
+                                "filingDate": [], "primaryDocument": []}},
+    }
+    aapl_index = {
+        "0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."},
+    }
+    routes = {
+        "https://www.sec.gov/files/company_tickers.json": (200, aapl_index),
+        "https://data.sec.gov/submissions/CIK0000320193.json": (200, aapl_submissions),
+    }
+    handler = _make_handler(routes)
+    async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+        match = await _resolve_issuer_match(client, "AAPL")
+    # Strip lowercases to "apple inc." → ", inc." doesn't match (no comma
+    # before " inc."), then " inc." matches → strip leaves "apple" (or
+    # "Apple" preserving case). Critically: NO trailing period.
+    assert match is not None
+    assert not match.endswith(".")
+    assert match.lower() == "apple"
+
+
+@pytest.mark.asyncio
+async def test_resolve_issuer_match_strips_corp_suffixes() -> None:
+    """Common corporate suffixes all strip cleanly."""
+    submissions_cases = [
+        ("NVIDIA CORPORATION", "NVIDIA"),
+        ("NVIDIA CORP", "NVIDIA"),
+        ("APPLE INC.", "APPLE"),
+        ("APPLE INC", "APPLE"),
+        ("ARM HOLDINGS PLC", "ARM HOLDINGS"),
+        ("UNILEVER PLC", "UNILEVER"),
+    ]
+    for name, expected in submissions_cases:
+        idx = {"0": {"cik_str": 1, "ticker": "X", "title": name}}
+        subs = {
+            "cik": "0000000001", "name": name,
+            "filings": {"recent": {"accessionNumber": [], "form": [],
+                                    "filingDate": [], "primaryDocument": []}},
+        }
+        routes = {
+            "https://www.sec.gov/files/company_tickers.json": (200, idx),
+            "https://data.sec.gov/submissions/CIK0000000001.json": (200, subs),
+        }
+        handler = _make_handler(routes)
+        async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+            match = await _resolve_issuer_match(client, "X")
+        assert match == expected, f"{name!r} → {match!r}, expected {expected!r}"
+
+
+def test_aggregate_funds_tracked_uses_passed_denominator() -> None:
+    """Regression: aggregate previously collapsed funds_tracked to
+    max(len(current), len(prior)) — after per-fund filtering this
+    became "N of N" instead of "N of universe_size"."""
+    current = [
+        _make_filing(manager_cik="01", manager_name="BlackRock",
+                     period="2026-03-31", holdings=[_nvda_holding()]),
+    ]
+    s = aggregate_institutional_ownership(
+        current, [], ticker="NVDA", issuer_match="NVIDIA",
+        funds_tracked=20,
+    )
+    assert s.funds_tracked == 20
+    assert s.funds_holding == 1
+    assert "1 of 20 tracked funds" in s.stage_2_line()
+
+
+def test_aggregate_funds_tracked_default_back_compat() -> None:
+    """Existing callers that don't pass funds_tracked keep the old
+    max(current, prior) heuristic — preserves backward compat."""
+    current = [
+        _make_filing(manager_cik="01", manager_name="BlackRock",
+                     period="2026-03-31", holdings=[_nvda_holding()]),
+    ]
+    s = aggregate_institutional_ownership(
+        current, [], ticker="NVDA", issuer_match="NVIDIA",
+    )
+    assert s.funds_tracked == 1
 
 
 @pytest.mark.asyncio

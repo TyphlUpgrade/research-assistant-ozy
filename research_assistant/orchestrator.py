@@ -609,13 +609,25 @@ def _extract_strong_tokens(text: str) -> list[str]:
     return [m.group(0).strip() for m in _STRONG_TOKEN_RE.finditer(text)]
 
 
+# Citable fields — fields that legitimately belong in Defender's
+# verification corpus. New anchor metadata (retrieved_at, cost_usd,
+# cik, confidence, etc.) MUST stay out unless added here intentionally;
+# otherwise a future field's value could resolve a fake citation token.
+_CITABLE_ANCHOR_FIELDS = frozenset({"claim", "source", "para_text", "quote"})
+
+
 def _flatten_anchors_to_corpus(anchors: list) -> str:
-    """Join {claim, source} dicts (or bare strings) into one lowercased blob
-    suitable for substring containment checks."""
+    """Join anchor citable fields into one lowercased blob suitable for
+    substring containment checks. Allowlist enforcement: only `claim`,
+    `source`, `para_text`, `quote` enter the corpus — other dict fields
+    are treated as metadata and excluded so future schema additions
+    can't accidentally widen the verification surface."""
     parts: list[str] = []
     for a in anchors or []:
         if isinstance(a, dict):
-            parts.extend(str(v) for v in a.values())
+            parts.extend(
+                str(v) for k, v in a.items() if k in _CITABLE_ANCHOR_FIELDS
+            )
         else:
             parts.append(str(a))
     return " ".join(parts).lower()
