@@ -43,7 +43,7 @@ from research_assistant.edgar import (
 # rather than re-exported from the package — keeps the public surface
 # honest about what's public.
 from research_assistant.edgar.client import _extract_paragraphs, _RateLimiter
-from research_assistant.edgar.form4 import _ownership_url
+from research_assistant.edgar.form4 import _form4_primary_xml_url
 from research_assistant.edgar.form4 import _fmt_dollars, _relationship_label
 
 
@@ -693,13 +693,9 @@ async def test_fetch_form4_parses_xml() -> None:
         cik="0001045810",
         primary_document="wf-form4_xxx.xml",
     )
-    # fetch_form4 builds the deterministic ownership.xml URL (ignores
-    # primary_document — see test_fetch_form4_bypasses_xslt_display_url).
-    ownership_url = (
-        "https://www.sec.gov/Archives/edgar/data/1045810/"
-        "000104581026000045/ownership.xml"
-    )
-    handler = _make_handler({ownership_url: (200, _FORM4_NVDA_CEO_SALE)})
+    handler = _make_handler({
+        _form4_primary_xml_url(filing): (200, _FORM4_NVDA_CEO_SALE),
+    })
     async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
         f = await fetch_form4(client, filing)
     assert f.issuer_ticker == "NVDA"
@@ -735,6 +731,36 @@ async def test_fetch_form4_bypasses_xslt_display_url() -> None:
     async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
         f = await fetch_form4(client, filing)
     assert f.issuer_ticker == "NVDA"
+
+
+@pytest.mark.asyncio
+async def test_fetch_form4_bypasses_xslt_with_vendor_filename() -> None:
+    """Some filers (e.g. T1 Energy) use EDGAR vendor names like
+    'marketforms-73189.xml' instead of the standard 'ownership.xml'. The
+    fetcher must strip only the 'xsl*/' prefix and preserve the filename,
+    not hardcode 'ownership.xml'."""
+    filing = Filing(
+        accession_number="0001213900-26-058482",
+        form_type="4",
+        filing_date="2026-05-19",
+        cik="0001992243",
+        primary_document="xslF345X06/marketforms-73189.xml",
+    )
+    plain_url = (
+        "https://www.sec.gov/Archives/edgar/data/1992243/"
+        "000121390026058482/marketforms-73189.xml"
+    )
+    xslt_url = (
+        "https://www.sec.gov/Archives/edgar/data/1992243/"
+        "000121390026058482/xslF345X06/marketforms-73189.xml"
+    )
+    handler = _make_handler({
+        plain_url: (200, _FORM4_NVDA_CEO_SALE),
+        xslt_url: (200, "<html><head><style>x</style></head><body></body></html>"),
+    })
+    async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+        f = await fetch_form4(client, filing)
+    assert f.issuer_ticker == "NVDA"  # body is reused fixture; ticker comes from XML
 
 
 @pytest.mark.asyncio
@@ -983,8 +1009,8 @@ async def test_load_insider_activity_aggregates_filings() -> None:
     routes = _form4_routes(
         submissions=submissions,
         xml_bodies={
-            _ownership_url(f_ceo): _FORM4_NVDA_CEO_SALE,
-            _ownership_url(f_cfo): _FORM4_NVDA_CFO_BUY_AND_GRANT,
+            _form4_primary_xml_url(f_ceo): _FORM4_NVDA_CEO_SALE,
+            _form4_primary_xml_url(f_cfo): _FORM4_NVDA_CFO_BUY_AND_GRANT,
         },
     )
     handler = _make_handler(routes)
@@ -1133,8 +1159,8 @@ async def test_load_insider_activity_skips_parse_failures() -> None:
     routes = _form4_routes(
         submissions=submissions,
         xml_bodies={
-            _ownership_url(good): _FORM4_NVDA_CEO_SALE,
-            _ownership_url(bad): "not valid xml <>",
+            _form4_primary_xml_url(good): _FORM4_NVDA_CEO_SALE,
+            _form4_primary_xml_url(bad): "not valid xml <>",
         },
     )
     handler = _make_handler(routes)
