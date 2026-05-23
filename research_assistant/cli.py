@@ -268,6 +268,7 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
         load_ticker_data,
     )
     from research_assistant.edgar import (
+        load_filing_excerpts,
         load_insider_activity,
         load_institutional_ownership,
     )
@@ -277,16 +278,29 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
     symbol = args.ticker.upper()
     adapter = YFinanceAdapter()
 
+    filing_form = getattr(args, "filing", None)
     if not args.quiet:
-        print(
-            f"Loading {symbol} data (yfinance + EDGAR Form 4 + 13F)…",
-            file=sys.stderr,
-        )
-    ticker_data, headlines, insider_activity, institutional_ownership = await asyncio.gather(
+        sources = "yfinance + EDGAR Form 4 + 13F"
+        if filing_form:
+            sources += f" + {filing_form} excerpts"
+        print(f"Loading {symbol} data ({sources})…", file=sys.stderr)
+
+    # Filing-excerpt fetch is opt-in via --filing; otherwise gather a
+    # placeholder None so the asyncio.gather shape stays uniform.
+    async def _maybe_excerpts():
+        if not filing_form:
+            return None
+        return await load_filing_excerpts(symbol, filing_form, args.question)
+
+    (
+        ticker_data, headlines, insider_activity,
+        institutional_ownership, filing_excerpts,
+    ) = await asyncio.gather(
         load_ticker_data(symbol, adapter),
         load_headlines(symbol, adapter, max_items=5),
         load_insider_activity(symbol),
         load_institutional_ownership(symbol),
+        _maybe_excerpts(),
     )
     if ticker_data.get("_data_quality") != "ok":
         print(
@@ -319,6 +333,7 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
             base=base,
             insider_activity=insider_activity,
             institutional_ownership=institutional_ownership,
+            filing_excerpts=filing_excerpts,
         )
     except FileNotFoundError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -662,6 +677,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     pp.add_argument("ticker", help="Stock symbol — must already have a dossier")
     pp.add_argument("question", help="Focused question to answer against the dossier")
+    pp.add_argument(
+        "--filing",
+        metavar="FORM",
+        help="Fetch the latest filing of the given form (e.g. 10-K, 10-Q, 8-K) and "
+             "inject paragraphs matching the question keywords. Cited anchors "
+             "(edgar:<form>:<acc>:para_N) persist into the trace for Defender.",
+    )
 
     pb = sub.add_parser("brief", help="Morning summary over watchlist + dynamic universe")
     pb.add_argument("--refresh", action="store_true", help="Bypass today's cache and rebuild")

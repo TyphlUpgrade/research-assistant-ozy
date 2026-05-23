@@ -33,7 +33,11 @@ from research_assistant.dossier_io import (
     read_dossier,
     write_dossier_atomic,
 )
-from research_assistant.edgar import InsiderActivitySummary, InstitutionalOwnership
+from research_assistant.edgar import (
+    FilingExcerpts,
+    InsiderActivitySummary,
+    InstitutionalOwnership,
+)
 from research_assistant.observations import Observation, append_observation
 from research_assistant.trace_renderer import append_stage_event
 from ozymandias.intelligence.claude_json import parse_claude_response
@@ -114,6 +118,60 @@ def _format_institutional_ownership_block(
             f"{ownership.period or 'last quarter'})"
         )
     return ownership.stage_2_line()
+
+
+def _format_filing_excerpts_block(
+    excerpts: Optional[FilingExcerpts],
+) -> str:
+    """Render a FilingExcerpts into the {filing_excerpts_block} slot
+    (FOLLOWUPS #1 — /probe full-text path). When None, the operator did
+    not opt in via --filing; when empty, the fetch succeeded but no
+    paragraphs matched. Populated case lists each excerpt as
+    [edgar:<form>:<acc>:para_N] followed by the paragraph text."""
+    if excerpts is None:
+        return "(no filing excerpts requested — pass --filing <FORM> to /probe to fetch on demand)"
+    return excerpts.render_block()
+
+
+# Matches the FilingText.anchor format: edgar:<form>:<accession>:para_<n>.
+# Three colon-separated segments after the "edgar:" prefix — form
+# (e.g. "10-K", "13F-HR"), accession (e.g. "0001234567-26-000045"),
+# para_N. Used by _enrich_anchors_with_filing_text to detect citable
+# paragraph anchors so Defender (#2) can verify pushback citations
+# against the fetched paragraph text without needing its own EDGAR
+# fetch path.
+_EDGAR_PARA_ANCHOR_RE = re.compile(r"^edgar:[\w.-]+:[\w.-]+:para_\d+$")
+
+
+def _enrich_anchors_with_filing_text(
+    anchors: list,
+    filing_excerpts: Optional[FilingExcerpts],
+) -> list:
+    """For any anchor dict whose `source` matches the edgar paragraph
+    pattern and lines up with a paragraph in `filing_excerpts`, splice
+    the paragraph text into the dict as `para_text`. Defender's
+    `_flatten_anchors_to_corpus` then picks up the text automatically
+    (no Defender code change required).
+
+    Non-dict entries and non-matching sources pass through unchanged.
+    """
+    if not filing_excerpts:
+        return list(anchors)
+    out: list = []
+    for a in anchors:
+        if not isinstance(a, dict):
+            out.append(a)
+            continue
+        source = a.get("source", "")
+        if not _EDGAR_PARA_ANCHOR_RE.match(source):
+            out.append(a)
+            continue
+        text = filing_excerpts.by_anchor(source)
+        if text is None:
+            out.append(a)
+            continue
+        out.append({**a, "para_text": text})
+    return out
 
 
 async def _stage_2_thesis(
@@ -371,6 +429,7 @@ async def _stage_2_probe(
     focused_question: str,
     insider_activity: Optional[InsiderActivitySummary] = None,
     institutional_ownership: Optional[InstitutionalOwnership] = None,
+    filing_excerpts: Optional[FilingExcerpts] = None,
 ) -> tuple[Optional[dict], Optional[CallResult]]:
     """Invoke the probe stage (Sonnet, dossier-scoped focused answer).
     Returns (parsed_json, call_metadata)."""
@@ -383,6 +442,7 @@ async def _stage_2_probe(
         focused_question=focused_question,
         insider_activity_block=_format_insider_activity_block(insider_activity),
         institutional_ownership_block=_format_institutional_ownership_block(institutional_ownership),
+        filing_excerpts_block=_format_filing_excerpts_block(filing_excerpts),
     )
     system = f"WORLD_STATE for this session:\n{json.dumps(world_state, indent=2)}"
     result = await client.call(prompt, model="claude-sonnet-4-6", system=system)
@@ -400,6 +460,7 @@ async def probe_ticker(
     client: Optional[ClaudeClient] = None,
     insider_activity: Optional[InsiderActivitySummary] = None,
     institutional_ownership: Optional[InstitutionalOwnership] = None,
+    filing_excerpts: Optional[FilingExcerpts] = None,
 ) -> ProbeResult:
     """Run a focused probe against an existing dossier.
 
@@ -437,7 +498,16 @@ async def probe_ticker(
         client, world_state, ticker_data, headlines, dossier_context, question,
         insider_activity=insider_activity,
         institutional_ownership=institutional_ownership,
+        filing_excerpts=filing_excerpts,
     )
+    # Enrich edgar:<form>:<acc>:para_N anchors with their paragraph text
+    # BEFORE the trace event is appended, so the trace JSONL persists the
+    # enrichment and the defender-check loader picks it up later.
+    if stage_2 is not None and filing_excerpts is not None:
+        stage_2["evidence_anchors"] = _enrich_anchors_with_filing_text(
+            stage_2.get("evidence_anchors") or [],
+            filing_excerpts,
+        )
     append_stage_event(
         chain_id=chain,
         stage_id="stage_2_probe",

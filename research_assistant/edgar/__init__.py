@@ -2,9 +2,10 @@
 EDGAR adapter package — rate-limited async client + per-form parsers.
 
 Modules:
-  client  — EdgarClient, _RateLimiter, Filing / FilingText, HTML extraction.
-  form4   — Form 4 insider transactions + per-window aggregation + loaders.
-  (form13f — institutional 13F filings — FOLLOWUPS #5, sibling layer)
+  client    — EdgarClient, _RateLimiter, Filing / FilingText, HTML extraction.
+  form4     — Form 4 insider transactions + per-window aggregation + loaders.
+  form13f   — Form 13F institutional holdings + per-stock aggregation.
+  excerpts  — Filing-text excerpts (FOLLOWUPS #1) for /probe + Defender corpus.
 
 Public surface re-exported here so callers can `from research_assistant.edgar
 import EdgarClient, load_insider_activity` without caring about the internal
@@ -45,13 +46,21 @@ from research_assistant.edgar.form13f import (
     load_institutional_ownership,
     parse_13f,
 )
+from research_assistant.edgar.excerpts import (
+    DEFAULT_MAX_PARAGRAPHS,
+    FilingExcerpts,
+    extract_keywords,
+    load_filing_excerpts,
+)
 
 __all__ = [
+    "DEFAULT_MAX_PARAGRAPHS",
     "DEFAULT_RATE_LIMIT_PER_SEC",
     "DEFAULT_TRACKED_FUNDS",
     "DEFAULT_USER_AGENT",
     "EdgarClient",
     "Filing",
+    "FilingExcerpts",
     "FilingText",
     "Form4Filing",
     "Form4Owner",
@@ -67,6 +76,8 @@ __all__ = [
     "TrackedFund",
     "aggregate_insider_activity",
     "aggregate_institutional_ownership",
+    "extract_keywords",
+    "load_filing_excerpts",
     "load_insider_activities_batch",
     "load_insider_activity",
     "load_institutional_ownership",

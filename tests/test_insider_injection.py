@@ -260,7 +260,7 @@ async def test_probe_ticker_forwards_insider_activity(tmp_path: Path) -> None:
     write_dossier_atomic(Dossier(symbol="NVDA", state_md="prior thesis"), tmp_path)
     captured: dict = {}
 
-    async def fake_probe(client, ws, td, h, dc, q, insider_activity=None, institutional_ownership=None):
+    async def fake_probe(client, ws, td, h, dc, q, insider_activity=None, institutional_ownership=None, filing_excerpts=None):
         captured["insider_activity"] = insider_activity
         return {
             "ticker": "NVDA", "answer": "ans",
@@ -516,7 +516,7 @@ async def test_probe_ticker_forwards_institutional_ownership(tmp_path: Path) -> 
     write_dossier_atomic(Dossier(symbol="NVDA", state_md="prior thesis"), tmp_path)
     captured: dict = {}
 
-    async def fake_probe(client, ws, td, h, dc, q, insider_activity=None, institutional_ownership=None):
+    async def fake_probe(client, ws, td, h, dc, q, insider_activity=None, institutional_ownership=None, filing_excerpts=None):
         captured["institutional_ownership"] = institutional_ownership
         return {
             "ticker": "NVDA", "answer": "ans",

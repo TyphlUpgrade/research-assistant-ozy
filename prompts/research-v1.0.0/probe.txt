@@ -60,6 +60,9 @@ INSIDER_ACTIVITY (Form 4 filings, compressed; per FOLLOWUPS #3):
 INSTITUTIONAL_OWNERSHIP (Form 13F across curated tracked funds; per FOLLOWUPS #5):
 {institutional_ownership_block}
 
+FILING_EXCERPTS (paragraphs from a specific filing, when operator passed --filing; per FOLLOWUPS #1):
+{filing_excerpts_block}
+
 NEWS REACTIVITY DISCIPLINE:
 - "fresh_likely_priced_in" headlines (<2h old) indicate the market HAS ALREADY MOVED on this news.
   Treat them as RISK signals (chase risk), NOT confirmation signals.
@@ -92,6 +95,11 @@ was driven by...", an anchor entry might be:
     INSTITUTIONAL_OWNERSHIP block above (fund counts, total $/shares,
     new/exited positions, per-fund breakdown). 45-day reporting lag —
     fundamental signal, not catalyst-timing.
+  - "edgar:<form>:<accession>:para_<N>" — use the EXACT anchor string
+    printed in brackets above each FILING_EXCERPTS paragraph when you
+    cite specifics drawn from that paragraph. These anchors are
+    persisted into the trace; Defender uses them to resolve user
+    pushback against the actual filing text.
   - "world_state" for regime-derived inferences
   - "dossier:state" / "dossier:ledger:<chain_id>" when citing prior
     dossier content (the dossier IS authoritative for what the system

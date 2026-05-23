@@ -69,7 +69,7 @@ def _fake_probe_response(
         "new_open_questions": new_qs or [],
     }
 
-    async def fake(client, ws, td, h, dc, q, insider_activity=None, institutional_ownership=None):
+    async def fake(client, ws, td, h, dc, q, insider_activity=None, institutional_ownership=None, filing_excerpts=None):
         return parsed, None
 
     return fake

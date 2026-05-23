@@ -53,8 +53,8 @@ context-budget a contract, not a per-source vigilance task.
 
 ## 1. EDGAR client foundation + full-text filings (10-K / 10-Q / 8-K)
 
-Status: **PARTIAL** — adapter foundation shipped 2026-05-22 in
-`research_assistant/edgar.py` + `tests/test_edgar.py` (24 tests).
+Status: **CLOSED** — adapter + `/probe --filing` + Defender corpus
+integration all shipped (2026-05-22 / 2026-05-23).
 
 Shipped:
 - `EdgarClient` async HTTP client, 5 req/sec sliding-window throttle,
@@ -73,17 +73,31 @@ Shipped:
   hits for Defender (#2) anchor-corpus injection.
 - CLI smoke: `python -m research_assistant.edgar <TICKER> <FORM>`.
 
-Remaining for full closure:
-- `/probe` wiring — when a probe question references filings, fetch
-  via `EdgarClient` and inject into the probe prompt's
-  `dossier_context` slot (out of scope of this commit per scope
-  decision; sequenced with #2).
-- Defender anchor-corpus injection — pushback citations like *"per
-  the 10-K page 47"* should resolve against `FilingText.search`
-  hits. Lands with #2 (bare-citation suppression floor).
+Closure pieces (2026-05-23):
+- `research_assistant/edgar/excerpts.py` — `FilingExcerpts` dataclass
+  + `extract_keywords` (drops stopwords + short tokens) +
+  `load_filing_excerpts(ticker, form, question, *, max_paragraphs=10)`.
+  Greps the latest filing of `form` for paragraphs matching ANY
+  content keyword from the question; returns anchored excerpts.
+- CLI `/probe --filing <FORM>` flag opts the operator into the
+  fetch; `probe_ticker` / `_stage_2_probe` accept the new
+  `filing_excerpts` kwarg and render via
+  `_format_filing_excerpts_block` into the new
+  `{filing_excerpts_block}` slot in `probe.txt`. Source-rule list
+  extended with `edgar:<form>:<accession>:para_<N>`.
+- Orchestrator post-processes Stage 2 output: for any
+  `evidence_anchor` whose `source` matches the paragraph anchor
+  regex, splice the corresponding paragraph text into the dict as
+  `para_text`. Enriched anchors persist to the trace JSONL.
+- Defender's existing `_flatten_anchors_to_corpus` picks up
+  `para_text` automatically — zero Defender code changes. End-to-end
+  test covers the spec's *"per the 10-K page 47"* path: pushback
+  citing a number that IS in para_text does NOT fire Defender;
+  invented numbers still do.
 
-Gate (when fully wired): **`/probe` only** for full filing text.
-Stage 2 never sees raw 10-K text.
+Gate: **`/probe` only** for full filing text. Stage 2 never sees raw
+10-K text (the cascade Stage 2 prompt has no `filing_excerpts_block`
+slot — only `/probe` does).
 
 Surfaced incidents:
 - 2026-05-19 RIG / NVDA brief session — Stage 3 Skeptic flagged
