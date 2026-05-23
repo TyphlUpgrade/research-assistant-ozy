@@ -348,6 +348,23 @@ def _xml_float_or_none(parent: Optional[ET.Element], path: str) -> Optional[floa
 # in the old EdgarClient.fetch_form4 was a symptom of that inversion.)
 # ---------------------------------------------------------------------------
 
+def _ownership_url(filing: Filing) -> str:
+    """The canonical ownership.xml URL for a Form 4 filing.
+
+    Why: EDGAR's submissions feed returns `primary_document` with an XSLT
+    display prefix (e.g. `xslF345X06/ownership.xml`), which serves the
+    HTML-rendered view — `<html><head><style>...</style></head><body>` that
+    ET.fromstring cannot parse. Modern Form 4 filings standardize on
+    `ownership.xml` as the primary XML; we construct that URL directly.
+    Mirrors form13f._infotable_url."""
+    accession_no_dashes = filing.accession_number.replace("-", "")
+    cik_no_zeros = filing.cik.lstrip("0") or "0"
+    return (
+        f"https://www.sec.gov/Archives/edgar/data/{cik_no_zeros}/"
+        f"{accession_no_dashes}/ownership.xml"
+    )
+
+
 async def fetch_form4(client: EdgarClient, filing: Filing) -> Form4Filing:
     """Fetch + parse one Form 4 filing.
 
@@ -357,7 +374,7 @@ async def fetch_form4(client: EdgarClient, filing: Filing) -> Form4Filing:
         raise ValueError(
             f"fetch_form4 requires form_type='4', got {filing.form_type!r}"
         )
-    response = await client.get(filing.archive_url)
+    response = await client.get(_ownership_url(filing))
     return parse_form4(
         response.text,
         accession_number=filing.accession_number,
