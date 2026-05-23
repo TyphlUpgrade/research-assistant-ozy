@@ -43,6 +43,7 @@ from research_assistant.edgar import (
 # rather than re-exported from the package — keeps the public surface
 # honest about what's public.
 from research_assistant.edgar.client import _extract_paragraphs, _RateLimiter
+from research_assistant.edgar.form4 import _ownership_url
 from research_assistant.edgar.form4 import _fmt_dollars, _relationship_label
 
 
@@ -692,11 +693,48 @@ async def test_fetch_form4_parses_xml() -> None:
         cik="0001045810",
         primary_document="wf-form4_xxx.xml",
     )
-    handler = _make_handler({filing.archive_url: (200, _FORM4_NVDA_CEO_SALE)})
+    # fetch_form4 builds the deterministic ownership.xml URL (ignores
+    # primary_document — see test_fetch_form4_bypasses_xslt_display_url).
+    ownership_url = (
+        "https://www.sec.gov/Archives/edgar/data/1045810/"
+        "000104581026000045/ownership.xml"
+    )
+    handler = _make_handler({ownership_url: (200, _FORM4_NVDA_CEO_SALE)})
     async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
         f = await fetch_form4(client, filing)
     assert f.issuer_ticker == "NVDA"
     assert f.primary_owner.officer_title == "President & CEO"
+
+
+@pytest.mark.asyncio
+async def test_fetch_form4_bypasses_xslt_display_url() -> None:
+    """EDGAR returns primary_document='xslF345X06/ownership.xml' (the XSLT
+    HTML-rendered view, which ET cannot parse). fetch_form4 must hit the
+    plain '.../ownership.xml' URL instead."""
+    filing = Filing(
+        accession_number="0001045810-26-000045",
+        form_type="4",
+        filing_date="2026-05-19",
+        cik="0001045810",
+        primary_document="xslF345X06/ownership.xml",
+    )
+    plain_url = (
+        "https://www.sec.gov/Archives/edgar/data/1045810/"
+        "000104581026000045/ownership.xml"
+    )
+    xslt_url = (
+        "https://www.sec.gov/Archives/edgar/data/1045810/"
+        "000104581026000045/xslF345X06/ownership.xml"
+    )
+    # Plain XML at the canonical URL; HTML garbage at the XSLT URL. If the
+    # fetcher hits the XSLT URL it gets unparseable HTML and raises.
+    handler = _make_handler({
+        plain_url: (200, _FORM4_NVDA_CEO_SALE),
+        xslt_url: (200, "<html><head><style>x</style></head><body></body></html>"),
+    })
+    async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+        f = await fetch_form4(client, filing)
+    assert f.issuer_ticker == "NVDA"
 
 
 @pytest.mark.asyncio
@@ -945,8 +983,8 @@ async def test_load_insider_activity_aggregates_filings() -> None:
     routes = _form4_routes(
         submissions=submissions,
         xml_bodies={
-            f_ceo.archive_url: _FORM4_NVDA_CEO_SALE,
-            f_cfo.archive_url: _FORM4_NVDA_CFO_BUY_AND_GRANT,
+            _ownership_url(f_ceo): _FORM4_NVDA_CEO_SALE,
+            _ownership_url(f_cfo): _FORM4_NVDA_CFO_BUY_AND_GRANT,
         },
     )
     handler = _make_handler(routes)
@@ -1095,8 +1133,8 @@ async def test_load_insider_activity_skips_parse_failures() -> None:
     routes = _form4_routes(
         submissions=submissions,
         xml_bodies={
-            good.archive_url: _FORM4_NVDA_CEO_SALE,
-            bad.archive_url: "not valid xml <>",
+            _ownership_url(good): _FORM4_NVDA_CEO_SALE,
+            _ownership_url(bad): "not valid xml <>",
         },
     )
     handler = _make_handler(routes)
