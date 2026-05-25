@@ -37,8 +37,13 @@ import logging
 import os
 import re
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from research_assistant.brief import Brief
+    from research_assistant.edgar import InsiderActivitySummary
 
 
 def _setup_logging(quiet: bool) -> None:
@@ -400,54 +405,125 @@ def _render_probe_result(result) -> str:
 # brief
 # ---------------------------------------------------------------------------
 
-async def _cmd_brief(args: argparse.Namespace) -> int:
-    if _require_api_key(args.quiet) is None:
-        return 3
+@dataclass
+class _PipelineInputs:
+    """Internal: data threaded into the screener pipeline + (PR 2A.1+) the
+    deterministic Stage 1 composite.
 
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-
-    from ozymandias.data.adapters.yfinance_adapter import YFinanceAdapter
-    from research_assistant.brief import (
-        Brief,
-        BriefItem,
-        build_brief,
-        load_watchlist,
-        render_brief_drill_down,
-        render_brief_top_level,
-        write_brief_cache,
-        _deserialize_setup,
+    Built fresh on every /brief invocation per Option α (plan §1F) so
+    downstream screeners always see current data — even on cache-hit. The
+    `insider_activities`, `earnings_calendar`, and `sector_breadth` fields
+    are carried for forward compatibility (PR 2A.1 / PR 2.1 wire them in);
+    today's screeners read only `world_state`, `universe`, and `ticker_data`.
+    """
+    world_state: dict
+    universe: list[str]
+    ticker_data: dict[str, dict]
+    insider_activities: dict[str, Optional["InsiderActivitySummary"]] = field(
+        default_factory=dict
     )
+    headlines_per_ticker: dict[str, list[dict]] = field(default_factory=dict)
+    earnings_calendar: Optional[dict] = None
+    sector_breadth: Optional[dict] = None
+
+
+async def _pipeline_inputs_for_universe(
+    universe: list[str],
+    news_seed: list[str],
+    base_world_state: Optional[dict] = None,
+    *,
+    fetch_insider: bool = False,
+) -> _PipelineInputs:
+    """Build pipeline inputs (world_state + ticker_data [+ insider]) for the
+    given universe. The compute_sector_performance OR-fallback for
+    `world_state["sector_performance"]` is centralized HERE so callers don't
+    need to know about it.
+
+    When `base_world_state` is supplied (cache-hit path), the LLM-derived
+    world_state is preserved and only `sector_performance` is overwritten with
+    the raw per-ETF returns the screeners actually need.
+    """
+    from ozymandias.data.adapters.yfinance_adapter import YFinanceAdapter
     from research_assistant.data_loader import (
         build_world_state_input,
         load_watchlist_data,
     )
-    from research_assistant.edgar import load_insider_activities_batch
-    from research_assistant.screeners import (
-        compute_sector_performance,
-        run_screeners_and_journal,
+    from research_assistant.edgar import (
+        EdgarClient,
+        load_insider_activities_batch,
+    )
+    from research_assistant.screeners import compute_sector_performance
+
+    adapter = YFinanceAdapter()
+
+    insider_activities: dict[str, Optional["InsiderActivitySummary"]] = {}
+    if fetch_insider:
+        # Shared EdgarClient so the CIK ticker index is fetched once for the
+        # whole batch (5 req/sec budget).
+        async with EdgarClient() as edgar:
+            (
+                (ticker_data, headlines_per_ticker),
+                insider_activities,
+                world_state_input,
+            ) = await asyncio.gather(
+                load_watchlist_data(universe, adapter),
+                load_insider_activities_batch(universe, client=edgar),
+                build_world_state_input(adapter, watchlist_news_for=news_seed),
+            )
+    else:
+        world_state_input, (ticker_data, headlines_per_ticker) = await asyncio.gather(
+            build_world_state_input(adapter, watchlist_news_for=news_seed),
+            load_watchlist_data(universe, adapter),
+        )
+
+    world_state = dict(base_world_state) if base_world_state else dict(world_state_input)
+    world_state["sector_performance"] = (
+        world_state_input.get("sector_performance")
+        or compute_sector_performance(ticker_data)
+    )
+
+    return _PipelineInputs(
+        world_state=world_state,
+        universe=list(universe),
+        ticker_data=ticker_data,
+        insider_activities=insider_activities,
+        headlines_per_ticker=headlines_per_ticker,
+    )
+
+
+async def _load_or_build_brief(
+    args: argparse.Namespace,
+    base: Path,
+    cache_path: Path,
+) -> tuple["Brief", _PipelineInputs, str]:
+    """Returns (brief, pipeline_inputs, cache_branch).
+
+    `cache_branch` is 'hit' or 'miss' for downstream observability. Both
+    branches return fresh `_PipelineInputs` per Option α — only `build_brief()`
+    is skipped on cache-hit. When `--skip-screeners` is set on cache-hit the
+    loader re-fetch is short-circuited (preserves the ~5s fast-path cost);
+    callers must check `args.skip_screeners` before relying on populated
+    pipeline_inputs in that branch.
+
+    Returns RuntimeError-shaped exits via the caller path (empty-universe
+    case raises so the caller's exit-1 path stays in `_cmd_brief`).
+    """
+    from research_assistant.brief import (
+        Brief,
+        BriefItem,
+        _deserialize_setup,
+        build_brief,
+        load_watchlist,
     )
     from research_assistant.universe import discover_universe
 
-    base = _resolve_base(args.base)
-    today_et = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
-    cache_path = base / "briefs" / f"{today_et}.json"
-
-    brief: Brief
-    # Variables threaded into the screener pipeline. On the cache-miss branch
-    # these are populated by the build-brief path. On the cache-hit branch
-    # they are re-loaded after the cached brief is deserialized (Option α
-    # per plan §1F — guaranteed-fresh data on every /brief invocation).
-    pipeline_universe: list[str] = []
-    pipeline_world_state: dict = {}
-    pipeline_ticker_data: dict[str, dict] = {}
-    cache_branch: str
-
     if cache_path.exists() and not args.refresh:
-        cache_branch = "hit"
         if not args.quiet:
-            print(f"Using cached brief for {today_et} (ET). "
-                  f"Pass --refresh to rebuild.", file=sys.stderr)
+            print(
+                f"Using cached brief for {cache_path.stem} (ET). "
+                "Pass --refresh to rebuild.",
+                file=sys.stderr,
+            )
         raw = json.loads(cache_path.read_text())
         brief = Brief(
             date_et=raw["date_et"],
@@ -463,114 +539,149 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
             setups=[_deserialize_setup(s) for s in raw.get("setups", []) or []],
         )
 
-        # Option α: re-load ticker_data + world_state on cache-hit so the
-        # screener pipeline always sees fresh data. ~5s budget at 30 tickers.
-        if not args.skip_screeners:
-            adapter = YFinanceAdapter()
-            pipeline_universe = brief.discovered_universe or []
-            if pipeline_universe:
-                if not args.quiet:
-                    print(
-                        f"Re-loading ticker data for {len(pipeline_universe)} "
-                        "tickers for screener pipeline (cache-hit path)…",
-                        file=sys.stderr,
-                    )
-                news_seed = pipeline_universe[:5]
-                world_state_input, (tickers_with_data, _hl) = await asyncio.gather(
-                    build_world_state_input(adapter, watchlist_news_for=news_seed),
-                    load_watchlist_data(pipeline_universe, adapter),
-                )
-                pipeline_ticker_data = tickers_with_data
-                # Merge raw sector_performance from the world-state input
-                # (which has the per-ETF return snapshots) into the brief's
-                # world_state dict so screeners that read
-                # `world_state["sector_performance"]` get the raw returns,
-                # not the LLM-derived bias/strength tags.
-                pipeline_world_state = dict(brief.world_state)
-                pipeline_world_state["sector_performance"] = (
-                    world_state_input.get("sector_performance")
-                    or compute_sector_performance(pipeline_ticker_data)
-                )
-    else:
-        cache_branch = "miss"
-        adapter = YFinanceAdapter()
-        pins = load_watchlist(base)
-
-        # Universe resolution. To keep `--refresh` deterministic within the
-        # ET day, reuse the prior cache's `discovered_universe` snapshot when
-        # one is available. `--rediscover` and `--static-only` force fresh
-        # resolution (overriding any snapshot).
-        prior_snapshot: list[str] = []
-        if not args.rediscover and not args.static_only:
-            prior_snapshot = _load_prior_universe_snapshot(cache_path)
-
-        if args.static_only:
-            universe = pins
-            source_label = "static watchlist"
-        elif prior_snapshot:
-            universe = prior_snapshot
-            source_label = "snapshot reused from prior cache"
+        # Option α re-fetch is suppressed when --skip-screeners is set:
+        # the pipeline won't run, so there's no consumer for the data and
+        # we keep the fast-path cheap.
+        universe = brief.discovered_universe or []
+        if args.skip_screeners or not universe:
+            inputs = _PipelineInputs(
+                world_state=dict(brief.world_state),
+                universe=universe,
+                ticker_data={},
+            )
         else:
-            universe = await discover_universe(pins=pins, cap=30)
-            pins_set = {p.upper() for p in pins}
-            pinned_in_universe = sum(1 for t in universe if t in pins_set)
-            discovered_count = len(universe) - pinned_in_universe
-            source_label = f"{pinned_in_universe} pinned + {discovered_count} discovered"
-        if not universe:
-            print(
-                f"ERROR: universe is empty. Add tickers to {base}/watchlist.txt "
-                "one-per-line, or drop --static-only so Yahoo screeners can fill in.",
-                file=sys.stderr,
+            if not args.quiet:
+                print(
+                    f"Re-loading ticker data for {len(universe)} "
+                    "tickers for screener pipeline (cache-hit path)…",
+                    file=sys.stderr,
+                )
+            inputs = await _pipeline_inputs_for_universe(
+                universe,
+                news_seed=universe[:5],
+                base_world_state=brief.world_state,
             )
-            return 1
-        if not args.quiet:
-            print(f"Building brief over {len(universe)} tickers ({source_label})…",
-                  file=sys.stderr)
+        return brief, inputs, "hit"
 
-        # Market context for Stage 0 input — keep headlines anchored to pinned
-        # names (or the first 5 universe entries when no pins exist) to bound
-        # the Stage 0 news cost.
-        news_seed = pins[:5] if pins else universe[:5]
-        market_context = await build_world_state_input(
-            adapter, watchlist_news_for=news_seed,
-        )
-        if not args.quiet:
-            print(
-                f"Fetching Form 4 insider activity for {len(universe)} tickers "
-                f"(~{len(universe) // 5 + 1}s at 5 req/sec)…",
-                file=sys.stderr,
-            )
-        # Shared EdgarClient across the whole batch so the CIK ticker
-        # index is fetched once for all 30 tickers.
-        from research_assistant.edgar import EdgarClient
-        async with EdgarClient() as edgar:
-            (tickers_with_data, headlines_per_ticker), insider_activities = await asyncio.gather(
-                load_watchlist_data(universe, adapter),
-                load_insider_activities_batch(universe, client=edgar),
-            )
-        brief = await build_brief(
-            market_context=market_context,
-            universe=universe,
-            watchlist_tickers_with_data=tickers_with_data,
-            headlines_per_ticker=headlines_per_ticker,
-            insider_activities=insider_activities,
-            research_base=base,
-        )
+    # Cache-miss path.
+    pins = load_watchlist(base)
 
-        # Pipeline inputs for cache-miss. Merge raw sector_performance from
-        # the build_world_state_input output into the (LLM-derived) brief
-        # world_state so screeners see per-ETF returns.
-        pipeline_universe = universe
-        pipeline_ticker_data = tickers_with_data
-        pipeline_world_state = dict(brief.world_state)
-        pipeline_world_state["sector_performance"] = (
-            market_context.get("sector_performance")
-            or compute_sector_performance(pipeline_ticker_data)
+    # Universe resolution. To keep `--refresh` deterministic within the
+    # ET day, reuse the prior cache's `discovered_universe` snapshot when
+    # one is available. `--rediscover` and `--static-only` force fresh
+    # resolution (overriding any snapshot).
+    prior_snapshot: list[str] = []
+    if not args.rediscover and not args.static_only:
+        prior_snapshot = _load_prior_universe_snapshot(cache_path)
+
+    if args.static_only:
+        universe = pins
+        source_label = "static watchlist"
+    elif prior_snapshot:
+        universe = prior_snapshot
+        source_label = "snapshot reused from prior cache"
+    else:
+        universe = await discover_universe(pins=pins, cap=30)
+        pins_set = {p.upper() for p in pins}
+        pinned_in_universe = sum(1 for t in universe if t in pins_set)
+        discovered_count = len(universe) - pinned_in_universe
+        source_label = f"{pinned_in_universe} pinned + {discovered_count} discovered"
+    if not universe:
+        raise _EmptyUniverseError(base)
+
+    if not args.quiet:
+        print(
+            f"Building brief over {len(universe)} tickers ({source_label})…",
+            file=sys.stderr,
+        )
+        print(
+            f"Fetching Form 4 insider activity for {len(universe)} tickers "
+            f"(~{len(universe) // 5 + 1}s at 5 req/sec)…",
+            file=sys.stderr,
         )
 
-    # PR 1.3 — iter-1 CRITICAL #1 fix: BOTH branches invoke the screener
-    # pipeline. The --skip-screeners flag is the operator escape hatch for
-    # the cache-hit fast path (skips the ~5s loader re-fetch above too).
+    # Load market context + per-ticker data + insider activity. The same
+    # `news_seed` rule as before: pin-anchored when pins exist, else top of
+    # universe.
+    news_seed = pins[:5] if pins else universe[:5]
+    inputs = await _pipeline_inputs_for_universe(
+        universe,
+        news_seed=news_seed,
+        fetch_insider=True,
+    )
+
+    # build_brief expects the raw world_state_input (with sector_performance
+    # already populated) as its market_context. _pipeline_inputs_for_universe
+    # has produced exactly that shape in `inputs.world_state`.
+    brief = await build_brief(
+        market_context=inputs.world_state,
+        universe=universe,
+        watchlist_tickers_with_data=inputs.ticker_data,
+        headlines_per_ticker=inputs.headlines_per_ticker,
+        insider_activities=inputs.insider_activities,
+        research_base=base,
+    )
+
+    # build_brief replaces world_state with the LLM-derived view. Merge the
+    # raw sector_performance back in for screener consumption (same OR-fallback
+    # contract as `_pipeline_inputs_for_universe` enforces on cache-hit).
+    pipeline_world_state = dict(brief.world_state)
+    pipeline_world_state["sector_performance"] = inputs.world_state.get(
+        "sector_performance"
+    )
+    inputs = _PipelineInputs(
+        world_state=pipeline_world_state,
+        universe=inputs.universe,
+        ticker_data=inputs.ticker_data,
+        insider_activities=inputs.insider_activities,
+        headlines_per_ticker=inputs.headlines_per_ticker,
+        earnings_calendar=inputs.earnings_calendar,
+        sector_breadth=inputs.sector_breadth,
+    )
+    return brief, inputs, "miss"
+
+
+class _EmptyUniverseError(RuntimeError):
+    """Signals an empty universe so `_cmd_brief` can render the canonical
+    error message + return exit 1. Carries the base path for that message."""
+    def __init__(self, base: Path) -> None:
+        super().__init__(f"empty universe under {base}")
+        self.base = base
+
+
+async def _cmd_brief(args: argparse.Namespace) -> int:
+    if _require_api_key(args.quiet) is None:
+        return 3
+
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from research_assistant.brief import (
+        render_brief_drill_down,
+        render_brief_top_level,
+        write_brief_cache,
+    )
+    from research_assistant.screeners import run_screeners_and_journal
+
+    base = _resolve_base(args.base)
+    today_et = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    cache_path = base / "briefs" / f"{today_et}.json"
+
+    try:
+        brief, inputs, cache_branch = await _load_or_build_brief(
+            args, base, cache_path,
+        )
+    except _EmptyUniverseError as exc:
+        print(
+            f"ERROR: universe is empty. Add tickers to {exc.base}/watchlist.txt "
+            "one-per-line, or drop --static-only so Yahoo screeners can fill in.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # PR 1.3 iter-1 CRITICAL #1 fix: BOTH cache branches invoke the screener
+    # pipeline. `--skip-screeners` is the operator escape hatch (and the only
+    # path where pipeline_inputs may carry empty ticker_data on cache-hit).
     if args.skip_screeners:
         print(
             "[skip-screeners] Setup-finder skipped per --skip-screeners flag; "
@@ -579,9 +690,9 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
         )
     else:
         setups = await run_screeners_and_journal(
-            world_state=pipeline_world_state,
-            universe=pipeline_universe,
-            ticker_data=pipeline_ticker_data,
+            world_state=inputs.world_state,
+            universe=inputs.universe,
+            ticker_data=inputs.ticker_data,
             research_base=base,
             cache_branch=cache_branch,
         )
@@ -593,11 +704,12 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
         write_brief_cache(brief, base)
 
     if args.ticker:
-        # Drill-down view
         text = render_brief_drill_down(brief, args.ticker)
         if args.json:
-            # JSON of just the drilled item
-            item = next((i for i in brief.items if i.ticker == args.ticker.upper()), None)
+            item = next(
+                (i for i in brief.items if i.ticker == args.ticker.upper()),
+                None,
+            )
             print(json.dumps(
                 dataclasses.asdict(item) if item else {"error": f"no item {args.ticker}"},
                 indent=2, default=str,
@@ -605,7 +717,6 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
         else:
             print(text)
     else:
-        # Top-level view
         if args.json:
             print(json.dumps({
                 "date_et": brief.date_et,
