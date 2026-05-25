@@ -415,12 +415,18 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
         load_watchlist,
         render_brief_drill_down,
         render_brief_top_level,
+        write_brief_cache,
+        _deserialize_setup,
     )
     from research_assistant.data_loader import (
         build_world_state_input,
         load_watchlist_data,
     )
     from research_assistant.edgar import load_insider_activities_batch
+    from research_assistant.screeners import (
+        compute_sector_performance,
+        run_screeners_and_journal,
+    )
     from research_assistant.universe import discover_universe
 
     base = _resolve_base(args.base)
@@ -428,8 +434,17 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
     cache_path = base / "briefs" / f"{today_et}.json"
 
     brief: Brief
+    # Variables threaded into the screener pipeline. On the cache-miss branch
+    # these are populated by the build-brief path. On the cache-hit branch
+    # they are re-loaded after the cached brief is deserialized (Option α
+    # per plan §1F — guaranteed-fresh data on every /brief invocation).
+    pipeline_universe: list[str] = []
+    pipeline_world_state: dict = {}
+    pipeline_ticker_data: dict[str, dict] = {}
+    cache_branch: str
 
     if cache_path.exists() and not args.refresh:
+        cache_branch = "hit"
         if not args.quiet:
             print(f"Using cached brief for {today_et} (ET). "
                   f"Pass --refresh to rebuild.", file=sys.stderr)
@@ -441,8 +456,43 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
             items=[BriefItem(**i) for i in raw["items"]],
             cost_usd=raw.get("cost_usd", 0.0),
             discovered_universe=raw.get("discovered_universe", []),
+            # PR 1.3: backward-compatible default for pre-PR-1.3 caches that
+            # never wrote `setups`. The pipeline will repopulate this list
+            # below; the cached value is only used as a fallback when
+            # --skip-screeners is set.
+            setups=[_deserialize_setup(s) for s in raw.get("setups", []) or []],
         )
+
+        # Option α: re-load ticker_data + world_state on cache-hit so the
+        # screener pipeline always sees fresh data. ~5s budget at 30 tickers.
+        if not args.skip_screeners:
+            adapter = YFinanceAdapter()
+            pipeline_universe = brief.discovered_universe or []
+            if pipeline_universe:
+                if not args.quiet:
+                    print(
+                        f"Re-loading ticker data for {len(pipeline_universe)} "
+                        "tickers for screener pipeline (cache-hit path)…",
+                        file=sys.stderr,
+                    )
+                news_seed = pipeline_universe[:5]
+                world_state_input, (tickers_with_data, _hl) = await asyncio.gather(
+                    build_world_state_input(adapter, watchlist_news_for=news_seed),
+                    load_watchlist_data(pipeline_universe, adapter),
+                )
+                pipeline_ticker_data = tickers_with_data
+                # Merge raw sector_performance from the world-state input
+                # (which has the per-ETF return snapshots) into the brief's
+                # world_state dict so screeners that read
+                # `world_state["sector_performance"]` get the raw returns,
+                # not the LLM-derived bias/strength tags.
+                pipeline_world_state = dict(brief.world_state)
+                pipeline_world_state["sector_performance"] = (
+                    world_state_input.get("sector_performance")
+                    or compute_sector_performance(pipeline_ticker_data)
+                )
     else:
+        cache_branch = "miss"
         adapter = YFinanceAdapter()
         pins = load_watchlist(base)
 
@@ -506,6 +556,41 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
             insider_activities=insider_activities,
             research_base=base,
         )
+
+        # Pipeline inputs for cache-miss. Merge raw sector_performance from
+        # the build_world_state_input output into the (LLM-derived) brief
+        # world_state so screeners see per-ETF returns.
+        pipeline_universe = universe
+        pipeline_ticker_data = tickers_with_data
+        pipeline_world_state = dict(brief.world_state)
+        pipeline_world_state["sector_performance"] = (
+            market_context.get("sector_performance")
+            or compute_sector_performance(pipeline_ticker_data)
+        )
+
+    # PR 1.3 — iter-1 CRITICAL #1 fix: BOTH branches invoke the screener
+    # pipeline. The --skip-screeners flag is the operator escape hatch for
+    # the cache-hit fast path (skips the ~5s loader re-fetch above too).
+    if args.skip_screeners:
+        print(
+            "[skip-screeners] Setup-finder skipped per --skip-screeners flag; "
+            "brief shows last-known setups from cache only.",
+            file=sys.stderr,
+        )
+    else:
+        setups = await run_screeners_and_journal(
+            world_state=pipeline_world_state,
+            universe=pipeline_universe,
+            ticker_data=pipeline_ticker_data,
+            research_base=base,
+            cache_branch=cache_branch,
+        )
+        brief.setups = list(setups)
+        # Re-write the cache so the on-disk brief reflects the freshly
+        # computed setups (both branches: cache-miss overwrites the
+        # build_brief-written file; cache-hit overwrites the prior day's
+        # cache with today's setups).
+        write_brief_cache(brief, base)
 
     if args.ticker:
         # Drill-down view
@@ -668,6 +753,143 @@ def _cmd_dossier(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# alerts review (PR 1.3)
+# ---------------------------------------------------------------------------
+
+_WINDOW_RE = re.compile(r"^(\d+)d$")
+
+
+def _parse_window_days(window: str) -> int:
+    """Parse `Nd` → N. Raises ValueError on malformed input."""
+    m = _WINDOW_RE.match(window.strip())
+    if not m:
+        raise ValueError(
+            f"Invalid --window: {window!r}. Expected format like '7d', '30d', '90d'."
+        )
+    return int(m.group(1))
+
+
+def _statistics_median(values: list[float]) -> float:
+    """Plain median over a non-empty list. Inline rather than `statistics`
+    import for one call-site."""
+    s = sorted(values)
+    n = len(s)
+    if n % 2:
+        return s[n // 2]
+    return (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+
+def _render_alerts_review(
+    alerts: list[dict],
+    *,
+    screener_filter: Optional[str] = None,
+) -> str:
+    """Per-screener tally rendering for `alerts review`. Reports count,
+    hit-rate (% with return_30d > 0), median return_30d. Top/bottom-3 winners
+    deferred to PR 3.1 — minimum-viable here per plan §1.3."""
+    if screener_filter:
+        alerts = [a for a in alerts if a.get("screener") == screener_filter]
+    if not alerts:
+        return "(no alerts in window)"
+
+    by_screener: dict[str, list[dict]] = {}
+    for a in alerts:
+        by_screener.setdefault(a.get("screener", "?"), []).append(a)
+
+    lines: list[str] = []
+    for name in sorted(by_screener):
+        rows = by_screener[name]
+        count = len(rows)
+        returns_30d = [
+            r["return_30d"] for r in rows
+            if isinstance(r.get("return_30d"), (int, float))
+        ]
+        if returns_30d:
+            hit_rate = sum(1 for r in returns_30d if r > 0) / len(returns_30d)
+            median = _statistics_median(returns_30d)
+            lines.append(
+                f"- **{name}** — count={count}  "
+                f"hit_rate_30d={hit_rate:.0%}  "
+                f"median_30d={median:+.2%}  "
+                f"(enriched={len(returns_30d)}/{count})"
+            )
+        else:
+            lines.append(
+                f"- **{name}** — count={count}  "
+                f"(no enriched horizon returns yet)"
+            )
+    return "\n".join(lines)
+
+
+def _export_alerts_csv(alerts: list[dict], path: Path) -> None:
+    """Flat CSV: one row per alert. Stable column order so operator
+    spreadsheets stay readable across runs."""
+    import csv
+    fieldnames = [
+        "asof", "ticker", "screener", "entry_price",
+        "return_7d", "return_30d", "return_90d",
+        "enriched_at", "created_at",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in alerts:
+            writer.writerow({k: row.get(k) for k in fieldnames})
+
+
+async def _cmd_alerts(args: argparse.Namespace) -> int:
+    """Dispatcher for `alerts <subcommand>`. Currently only `review`."""
+    from datetime import date, timedelta
+
+    from ozymandias.data.adapters.yfinance_adapter import YFinanceAdapter
+    from research_assistant.journal import enrich_window, read_alerts_window
+
+    if args.alerts_cmd != "review":
+        print(f"Unknown alerts subcommand: {args.alerts_cmd}", file=sys.stderr)
+        return 2
+
+    try:
+        days = _parse_window_days(args.window)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    base = _resolve_base(args.base)
+    end_date = date.today()
+    start_date = end_date - timedelta(days=days)
+    alerts = read_alerts_window(base, start_date.isoformat(), end_date.isoformat())
+
+    # Lazy-enrich horizons (plan §B1). Adapter exposes async fetch_price_at.
+    if alerts:
+        adapter = YFinanceAdapter()
+        adapter.research_base = base
+        try:
+            await enrich_window(alerts, adapter)
+        except Exception as exc:
+            # Enrichment failures are non-fatal — render what we have.
+            logging.warning("alerts review enrichment failed: %s", exc)
+        # Re-read so LWW-enrichment rows are folded back in
+        alerts = read_alerts_window(base, start_date.isoformat(), end_date.isoformat())
+
+    if args.export_csv:
+        _export_alerts_csv(alerts, Path(args.export_csv))
+        print(f"Wrote {len(alerts)} rows to {args.export_csv}", file=sys.stderr)
+
+    if args.json:
+        print(json.dumps(alerts, indent=2, default=str))
+    else:
+        header = (
+            f"# Alerts review — window {start_date.isoformat()} → "
+            f"{end_date.isoformat()} ({days}d)"
+        )
+        print(header)
+        print()
+        print(_render_alerts_review(alerts, screener_filter=args.screener))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Top-level parser
 # ---------------------------------------------------------------------------
 
@@ -712,6 +934,36 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Re-run Yahoo screener discovery instead of reusing today's cached snapshot",
     )
+    pb.add_argument(
+        "--skip-screeners",
+        action="store_true",
+        help="Skip the setup-finder pipeline on this invocation",
+    )
+
+    # alerts review — setup-finder operator surface (PR 1.3)
+    pa = sub.add_parser(
+        "alerts", help="Operator surface for the setup-finder alert journal",
+    )
+    pa_sub = pa.add_subparsers(dest="alerts_cmd", required=True)
+    pa_review = pa_sub.add_parser(
+        "review",
+        help="Per-screener tally over a window (default 30d) with horizon returns",
+    )
+    pa_review.add_argument(
+        "--window",
+        default="30d",
+        help="Window size in days, e.g. 7d, 30d, 90d (default: 30d)",
+    )
+    pa_review.add_argument(
+        "--screener",
+        default=None,
+        help="Filter to a single screener name (e.g. sector_rotation)",
+    )
+    pa_review.add_argument(
+        "--export-csv",
+        default=None,
+        help="Optional path to write a flat CSV of the windowed alerts",
+    )
 
     pt = sub.add_parser("trace", help="Render a cascade trace by chain_id")
     pt.add_argument("chain_id", help="Chain ID printed at end of a research/brief result")
@@ -748,6 +1000,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "research":       lambda a: asyncio.run(_cmd_research(a)),
         "probe":          lambda a: asyncio.run(_cmd_probe(a)),
         "brief":          lambda a: asyncio.run(_cmd_brief(a)),
+        "alerts":         lambda a: asyncio.run(_cmd_alerts(a)),
         "trace":          _cmd_trace,
         "dossier":        _cmd_dossier,
         "defender-check": _cmd_defender_check,

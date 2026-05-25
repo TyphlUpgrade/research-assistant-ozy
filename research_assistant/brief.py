@@ -36,6 +36,7 @@ from research_assistant.observations import Observation, append_observation, now
 from research_assistant.prompts import chain_id as _chain_id
 from research_assistant.prompts import load_prompt as _load_prompt
 from research_assistant.prompts import render as _render
+from research_assistant.screeners import SetupCandidate, render_setup_line
 from research_assistant.trace_renderer import append_stage_event
 from ozymandias.intelligence.claude_json import parse_claude_response
 
@@ -78,6 +79,10 @@ class Brief:
     # LLM pipeline against the same universe without intra-day Yahoo drift.
     # Pass --rediscover (or --static-only) to override.
     discovered_universe: list[str] = field(default_factory=list)
+    # Setup-finder candidates (PR 1.3). Populated AFTER build_brief by
+    # `_cmd_brief` on BOTH cache branches via `run_screeners_and_journal`.
+    # Default empty so pre-PR-1.3 cached briefs still round-trip cleanly.
+    setups: list[SetupCandidate] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -315,10 +320,53 @@ async def build_brief(
     )
 
     # Cache to .research/briefs/<date-ET>.json — used by SessionStart hook
-    # to detect "brief generated today?"
+    # to detect "brief generated today?". PR 1.3: `setups` may be re-written
+    # by `_cmd_brief` after `run_screeners_and_journal` returns — see
+    # `write_brief_cache` below.
+    write_brief_cache(brief, research_base)
+
+    return brief
+
+
+def _serialize_setup(s: SetupCandidate) -> dict:
+    """Flatten a frozen SetupCandidate to a plain dict for JSON cache."""
+    return {
+        "ticker": s.ticker,
+        "screener": s.screener,
+        "asof": s.asof,
+        "entry_price": s.entry_price,
+        "evidence": dict(s.evidence),
+        "return_7d": s.return_7d,
+        "return_30d": s.return_30d,
+        "return_90d": s.return_90d,
+        "enriched_at": s.enriched_at,
+    }
+
+
+def _deserialize_setup(raw: dict) -> SetupCandidate:
+    """Inverse of `_serialize_setup`. Tolerates missing optional horizon
+    fields so a cache pre-PR-1.3 (which never wrote them) still loads."""
+    return SetupCandidate(
+        ticker=raw["ticker"],
+        screener=raw["screener"],
+        asof=raw["asof"],
+        entry_price=raw["entry_price"],
+        evidence=raw.get("evidence", {}) or {},
+        return_7d=raw.get("return_7d"),
+        return_30d=raw.get("return_30d"),
+        return_90d=raw.get("return_90d"),
+        enriched_at=raw.get("enriched_at"),
+    )
+
+
+def write_brief_cache(brief: Brief, research_base: Path) -> Path:
+    """Write the brief cache JSON. Called by `build_brief` after Stage 2
+    completion AND by `_cmd_brief` after `run_screeners_and_journal` attaches
+    `setups` — re-writing is cheap and keeps the on-disk cache canonical.
+    """
     briefs_dir = research_base / "briefs"
     briefs_dir.mkdir(parents=True, exist_ok=True)
-    cache_path = briefs_dir / f"{date_et}.json"
+    cache_path = briefs_dir / f"{brief.date_et}.json"
     cache_payload = {
         "date_et": brief.date_et,
         "chain_id": brief.chain_id,
@@ -339,10 +387,12 @@ async def build_brief(
         ],
         "cost_usd": brief.cost_usd,
         "discovered_universe": brief.discovered_universe,
+        # PR 1.3: setups field. Pre-PR-1.3 caches lack this key entirely;
+        # the deserializer in cli.py defaults to [] when reading.
+        "setups": [_serialize_setup(s) for s in brief.setups],
     }
     cache_path.write_text(json.dumps(cache_payload, indent=2))
-
-    return brief
+    return cache_path
 
 
 def render_brief_top_level(brief: Brief) -> str:
@@ -372,6 +422,18 @@ def render_brief_top_level(brief: Brief) -> str:
             f"- **VIX:** {macro.get('vix_level', '?')} ({macro.get('vix_trend', '?')})  ·  "
             f"**Active catalysts:** {', '.join(catalysts) if catalysts else 'none'}"
         )
+    lines.append("")
+
+    # PR 1.3: Setup-finder section. Renders ABOVE the opportunity surface so
+    # operator sees screener hits first. Empty list still renders the header
+    # so the absence is explicit (and the smoke test can assert on it).
+    lines.append(f"## Setups ({len(brief.setups)})")
+    if not brief.setups:
+        lines.append("")
+        lines.append("(no setups detected today)")
+    else:
+        for setup in brief.setups:
+            lines.append(render_setup_line(setup))
     lines.append("")
 
     lines.append(f"## Opportunity surface ({len(brief.items)} items)")
