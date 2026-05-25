@@ -369,8 +369,11 @@ async def test_build_brief_threads_insider_summary_into_composite(
         )
 
     # No Stage 2 survivors — keep the test fast and focused.
-    async def fake_stage_2_thesis(client, ws, td, s1, h, insider_activity=None,
-                                  institutional_ownership=None):
+    # PR 2A.2: brief.build_brief now calls `_stage_2_note` (not
+    # `_stage_2_thesis`). The fake matches the new keyword-arg signature.
+    async def fake_stage_2_note(client, ws, td, h, *, insider_activity=None,
+                                institutional_ownership=None,
+                                screener_evidence=None, default_ticker=None):
         return None, None
 
     nvda_summary = _summary(
@@ -395,7 +398,7 @@ async def test_build_brief_threads_insider_summary_into_composite(
 
     with patch("research_assistant.brief._stage_0_world_state", fake_stage_0), \
          patch("research_assistant.brief._stage_1_composite", fake_composite), \
-         patch("research_assistant.orchestrator._stage_2_thesis", fake_stage_2_thesis):
+         patch("research_assistant.orchestrator._stage_2_note", fake_stage_2_note):
         brief = await build_brief(
             market_context={},
             universe=["NVDA", "AAPL", "TSLA"],
@@ -429,12 +432,14 @@ async def test_build_brief_default_insider_activities_unavailable(
     async def fake_stage_0(client, ctx):
         return {"regime": "bull-trending"}
 
-    async def fake_stage_2_thesis(client, ws, td, s1, h, insider_activity=None,
-                                  institutional_ownership=None):
+    # PR 2A.2: brief.build_brief now calls `_stage_2_note`.
+    async def fake_stage_2_note(client, ws, td, h, *, insider_activity=None,
+                                institutional_ownership=None,
+                                screener_evidence=None, default_ticker=None):
         return None, None
 
     with patch("research_assistant.brief._stage_0_world_state", fake_stage_0), \
-         patch("research_assistant.orchestrator._stage_2_thesis", fake_stage_2_thesis):
+         patch("research_assistant.orchestrator._stage_2_note", fake_stage_2_note):
         brief = await build_brief(
             market_context={},
             universe=["NVDA"],

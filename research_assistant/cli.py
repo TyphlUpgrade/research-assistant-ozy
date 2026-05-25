@@ -508,21 +508,51 @@ def _attach_screener_evidence(items: list, screener_alerts: list) -> None:
 
 
 def _brief_item_from_cache(raw: dict) -> "BriefItem":
-    """Construct a BriefItem from a cached dict, tolerating pre-PR-2A.1
-    payloads that lack `screener_evidence`. Per plan §PR 2A.1 acceptance
-    criterion 7 — graceful degrade to empty screener_evidence on legacy
-    caches; do not crash."""
+    """Construct a BriefItem from a cached dict.
+
+    Backward compat layers:
+      - Pre-PR-2A.1 payloads lack `screener_evidence` → empty list.
+      - Pre-PR-2A.2 payloads carry the old prose-thesis fields
+        (`thesis_text`/`key_drivers`/`risks`/`open_questions`/
+        `evidence_anchors`) and have no `stage_2_note` key. We construct
+        the BriefItem without a Stage2Note (stays None) — the drill-down
+        render then shows "Stage 2 note unavailable" rather than crashing.
+        The legacy thesis fields are silently dropped (operator's brief
+        cache pre-2A.2 is one ET-day old; refresh re-runs Stage 2 against
+        the new schema).
+    """
     from research_assistant.brief import BriefItem
+    from research_assistant.orchestrator import Stage2Note, compute_composite_conviction
+
+    raw_note = raw.get("stage_2_note")
+    stage_2_note: Optional["Stage2Note"] = None
+    if isinstance(raw_note, dict):
+        try:
+            conviction = {
+                k: float(v) for k, v in (raw_note.get("conviction") or {}).items()
+            }
+            composite = raw_note.get("composite_conviction")
+            if composite is None:
+                composite = compute_composite_conviction(conviction)
+            stage_2_note = Stage2Note(
+                ticker=str(raw_note.get("ticker", raw["ticker"])).upper(),
+                observation=tuple(raw_note.get("observation") or ()),
+                bull_anchor=str(raw_note.get("bull_anchor", "")),
+                bear_anchor=str(raw_note.get("bear_anchor", "")),
+                what_would_change=tuple(raw_note.get("what_would_change") or ()),
+                conviction=conviction,
+                composite_conviction=float(composite),
+                decision_tag=str(raw_note.get("decision_tag", "WATCH")).upper(),
+            )
+        except (TypeError, ValueError):
+            stage_2_note = None
+
     return BriefItem(
         ticker=raw["ticker"],
         intrinsic_score=raw.get("intrinsic_score", 0.0),
         stage_1_reason=raw.get("stage_1_reason", ""),
-        thesis_text=raw.get("thesis_text"),
+        stage_2_note=stage_2_note,
         conviction_score=raw.get("conviction_score"),
-        key_drivers=list(raw.get("key_drivers") or []),
-        risks=list(raw.get("risks") or []),
-        open_questions=list(raw.get("open_questions") or []),
-        evidence_anchors=list(raw.get("evidence_anchors") or []),
         chain_id=raw.get("chain_id"),
         screener_evidence=list(raw.get("screener_evidence") or []),
     )

@@ -43,6 +43,11 @@ from research_assistant.screeners import SetupCandidate
 from research_assistant.trace_renderer import append_stage_event
 from ozymandias.intelligence.claude_json import parse_claude_response
 
+from research_assistant.orchestrator import (
+    STAGE2_CONVICTION_DIMENSIONS,
+    Stage2Note,
+)
+
 log = logging.getLogger(__name__)
 
 
@@ -57,16 +62,22 @@ SURVIVORS_PER_BRIEF = (4, 8)  # min, max
 
 @dataclass
 class BriefItem:
-    """One ticker in the /brief opportunity surface."""
+    """One ticker in the /brief opportunity surface.
+
+    PR 2A.2: Stage 2 now produces a structured `Stage2Note` (replacing the
+    prose-thesis fields `thesis_text`/`key_drivers`/`risks`/`open_questions`/
+    `evidence_anchors`). `conviction_score` is derived from
+    `stage_2_note.composite_conviction` (kept as a top-level field so the
+    render + JSON layers don't need to dig into the nested dict).
+    """
     ticker: str
     intrinsic_score: float                # Stage 1
     stage_1_reason: str
-    thesis_text: Optional[str] = None     # Stage 2
+    stage_2_note: Optional[Stage2Note] = None
+    # Mirrors `stage_2_note.composite_conviction` when set; preserved as a
+    # top-level field so the brief render + ranking layers don't need to
+    # reach into the dataclass. None when Stage 2 didn't run or parse failed.
     conviction_score: Optional[float] = None
-    key_drivers: list[str] = field(default_factory=list)
-    risks: list[str] = field(default_factory=list)
-    open_questions: list[str] = field(default_factory=list)
-    evidence_anchors: list[dict] = field(default_factory=list)
     chain_id: Optional[str] = None
     # PR 2A.1: screener hits that pinned this ticker. Each dict mirrors the
     # SetupCandidate.evidence dict plus a "screener" key so the render layer
@@ -214,39 +225,66 @@ async def _stage_2_for_survivor(
     client: ClaudeClient,
     world_state: dict,
     ticker_data: dict,
-    stage_1_result: dict,
+    ticker: str,
     headlines: list[dict],
     semaphore: asyncio.Semaphore,
     *,
     chain_id: str,
     traces_base: Path,
-) -> Optional[dict]:
-    """Stage 2 thesis for one survivor, semaphore-bounded.
+    insider_activity: Optional[InsiderActivitySummary] = None,
+    screener_evidence: Optional[list[dict]] = None,
+) -> Optional[Stage2Note]:
+    """Stage 2 structured-note for one survivor, semaphore-bounded.
 
-    Emits a `stage_2_thesis` trace event stamped with the survivor's symbol
-    so downstream Defender citation verification can scope the anchor corpus
-    to one survivor (the chain_id is shared across all survivors in a brief).
+    PR 2A.2: Stage 1 result is NOT passed in (data isolation principle —
+    Stage 2 sees raw data only, never the upstream score). The caller's
+    only obligation is to thread `ticker` (for trace event symbol stamp)
+    and the raw `screener_evidence` dicts (framed in the prompt as "these
+    screeners flagged this ticker", not as a ranking justification).
+
+    Emits a `stage_2_note` trace event stamped with the survivor's symbol
+    so downstream filters (Defender, /trace) can scope to one survivor
+    (the chain_id is shared across all survivors in a brief).
     """
     async with semaphore:
-        from research_assistant.orchestrator import _stage_2_thesis
-        stage_2, s2_meta = await _stage_2_thesis(
-            client, world_state, ticker_data, stage_1_result, headlines
+        from research_assistant.orchestrator import _stage_2_note
+        note, s2_meta = await _stage_2_note(
+            client, world_state, ticker_data, headlines,
+            insider_activity=insider_activity,
+            screener_evidence=screener_evidence or [],
+            default_ticker=ticker,
         )
+        # Serialize note → dict for trace persistence so /trace stays
+        # JSONL-compatible. None on parse failure surfaces as `parsed=None`
+        # + an error string so the visibility surface still records the
+        # call happened.
+        parsed_for_trace: Optional[dict] = None
+        if note is not None:
+            parsed_for_trace = {
+                "ticker": note.ticker,
+                "observation": list(note.observation),
+                "bull_anchor": note.bull_anchor,
+                "bear_anchor": note.bear_anchor,
+                "what_would_change": list(note.what_would_change),
+                "conviction": dict(note.conviction),
+                "composite_conviction": note.composite_conviction,
+                "decision_tag": note.decision_tag,
+            }
         append_stage_event(
             chain_id=chain_id,
-            stage_id="stage_2_thesis",
+            stage_id="stage_2_note",
             model=s2_meta.model if s2_meta else "unknown",
             tokens_in=s2_meta.input_tokens if s2_meta else 0,
             tokens_out=s2_meta.output_tokens if s2_meta else 0,
             cost_usd=s2_meta.cost_usd if s2_meta else 0.0,
             latency_ms=s2_meta.latency_ms if s2_meta else 0,
-            parsed=stage_2,
+            parsed=parsed_for_trace,
             raw_response=s2_meta.text if s2_meta else None,
             traces_base=traces_base,
-            error=None if stage_2 else "Stage 2 JSON parse failed",
-            symbol=stage_1_result.get("ticker"),
+            error=None if note else "Stage 2 note parse/schema failed",
+            symbol=ticker,
         )
-        return stage_2
+        return note
 
 
 # ---------------------------------------------------------------------------
@@ -336,12 +374,12 @@ async def build_brief(
         if len(survivors) < SURVIVORS_PER_BRIEF[0] and len(ranked) >= SURVIVORS_PER_BRIEF[0]:
             survivors = ranked[:SURVIVORS_PER_BRIEF[0]]
 
-    # Stage 2 — parallel theses with semaphore cap.
-    # Strip the composite `breakdown` from each survivor before threading
-    # into Stage 2: per the plan's data-isolation principle, Stage 2 must
-    # do original analysis from raw ticker_data, not rationalize an
-    # upstream score. `ticker` + `intrinsic_score` is the minimum Stage 2
-    # downstream code expects.
+    # Stage 2 — parallel notes with semaphore cap.
+    # PR 2A.2: Stage 1 score / breakdown is NOT threaded into Stage 2 —
+    # data isolation principle. `_stage_2_for_survivor` takes the raw
+    # ticker symbol + screener_evidence dicts; the prompt frames the
+    # latter as "screeners flagged this ticker", not as a ranking
+    # justification.
     semaphore = asyncio.Semaphore(_STAGE_2_CONCURRENCY)
     traces_base = research_base / "traces"
     stage_2_tasks = [
@@ -349,20 +387,22 @@ async def build_brief(
             client,
             world_state,
             watchlist_tickers_with_data.get(s["ticker"], {}),
-            {"ticker": s["ticker"], "intrinsic_score": s.get("intrinsic_score", 0.0)},
+            s["ticker"],
             headlines_per_ticker.get(s["ticker"], []),
             semaphore,
             chain_id=chain,
             traces_base=traces_base,
+            insider_activity=insider_activities.get(s["ticker"]),
+            screener_evidence=list(s.get("screener_evidence", [])),
         )
         for s in survivors
     ]
-    stage_2_results = await asyncio.gather(*stage_2_tasks)
+    stage_2_results: list[Optional[Stage2Note]] = await asyncio.gather(*stage_2_tasks)
 
     items: list[BriefItem] = []
     regime = world_state.get("regime") if isinstance(world_state, dict) else None
     obs_ts = now_iso()
-    for survivor, stage_2 in zip(survivors, stage_2_results):
+    for survivor, note in zip(survivors, stage_2_results):
         item = BriefItem(
             ticker=survivor["ticker"],
             intrinsic_score=survivor.get("intrinsic_score", 0.0),
@@ -374,26 +414,29 @@ async def build_brief(
             screener_evidence=list(survivor.get("screener_evidence", [])),
             chain_id=chain,
         )
-        if stage_2 is not None:
-            item.thesis_text = stage_2.get("thesis_text")
-            item.conviction_score = stage_2.get("conviction_score")
-            item.key_drivers = stage_2.get("key_drivers", [])
-            item.risks = stage_2.get("risks", [])
-            item.open_questions = stage_2.get("open_questions", [])
-            item.evidence_anchors = stage_2.get("evidence_anchors", [])
+        if note is not None:
+            item.stage_2_note = note
+            item.conviction_score = note.composite_conviction
+            # PR 2A.2: observation stream now carries the Stage2Note read
+            # in its `thesis` field (one-line synthesis: bull vs bear
+            # anchor + decision tag) so the per-ticker history surface
+            # stays useful. PR 2A.4 will add explicit trajectory persistence.
+            obs_thesis = (
+                f"[{note.decision_tag}] bull: {note.bull_anchor} | "
+                f"bear: {note.bear_anchor}"
+            )
             append_observation(
                 Observation(
                     ts=obs_ts,
                     kind="brief",
                     symbol=item.ticker,
                     chain_id=chain,
-                    thesis=item.thesis_text or "",
+                    thesis=obs_thesis,
                     conviction=item.conviction_score,
                     regime=regime,
-                    drivers=list(item.key_drivers),
-                    risks=list(item.risks),
-                    open_questions=list(item.open_questions),
-                    anchors=list(item.evidence_anchors),
+                    drivers=[note.bull_anchor] if note.bull_anchor else [],
+                    risks=[note.bear_anchor] if note.bear_anchor else [],
+                    open_questions=list(note.what_would_change),
                 ),
                 research_base,
             )
@@ -417,6 +460,22 @@ async def build_brief(
     return brief
 
 
+def _stage_2_note_to_cache_dict(note: Optional[Stage2Note]) -> Optional[dict]:
+    """Serialize a Stage2Note into the cache JSON shape. None passes through."""
+    if note is None:
+        return None
+    return {
+        "ticker": note.ticker,
+        "observation": list(note.observation),
+        "bull_anchor": note.bull_anchor,
+        "bear_anchor": note.bear_anchor,
+        "what_would_change": list(note.what_would_change),
+        "conviction": dict(note.conviction),
+        "composite_conviction": note.composite_conviction,
+        "decision_tag": note.decision_tag,
+    }
+
+
 def write_brief_cache(brief: Brief, research_base: Path) -> Path:
     """Write the brief cache JSON. Called by `build_brief` after Stage 2
     completion AND by `_cmd_brief` after `run_screeners_and_journal` runs —
@@ -434,16 +493,16 @@ def write_brief_cache(brief: Brief, research_base: Path) -> Path:
                 "ticker": i.ticker,
                 "intrinsic_score": i.intrinsic_score,
                 "stage_1_reason": i.stage_1_reason,
-                "thesis_text": i.thesis_text,
+                # PR 2A.2: nested Stage2Note shape. Top-level
+                # `conviction_score` mirrors composite_conviction for
+                # quick scan by the render + observability code paths.
+                "stage_2_note": _stage_2_note_to_cache_dict(i.stage_2_note),
                 "conviction_score": i.conviction_score,
-                "key_drivers": i.key_drivers,
-                "risks": i.risks,
-                "open_questions": i.open_questions,
-                "evidence_anchors": i.evidence_anchors,
                 # PR 2A.1: per-item screener hits, threaded through to the
                 # render layer so the unified opportunity surface can show
                 # `[screener: evidence]` inline.
                 "screener_evidence": i.screener_evidence,
+                "chain_id": i.chain_id,
             }
             for i in brief.items
         ],
@@ -458,10 +517,11 @@ def render_brief_top_level(brief: Brief) -> str:
     """
     Scannable top-level summary (~5min read).
 
-    Format:
+    Format (PR 2A.2):
       - regime + dispersion + top macro signals (1 paragraph)
-      - top 4-8 opportunities: ticker + 1-line thesis + conviction
-      - "Run `/research <TICKER>` for full DD on any item."
+      - per-item: ticker + composite conviction + decision_tag, then the
+        observation list, bull/bear anchors, what_would_change triggers,
+        conviction breakdown across four dimensions.
     """
     lines = [f"# Morning Brief — {brief.date_et} (ET)", ""]
     ws = brief.world_state
@@ -487,22 +547,72 @@ def render_brief_top_level(brief: Brief) -> str:
     # section. Screener hits surface inline per item as
     # `[screener: evidence]` suffixes when present.
     lines.append(f"## Opportunity surface ({len(brief.items)} items)")
-    for item in brief.items:
-        conviction_str = (
-            f"conviction {item.conviction_score:.2f}"
-            if item.conviction_score is not None else "(no thesis)"
-        )
-        evidence_suffix = _render_screener_evidence_inline(item.screener_evidence)
-        thesis_preview = (item.thesis_text or item.stage_1_reason or "")[:140]
-        line = f"- **{item.ticker}** — {conviction_str}: "
-        if evidence_suffix:
-            line += f"{evidence_suffix} {thesis_preview}"
-        else:
-            line += thesis_preview
-        lines.append(line)
     lines.append("")
+    for item in brief.items:
+        lines.append(_render_item_block(item))
+        lines.append("")
     lines.append(f"_Run `/research <TICKER>` for full DD. Trace chain: `{brief.chain_id}`._")
     return "\n".join(lines)
+
+
+def _render_item_block(item: BriefItem) -> str:
+    """Render one BriefItem in the PR 2A.2 structured-note format.
+
+    Header line: `### NVDA — conviction 0.46 · WATCH · [screener: evidence]`
+    Then observation block, bull/bear anchors, what_would_change list,
+    conviction-by-dimension line. Items without a Stage2Note degrade to
+    the Stage 1 reason only.
+    """
+    evidence_suffix = _render_screener_evidence_inline(item.screener_evidence)
+    note = item.stage_2_note
+    if note is None:
+        header_bits = [f"### {item.ticker}", f"intrinsic {item.intrinsic_score:.2f}"]
+        if evidence_suffix:
+            header_bits.append(evidence_suffix)
+        header = " — ".join([header_bits[0], " · ".join(header_bits[1:])])
+        body_lines = [header, "", f"_(Stage 2 note unavailable — {item.stage_1_reason or 'no Stage 1 reason'})_"]
+        return "\n".join(body_lines)
+
+    header_bits = [
+        f"conviction {note.composite_conviction:.2f}",
+        note.decision_tag,
+    ]
+    if evidence_suffix:
+        header_bits.append(evidence_suffix)
+    header = f"### {item.ticker} — " + " · ".join(header_bits)
+
+    body: list[str] = [header, ""]
+    if note.observation:
+        body.append("Observation: " + "; ".join(note.observation))
+        body.append("")
+    body.append(f"Bull anchor: {note.bull_anchor}")
+    body.append(f"Bear anchor: {note.bear_anchor}")
+    if note.what_would_change:
+        body.append("")
+        body.append("What would change this read:")
+        for trigger in note.what_would_change:
+            body.append(f"- {trigger}")
+    body.append("")
+    body.append(_format_conviction_line(note.conviction))
+    return "\n".join(body)
+
+
+def _format_conviction_line(conviction: dict[str, float]) -> str:
+    """One-line per-dimension conviction render (PR 2A.2).
+
+    Example: `Conviction:  Tech 0.65 / Fund 0.25 / Catalyst 0.40 / Regime 0.75`
+    """
+    labels = {
+        "technical": "Tech",
+        "fundamental": "Fund",
+        "catalyst": "Catalyst",
+        "regime": "Regime",
+    }
+    parts = [
+        f"{labels[dim]} {conviction.get(dim, 0.0):.2f}"
+        for dim in STAGE2_CONVICTION_DIMENSIONS
+    ]
+    return "Conviction:  " + " / ".join(parts)
 
 
 def _render_screener_evidence_inline(evidence_list: list[dict]) -> str:
@@ -541,37 +651,45 @@ def _summarize_evidence(screener: str, ev: dict) -> str:
 
 
 def render_brief_drill_down(brief: Brief, ticker: str) -> str:
-    """Full per-item detail with anchors inline."""
+    """Full per-item detail in the PR 2A.2 structured-note format."""
     item = next((i for i in brief.items if i.ticker == ticker.upper()), None)
     if item is None:
         return f"No brief item for {ticker}. Items: {[i.ticker for i in brief.items]}"
 
     lines = [f"# {item.ticker} — Brief drill-down ({brief.date_et} ET)", ""]
-    if item.thesis_text:
-        lines.append(f"**Thesis:** {item.thesis_text}")
-        lines.append(f"**Conviction:** {item.conviction_score:.2f}")
-    else:
+    note = item.stage_2_note
+    if note is None:
         lines.append(f"**Stage 1 reason:** {item.stage_1_reason}")
-        lines.append(f"(Stage 2 thesis not generated — ticker below Stage 1 floor.)")
+        lines.append("(Stage 2 note not generated — ticker below Stage 1 floor.)")
+        lines.append("")
+        lines.append(f"_Run `/research {item.ticker}` for full Skeptic + Defender DD._")
+        return "\n".join(lines)
+
+    evidence_suffix = _render_screener_evidence_inline(item.screener_evidence)
+    header = [
+        f"**Decision:** {note.decision_tag}",
+        f"**Composite conviction:** {note.composite_conviction:.2f}",
+    ]
+    if evidence_suffix:
+        header.append(f"**Screener evidence:** {evidence_suffix}")
+    header.append(f"**Stage 1 reason:** {item.stage_1_reason}")
+    lines.extend(header)
     lines.append("")
 
-    if item.key_drivers:
-        lines.append("**Key drivers:**")
-        anchors_by_claim = {
-            a.get("claim", "").lower(): a.get("source", "")
-            for a in (item.evidence_anchors or [])
-        }
-        for d in item.key_drivers:
-            anchor = anchors_by_claim.get(d.lower(), "[NO ANCHOR — visibility regression]")
-            lines.append(f"- {d}  ← {anchor}")
-    if item.risks:
-        lines.append("\n**Risks:**")
-        for r in item.risks:
-            lines.append(f"- {r}")
-    if item.open_questions:
-        lines.append("\n**Open questions to probe:**")
-        for q in item.open_questions:
-            lines.append(f"- {q}")
+    if note.observation:
+        lines.append("**Observation:**")
+        for sentence in note.observation:
+            lines.append(f"- {sentence}")
+        lines.append("")
+    lines.append(f"**Bull anchor:** {note.bull_anchor}")
+    lines.append(f"**Bear anchor:** {note.bear_anchor}")
+    lines.append("")
+    if note.what_would_change:
+        lines.append("**What would change this read:**")
+        for trigger in note.what_would_change:
+            lines.append(f"- {trigger}")
+        lines.append("")
+    lines.append(_format_conviction_line(note.conviction))
     lines.append("")
     lines.append(f"_Run `/research {item.ticker}` for full Skeptic + Defender DD._")
     return "\n".join(lines)

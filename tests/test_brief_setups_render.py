@@ -56,7 +56,6 @@ def test_item_without_screener_evidence_renders_clean() -> None:
         ticker="NVDA",
         intrinsic_score=0.65,
         stage_1_reason="trend_strong +0.10",
-        thesis_text="NVDA DC growth aligned with bull regime.",
         conviction_score=0.72,
         screener_evidence=[],
     )
@@ -74,7 +73,6 @@ def test_screener_evidence_renders_inline() -> None:
         ticker="XLK",
         intrinsic_score=0.58,
         stage_1_reason="screener_confirmations +0.08",
-        thesis_text="XLK rotation to top quartile.",
         conviction_score=0.55,
         screener_evidence=[{
             "screener": "sector_rotation",
@@ -97,7 +95,6 @@ def test_multiple_screener_hits_chain() -> None:
         ticker="NVDA",
         intrinsic_score=0.74,
         stage_1_reason="multi-source",
-        thesis_text="Multi-source confirmation.",
         conviction_score=0.65,
         screener_evidence=[
             {"screener": "sector_rotation", "rs_rank_now": 2,

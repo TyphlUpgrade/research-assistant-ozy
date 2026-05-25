@@ -48,6 +48,193 @@ from ozymandias.intelligence.claude_json import parse_claude_response
 log = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Stage 2 structured note (PR 2A.2)
+# ---------------------------------------------------------------------------
+
+# The five decision tags Stage 2 may emit. Parser rejects anything else
+# (preserves the operator's ability to grep/filter by tag without coping
+# with free-form variants).
+STAGE2_DECISION_TAGS: tuple[str, ...] = (
+    "CHASE", "WATCH", "PROBE", "RESEARCH", "PASS",
+)
+
+# The four conviction dimensions Stage 2 scores. Order is fixed so the
+# composite math + the render layer have a stable iteration order.
+STAGE2_CONVICTION_DIMENSIONS: tuple[str, ...] = (
+    "technical", "fundamental", "catalyst", "regime",
+)
+
+
+@dataclass(frozen=True)
+class Stage2Note:
+    """Structured-note output of Stage 2 (PR 2A.2).
+
+    Replaces the prose-thesis schema (thesis_text + key_drivers + risks +
+    open_questions + evidence_anchors). Designed to make honest data
+    interpretation the path of least resistance: ONE bull anchor + ONE bear
+    anchor (no symmetric false-balance), specific `what_would_change`
+    triggers (no vague open questions), multi-dimensional conviction (so
+    the weak dimension is visible), enum decision tag (so downstream code
+    can branch cleanly).
+
+    `composite_conviction` is the geometric mean of the four dimension
+    scores. Geometric (not arithmetic) so one weak dimension drags the
+    composite — matches the design principle that high conviction requires
+    convergence across dimensions, not averaging away a red flag. The
+    function `compute_composite_conviction` is the single source of truth
+    for the math; tests pin its behavior.
+    """
+    ticker: str
+    observation: tuple[str, ...]                  # immutable so frozen=True survives
+    bull_anchor: str
+    bear_anchor: str
+    what_would_change: tuple[str, ...]
+    conviction: dict[str, float]                  # {technical, fundamental, catalyst, regime}
+    composite_conviction: float                   # geometric mean — see compute_composite_conviction
+    decision_tag: str                             # one of STAGE2_DECISION_TAGS
+
+
+def compute_composite_conviction(conviction: dict[str, float]) -> float:
+    """Geometric mean of the four conviction dimensions.
+
+    Returns 0.0 if any dimension is 0.0 (geometric-mean behavior — a single
+    zero zeros the product). Missing dimensions are treated as 0.0 (forces
+    Stage 2 to score all four; missing == admit weakness, not skip).
+
+    Pinned by `test_composite_conviction_geometric_mean`. Sanity: dimensions
+    all 0.5 → composite 0.5 (geometric mean of identical values equals the
+    value).
+    """
+    if not conviction:
+        return 0.0
+    n = len(STAGE2_CONVICTION_DIMENSIONS)
+    product = 1.0
+    for dim in STAGE2_CONVICTION_DIMENSIONS:
+        v = float(conviction.get(dim, 0.0))
+        # Clamp into [0.0, 1.0] — defensive against LLM out-of-range output.
+        v = max(0.0, min(1.0, v))
+        product *= v
+    return product ** (1.0 / n)
+
+
+def parse_stage2_note(payload: dict, *, default_ticker: Optional[str] = None) -> Stage2Note:
+    """Parse a Stage 2 JSON response into a Stage2Note.
+
+    Required fields: `bull_anchor`, `bear_anchor`, `conviction` (with all
+    four dimension keys), `decision_tag`. Missing required fields raise
+    ValueError so callers (trace event + brief render) get a clean signal
+    rather than a silently-degraded Stage2Note.
+
+    Defensive transforms (logged as WARN, not raised):
+      - `bull_anchor` / `bear_anchor` arriving as a list → collapse to
+        first element. The prompt is explicit that these are scalars; if
+        the model returns a list anyway we take the first rather than
+        crashing the brief render. WARN logs the violation.
+      - `observation` / `what_would_change` arriving as a scalar string →
+        wrap in a single-element tuple.
+      - `decision_tag` arriving in unexpected case → uppercase + validate
+        against STAGE2_DECISION_TAGS.
+    """
+    if default_ticker is None:
+        ticker = str(payload.get("ticker", "")).upper()
+    else:
+        ticker = str(payload.get("ticker", default_ticker)).upper()
+    if not ticker:
+        raise ValueError("Stage2Note missing required field: ticker")
+
+    def _collapse_anchor(value, label: str) -> str:
+        if isinstance(value, list):
+            log.warning(
+                "Stage2Note %s arrived as list (prompt requires scalar); collapsing to first element: %r",
+                label, value,
+            )
+            value = value[0] if value else ""
+        if value is None:
+            raise ValueError(f"Stage2Note missing required field: {label}")
+        return str(value)
+
+    def _normalize_string_list(value) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if isinstance(value, str):
+            return (value,)
+        return tuple(str(v) for v in value)
+
+    bull_anchor = _collapse_anchor(payload.get("bull_anchor"), "bull_anchor")
+    bear_anchor = _collapse_anchor(payload.get("bear_anchor"), "bear_anchor")
+
+    observation = _normalize_string_list(payload.get("observation"))
+    what_would_change = _normalize_string_list(payload.get("what_would_change"))
+
+    raw_conviction = payload.get("conviction")
+    if not isinstance(raw_conviction, dict):
+        raise ValueError(
+            f"Stage2Note conviction must be a dict with keys {STAGE2_CONVICTION_DIMENSIONS}; "
+            f"got {type(raw_conviction).__name__}"
+        )
+    conviction: dict[str, float] = {}
+    for dim in STAGE2_CONVICTION_DIMENSIONS:
+        if dim not in raw_conviction:
+            raise ValueError(f"Stage2Note conviction missing dimension: {dim}")
+        try:
+            conviction[dim] = float(raw_conviction[dim])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Stage2Note conviction[{dim!r}] must be numeric; got {raw_conviction[dim]!r}"
+            ) from exc
+
+    raw_tag = payload.get("decision_tag")
+    if raw_tag is None:
+        raise ValueError("Stage2Note missing required field: decision_tag")
+    decision_tag = str(raw_tag).strip().upper()
+    if decision_tag not in STAGE2_DECISION_TAGS:
+        raise ValueError(
+            f"Stage2Note decision_tag must be one of {STAGE2_DECISION_TAGS}; "
+            f"got {raw_tag!r}"
+        )
+
+    composite = compute_composite_conviction(conviction)
+
+    return Stage2Note(
+        ticker=ticker,
+        observation=observation,
+        bull_anchor=bull_anchor,
+        bear_anchor=bear_anchor,
+        what_would_change=what_would_change,
+        conviction=conviction,
+        composite_conviction=composite,
+        decision_tag=decision_tag,
+    )
+
+
+def _render_screener_evidence_block(screener_evidence: list[dict]) -> str:
+    """Render `screener_evidence` as a Stage-2 prompt block.
+
+    Stage 2 sees the raw evidence dicts framed as "these screeners flagged
+    this ticker" — NOT as a Stage-1 score or ranking justification. The
+    block deliberately omits any intrinsic_score / breakdown fields.
+    Empty list → explicit "(no screener hits)" so the prompt placeholder
+    never leaks.
+    """
+    if not screener_evidence:
+        return "(no screener hits for this ticker)"
+    lines: list[str] = []
+    for ev in screener_evidence:
+        screener = ev.get("screener", "<unknown>")
+        # Strip any accidental intrinsic_score/breakdown keys from the
+        # rendered detail — defense-in-depth against caller leakage.
+        detail = {
+            k: v for k, v in ev.items()
+            if k not in {"screener", "intrinsic_score", "breakdown"}
+        }
+        if detail:
+            lines.append(f"- {screener}: {detail}")
+        else:
+            lines.append(f"- {screener}")
+    return "\n".join(lines)
+
+
 @dataclass
 class ResearchResult:
     """Output of one `/research <TICKER>` invocation."""
@@ -139,6 +326,49 @@ async def _stage_2_thesis(
     system = f"WORLD_STATE for this session:\n{json.dumps(world_state, indent=2)}"
     result = await client.call(prompt, model="claude-sonnet-4-6", system=system)
     return parse_claude_response(result.text), result
+
+
+async def _stage_2_note(
+    client: ClaudeClient,
+    world_state: dict,
+    ticker_data: dict,
+    headlines: list[dict],
+    *,
+    insider_activity: Optional[InsiderActivitySummary] = None,
+    institutional_ownership: Optional[InstitutionalOwnership] = None,
+    screener_evidence: Optional[list[dict]] = None,
+    default_ticker: Optional[str] = None,
+) -> tuple[Optional[Stage2Note], Optional[CallResult]]:
+    """Invoke Stage 2 (Sonnet structured-note). Returns (note, call_metadata).
+
+    `note` is None on parse failure or schema-validation failure (logged at
+    WARN). `call_metadata` is always returned (so trace events can record
+    even when the parse fails).
+
+    Stage 1 score / breakdown is NOT a parameter — that's the data
+    isolation principle that PR 2A.2 enforces structurally. The signature
+    literally cannot leak Stage 1's read into Stage 2.
+    """
+    template = _load_prompt("stage_2_note")
+    prompt = _render(
+        template,
+        ticker_json=json.dumps(ticker_data, indent=2),
+        headlines_json=json.dumps(headlines, indent=2),
+        insider_activity_block=InsiderActivitySummary.render_for_prompt(insider_activity),
+        institutional_ownership_block=InstitutionalOwnership.render_for_prompt(institutional_ownership),
+        screener_evidence_block=_render_screener_evidence_block(screener_evidence or []),
+    )
+    system = f"WORLD_STATE for this session:\n{json.dumps(world_state, indent=2)}"
+    result = await client.call(prompt, model="claude-sonnet-4-6", system=system)
+    raw = parse_claude_response(result.text)
+    if raw is None:
+        return None, result
+    try:
+        note = parse_stage2_note(raw, default_ticker=default_ticker)
+    except ValueError as exc:
+        log.warning("Stage2Note parse failed (%s); raw=%r", exc, raw)
+        return None, result
+    return note, result
 
 
 async def _stage_3_skeptic(

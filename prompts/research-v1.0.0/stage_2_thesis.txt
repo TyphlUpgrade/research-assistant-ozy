@@ -1,3 +1,7 @@
+# DEPRECATED PR 2A.2: superseded by stage_2_note.txt. Kept for reference;
+# /research single-ticker flow (Stage 2 thesis → Stage 3 Skeptic → Dossier)
+# still loads this template until PR 2A.3 reconciles the Skeptic against the
+# new note schema. PR 2A.3 may delete this file once Skeptic adapts.
 PROMPT_VERSION: research-v1.0.0
 STAGE: 2 (deep intrinsic thesis, per-ticker, research-mode)
 MODEL_TIER: sonnet
