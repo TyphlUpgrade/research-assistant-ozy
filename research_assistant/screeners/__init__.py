@@ -33,6 +33,7 @@ __all__ = [
     "run_screeners_and_journal",
 ]
 
-# Screener auto-registration imports land in subsequent PRs as each
-# screener module ships (PR 1.2: sector_rotation; PR 2.2: pead;
-# PR 2.3: pre_catalyst). PR 1.1 ships the empty registry.
+# Screener auto-registration — importing the module triggers its
+# register_screener() call at the bottom of the file.
+# PR 1.2: sector_rotation. PR 2.2: pead. PR 2.3: pre_catalyst.
+from research_assistant.screeners import sector_rotation as sector_rotation  # noqa: E402, F401
