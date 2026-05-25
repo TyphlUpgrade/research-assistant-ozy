@@ -6,7 +6,10 @@ Pipeline:
    `#` comments allowed)
 2. Build Stage 0 world state via the cascade prompt (cached per ET date in
    `.research/briefs/<date-ET>.json` so a second /brief same day is cheap)
-3. Stage 1 batched filter (Haiku) — one call covering all watchlist tickers
+3. Stage 1 deterministic composite — `_stage_1_composite` ranks every
+   watchlist ticker via a pure-function scoring pass over ticker_data,
+   insider summaries, world_state and screener alerts (PR 2A.1; replaces
+   the previous Haiku-driven Stage 1 batched filter)
 4. Top 4-8 survivors → Stage 2 thesis (Sonnet) in parallel, semaphore-bounded
    per Critic iter1 #17 (concurrency cap to respect Anthropic + yfinance rate
    limits)
@@ -36,7 +39,7 @@ from research_assistant.observations import Observation, append_observation, now
 from research_assistant.prompts import chain_id as _chain_id
 from research_assistant.prompts import load_prompt as _load_prompt
 from research_assistant.prompts import render as _render
-from research_assistant.screeners import SetupCandidate, render_setup_line
+from research_assistant.screeners import SetupCandidate
 from research_assistant.trace_renderer import append_stage_event
 from ozymandias.intelligence.claude_json import parse_claude_response
 
@@ -65,6 +68,11 @@ class BriefItem:
     open_questions: list[str] = field(default_factory=list)
     evidence_anchors: list[dict] = field(default_factory=list)
     chain_id: Optional[str] = None
+    # PR 2A.1: screener hits that pinned this ticker. Each dict mirrors the
+    # SetupCandidate.evidence dict plus a "screener" key so the render layer
+    # can show e.g. `[sector_rotation: rank 7→2 on 30d basis]` inline. Empty
+    # list means "no screener fired on this ticker."
+    screener_evidence: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -79,10 +87,13 @@ class Brief:
     # LLM pipeline against the same universe without intra-day Yahoo drift.
     # Pass --rediscover (or --static-only) to override.
     discovered_universe: list[str] = field(default_factory=list)
-    # Setup-finder candidates (PR 1.3). Populated AFTER build_brief by
-    # `_cmd_brief` on BOTH cache branches via `run_screeners_and_journal`.
-    # Default empty so pre-PR-1.3 cached briefs still round-trip cleanly.
-    setups: list[SetupCandidate] = field(default_factory=list)
+    # NOTE on the dropped `setups` field (PR 2A.1):
+    # The setups list previously lived at the Brief level (rendered as a
+    # standalone `## Setups` block above the opportunity surface). Per the
+    # plan §PR 2A.1, screener hits now attach to individual BriefItems via
+    # `screener_evidence`, and the render layer surfaces them inline.
+    # Backward-compat on cached briefs: the cli cache loader drops the
+    # legacy `setups` key cleanly; new code never persists it.
 
 
 # ---------------------------------------------------------------------------
@@ -115,14 +126,88 @@ async def _stage_0_world_state(client: ClaudeClient, context: dict) -> Optional[
     return parse_claude_response(raw.text)
 
 
-async def _stage_1_filter(
-    client: ClaudeClient, world_state: dict, candidates: list[dict]
-) -> Optional[dict]:
-    template = _load_prompt("stage_1_filter")
-    prompt = _render(template, candidates_json=json.dumps(candidates, indent=2))
-    system = f"WORLD_STATE:\n{json.dumps(world_state, indent=2)}"
-    raw = await client.call(prompt, model="claude-haiku-4-5-20251001", system=system)
-    return parse_claude_response(raw.text)
+def _breakdown_summary(breakdown: dict) -> str:
+    """Render a composite breakdown dict as a one-line operator summary.
+
+    Picks the top 3 named signal contributions by absolute value (skipping
+    `baseline` and `regime_multiplier` since they're applied to every
+    ticker). Empty breakdown → empty string. Format example:
+        "trend_strong +0.10, screener_confirmations +0.16, sector_aligned +0.05"
+    """
+    if not breakdown:
+        return ""
+    skip = {"baseline", "regime_multiplier", "distinct_screener_sources"}
+    contributions: list[tuple[str, float]] = []
+    for key, value in breakdown.items():
+        if key in skip:
+            continue
+        if isinstance(value, bool):
+            # Boolean breakdown flags (parabolic_cap, insider_selling_cap)
+            # surface as labelled markers rather than signed numbers.
+            if value:
+                contributions.append((key, 0.0))
+            continue
+        if isinstance(value, (int, float)):
+            contributions.append((key, float(value)))
+    if not contributions:
+        return ""
+    contributions.sort(key=lambda kv: -abs(kv[1]))
+    parts = [
+        f"{k} {v:+.2f}" if v != 0.0 else f"{k}"
+        for k, v in contributions[:3]
+    ]
+    return ", ".join(parts)
+
+
+def _stage_1_composite(
+    world_state: dict,
+    ticker_data_by_symbol: dict[str, dict],
+    insider_activities: dict[str, Optional[InsiderActivitySummary]],
+    screener_alerts: list[SetupCandidate],
+) -> list[dict]:
+    """Deterministic Stage-1 ranking (PR 2A.1).
+
+    Pure function — no I/O, no LLM. Replaces `_stage_1_filter` (Haiku call).
+    For every ticker in `ticker_data_by_symbol` it computes an intrinsic
+    score + breakdown via `compute_intrinsic_score`, attaches any matching
+    screener_alerts (keyed by ticker), and returns a list sorted by
+    `intrinsic_score` descending.
+
+    Output shape per item: `{ticker, intrinsic_score, breakdown,
+    screener_evidence}`. Downstream Stage-2 code reads `ticker` +
+    `intrinsic_score`; `breakdown` and `screener_evidence` are additional
+    fields for trace logging and rendering. The breakdown is intentionally
+    NOT threaded into Stage-2 inputs — see plan §"Core principle 1".
+    """
+    from research_assistant.composite import compute_intrinsic_score
+
+    # Group screener alerts by ticker so each ticker sees only its hits.
+    alerts_by_ticker: dict[str, list[SetupCandidate]] = {}
+    for alert in screener_alerts or []:
+        alerts_by_ticker.setdefault(alert.ticker.upper(), []).append(alert)
+
+    results: list[dict] = []
+    for ticker, ticker_data in ticker_data_by_symbol.items():
+        upper = ticker.upper()
+        ticker_alerts = alerts_by_ticker.get(upper, [])
+        score, breakdown = compute_intrinsic_score(
+            ticker_data=ticker_data,
+            insider_summary=insider_activities.get(upper),
+            world_state=world_state,
+            screener_alerts=ticker_alerts,
+        )
+        results.append({
+            "ticker": upper,
+            "intrinsic_score": score,
+            "breakdown": breakdown,
+            "screener_evidence": [
+                {"screener": a.screener, **(a.evidence or {})}
+                for a in ticker_alerts
+            ],
+        })
+
+    results.sort(key=lambda r: r.get("intrinsic_score", 0.0), reverse=True)
+    return results
 
 
 async def _stage_2_for_survivor(
@@ -192,6 +277,7 @@ async def build_brief(
     insider_activities: Optional[
         dict[str, Optional[InsiderActivitySummary]]
     ] = None,
+    screener_alerts: Optional[list[SetupCandidate]] = None,
 ) -> Brief:
     """
     Build the morning brief. Caller provides pre-loaded market context +
@@ -206,10 +292,14 @@ async def build_brief(
         research_base: path to `.research/` directory
         client: optional ClaudeClient (cost continuity across stages)
         insider_activities: optional dict of {ticker: Optional[InsiderActivitySummary]}
-            from `load_insider_activities_batch` (FOLLOWUPS #3). When provided,
-            each Stage 1 candidate gains an `insider_summary` line so Haiku
-            can gate on severe insider selling. None values per-ticker are
+            from `load_insider_activities_batch` (FOLLOWUPS #3). Threaded into
+            the deterministic Stage-1 composite scorer so insider buying /
+            severe selling caps influence ranking. None values per-ticker are
             tolerated (graceful degrade per failed ticker).
+        screener_alerts: optional list of SetupCandidate from
+            `run_screeners_and_journal`. PR 2A.1: alerts feed the composite
+            score (multi-source confirmation bonus) AND attach as inline
+            `screener_evidence` on each surviving BriefItem.
 
     Returns:
         Brief with world_state + ranked items. Cached to
@@ -226,28 +316,17 @@ async def build_brief(
     if world_state is None:
         raise RuntimeError("Stage 0 (world state) JSON parse failed")
 
-    # Stage 1 — batched filter
+    # Stage 1 — deterministic composite (PR 2A.1). No LLM call here.
     insider_activities = insider_activities or {}
-    candidates = [
-        {
-            "ticker": ticker,
-            **data,
-            "insider_summary": _insider_summary_line(
-                insider_activities.get(ticker.upper())
-            ),
-        }
-        for ticker, data in watchlist_tickers_with_data.items()
-    ]
-    stage_1 = await _stage_1_filter(client, world_state, candidates)
-    if stage_1 is None:
-        raise RuntimeError("Stage 1 (batched filter) JSON parse failed")
+    screener_alerts = list(screener_alerts or [])
+    ranked = _stage_1_composite(
+        world_state=world_state,
+        ticker_data_by_symbol=watchlist_tickers_with_data,
+        insider_activities=insider_activities,
+        screener_alerts=screener_alerts,
+    )
 
     # Take top N survivors (within [min, max] range)
-    ranked = sorted(
-        stage_1.get("results", []),
-        key=lambda r: r.get("intrinsic_score", 0.0),
-        reverse=True,
-    )
     survivors = ranked[:SURVIVORS_PER_BRIEF[1]]
     # Drop low-conviction survivors below min count threshold
     if len(survivors) > SURVIVORS_PER_BRIEF[0]:
@@ -257,7 +336,12 @@ async def build_brief(
         if len(survivors) < SURVIVORS_PER_BRIEF[0] and len(ranked) >= SURVIVORS_PER_BRIEF[0]:
             survivors = ranked[:SURVIVORS_PER_BRIEF[0]]
 
-    # Stage 2 — parallel theses with semaphore cap
+    # Stage 2 — parallel theses with semaphore cap.
+    # Strip the composite `breakdown` from each survivor before threading
+    # into Stage 2: per the plan's data-isolation principle, Stage 2 must
+    # do original analysis from raw ticker_data, not rationalize an
+    # upstream score. `ticker` + `intrinsic_score` is the minimum Stage 2
+    # downstream code expects.
     semaphore = asyncio.Semaphore(_STAGE_2_CONCURRENCY)
     traces_base = research_base / "traces"
     stage_2_tasks = [
@@ -265,7 +349,7 @@ async def build_brief(
             client,
             world_state,
             watchlist_tickers_with_data.get(s["ticker"], {}),
-            s,
+            {"ticker": s["ticker"], "intrinsic_score": s.get("intrinsic_score", 0.0)},
             headlines_per_ticker.get(s["ticker"], []),
             semaphore,
             chain_id=chain,
@@ -282,7 +366,12 @@ async def build_brief(
         item = BriefItem(
             ticker=survivor["ticker"],
             intrinsic_score=survivor.get("intrinsic_score", 0.0),
-            stage_1_reason=survivor.get("reason", ""),
+            # PR 2A.1: stage_1_reason is a compact composite-breakdown
+            # summary string (no LLM-authored prose) — the operator sees
+            # which signals lifted this ticker into Stage 2 without needing
+            # the trace.
+            stage_1_reason=_breakdown_summary(survivor.get("breakdown") or {}),
+            screener_evidence=list(survivor.get("screener_evidence", [])),
             chain_id=chain,
         )
         if stage_2 is not None:
@@ -328,41 +417,10 @@ async def build_brief(
     return brief
 
 
-def _serialize_setup(s: SetupCandidate) -> dict:
-    """Flatten a frozen SetupCandidate to a plain dict for JSON cache."""
-    return {
-        "ticker": s.ticker,
-        "screener": s.screener,
-        "asof": s.asof,
-        "entry_price": s.entry_price,
-        "evidence": dict(s.evidence),
-        "return_7d": s.return_7d,
-        "return_30d": s.return_30d,
-        "return_90d": s.return_90d,
-        "enriched_at": s.enriched_at,
-    }
-
-
-def _deserialize_setup(raw: dict) -> SetupCandidate:
-    """Inverse of `_serialize_setup`. Tolerates missing optional horizon
-    fields so a cache pre-PR-1.3 (which never wrote them) still loads."""
-    return SetupCandidate(
-        ticker=raw["ticker"],
-        screener=raw["screener"],
-        asof=raw["asof"],
-        entry_price=raw["entry_price"],
-        evidence=raw.get("evidence", {}) or {},
-        return_7d=raw.get("return_7d"),
-        return_30d=raw.get("return_30d"),
-        return_90d=raw.get("return_90d"),
-        enriched_at=raw.get("enriched_at"),
-    )
-
-
 def write_brief_cache(brief: Brief, research_base: Path) -> Path:
     """Write the brief cache JSON. Called by `build_brief` after Stage 2
-    completion AND by `_cmd_brief` after `run_screeners_and_journal` attaches
-    `setups` — re-writing is cheap and keeps the on-disk cache canonical.
+    completion AND by `_cmd_brief` after `run_screeners_and_journal` runs —
+    re-writing is cheap and keeps the on-disk cache canonical.
     """
     briefs_dir = research_base / "briefs"
     briefs_dir.mkdir(parents=True, exist_ok=True)
@@ -382,14 +440,15 @@ def write_brief_cache(brief: Brief, research_base: Path) -> Path:
                 "risks": i.risks,
                 "open_questions": i.open_questions,
                 "evidence_anchors": i.evidence_anchors,
+                # PR 2A.1: per-item screener hits, threaded through to the
+                # render layer so the unified opportunity surface can show
+                # `[screener: evidence]` inline.
+                "screener_evidence": i.screener_evidence,
             }
             for i in brief.items
         ],
         "cost_usd": brief.cost_usd,
         "discovered_universe": brief.discovered_universe,
-        # PR 1.3: setups field. Pre-PR-1.3 caches lack this key entirely;
-        # the deserializer in cli.py defaults to [] when reading.
-        "setups": [_serialize_setup(s) for s in brief.setups],
     }
     cache_path.write_text(json.dumps(cache_payload, indent=2))
     return cache_path
@@ -424,29 +483,61 @@ def render_brief_top_level(brief: Brief) -> str:
         )
     lines.append("")
 
-    # PR 1.3: Setup-finder section. Renders ABOVE the opportunity surface so
-    # operator sees screener hits first. Empty list still renders the header
-    # so the absence is explicit (and the smoke test can assert on it).
-    lines.append(f"## Setups ({len(brief.setups)})")
-    if not brief.setups:
-        lines.append("")
-        lines.append("(no setups detected today)")
-    else:
-        for setup in brief.setups:
-            lines.append(render_setup_line(setup))
-    lines.append("")
-
+    # PR 2A.1: Unified opportunity surface — no more standalone `## Setups`
+    # section. Screener hits surface inline per item as
+    # `[screener: evidence]` suffixes when present.
     lines.append(f"## Opportunity surface ({len(brief.items)} items)")
     for item in brief.items:
         conviction_str = (
             f"conviction {item.conviction_score:.2f}"
             if item.conviction_score is not None else "(no thesis)"
         )
+        evidence_suffix = _render_screener_evidence_inline(item.screener_evidence)
         thesis_preview = (item.thesis_text or item.stage_1_reason or "")[:140]
-        lines.append(f"- **{item.ticker}** — {conviction_str}: {thesis_preview}")
+        line = f"- **{item.ticker}** — {conviction_str}: "
+        if evidence_suffix:
+            line += f"{evidence_suffix} {thesis_preview}"
+        else:
+            line += thesis_preview
+        lines.append(line)
     lines.append("")
     lines.append(f"_Run `/research <TICKER>` for full DD. Trace chain: `{brief.chain_id}`._")
     return "\n".join(lines)
+
+
+def _render_screener_evidence_inline(evidence_list: list[dict]) -> str:
+    """Render per-item screener hits as `[screener: evidence-summary]` blobs.
+
+    Examples (sector_rotation):
+        `[sector_rotation: rank 7→2 on 30d basis]`
+    Multiple hits chain with spaces. Empty list → empty string.
+    """
+    if not evidence_list:
+        return ""
+    parts: list[str] = []
+    for ev in evidence_list:
+        screener = ev.get("screener", "screener")
+        summary = _summarize_evidence(screener, ev)
+        if summary:
+            parts.append(f"[{screener}: {summary}]")
+        else:
+            parts.append(f"[{screener}]")
+    return " ".join(parts)
+
+
+def _summarize_evidence(screener: str, ev: dict) -> str:
+    """Per-screener compact evidence string. Centralised here so the brief
+    render layer doesn't need to learn each screener's evidence schema.
+
+    Unknown screeners surface as the bare `[screener]` tag (empty summary).
+    """
+    if screener == "sector_rotation":
+        rp = ev.get("rs_rank_prior")
+        rn = ev.get("rs_rank_now")
+        basis = ev.get("basis_days")
+        if rp is not None and rn is not None and basis is not None:
+            return f"rank {rp}→{rn} on {basis}d basis"
+    return ""
 
 
 def render_brief_drill_down(brief: Brief, ticker: str) -> str:

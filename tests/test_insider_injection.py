@@ -344,25 +344,33 @@ def test_insider_summary_line_populated() -> None:
 
 
 @pytest.mark.asyncio
-async def test_build_brief_injects_insider_summary_into_candidates(
+async def test_build_brief_threads_insider_summary_into_composite(
     tmp_path: Path,
 ) -> None:
-    """End-to-end Stage 1 wiring: build_brief should merge insider_summary
-    into each candidate dict before sending to _stage_1_filter."""
+    """PR 2A.1: build_brief should pass insider_activities through to the
+    deterministic Stage-1 composite (NOT the deleted Haiku batched filter).
+    Severe insider selling on NVDA must trigger the cap in `breakdown`,
+    surfacing on the returned BriefItem.stage_1_reason summary."""
     captured: dict = {}
 
     async def fake_stage_0(client, ctx):
         return {"regime": "bull-trending", "regime_confidence": 0.7}
 
-    async def fake_stage_1(client, ws, candidates):
-        captured["candidates"] = candidates
-        return {"results": [
-            {"ticker": c["ticker"], "intrinsic_score": 0.6, "reason": "ok"}
-            for c in candidates
-        ]}
+    # Spy on _stage_1_composite to capture the insider_activities it sees.
+    from research_assistant.brief import _stage_1_composite as real_composite
 
-    # No Stage 2 survivors — keep the test fast and focused on the Stage 1 surface
-    async def fake_stage_2_thesis(client, ws, td, s1, h, insider_activity=None):
+    def fake_composite(world_state, ticker_data_by_symbol, insider_activities, screener_alerts):
+        captured["insider_activities"] = insider_activities
+        return real_composite(
+            world_state=world_state,
+            ticker_data_by_symbol=ticker_data_by_symbol,
+            insider_activities=insider_activities,
+            screener_alerts=screener_alerts,
+        )
+
+    # No Stage 2 survivors — keep the test fast and focused.
+    async def fake_stage_2_thesis(client, ws, td, s1, h, insider_activity=None,
+                                  institutional_ownership=None):
         return None, None
 
     nvda_summary = _summary(
@@ -372,8 +380,8 @@ async def test_build_brief_injects_insider_summary_into_candidates(
     )
     insider_activities = {
         "NVDA": nvda_summary,
-        "AAPL": None,                       # EDGAR failure → "unavailable"
-        "TSLA": _summary(                   # empty window → "no Form 4 last 90d"
+        "AAPL": None,
+        "TSLA": _summary(
             total_filings=0, buys_count=0, sales_count=0, net_dollars=0.0,
             code_mix={}, deriv_code_mix={}, by_officer=[],
             latest_transaction_date=None,
@@ -386,9 +394,9 @@ async def test_build_brief_injects_insider_summary_into_candidates(
     }
 
     with patch("research_assistant.brief._stage_0_world_state", fake_stage_0), \
-         patch("research_assistant.brief._stage_1_filter", fake_stage_1), \
+         patch("research_assistant.brief._stage_1_composite", fake_composite), \
          patch("research_assistant.orchestrator._stage_2_thesis", fake_stage_2_thesis):
-        await build_brief(
+        brief = await build_brief(
             market_context={},
             universe=["NVDA", "AAPL", "TSLA"],
             watchlist_tickers_with_data=watchlist_data,
@@ -397,46 +405,48 @@ async def test_build_brief_injects_insider_summary_into_candidates(
             insider_activities=insider_activities,
         )
 
-    candidates = {c["ticker"]: c for c in captured["candidates"]}
-    assert candidates["NVDA"]["insider_summary"] == nvda_summary.stage_1_line()
-    assert "-$42.0M / 4 sales / 0 buys" in candidates["NVDA"]["insider_summary"]
-    assert candidates["AAPL"]["insider_summary"] == "(insider data unavailable)"
-    assert candidates["TSLA"]["insider_summary"] == "(no Form 4 last 90d)"
+    # The composite saw the raw InsiderActivitySummary objects (not
+    # pre-rendered strings) — that's the new contract.
+    assert captured["insider_activities"]["NVDA"] is nvda_summary
+    assert captured["insider_activities"]["AAPL"] is None
+    # NVDA's severe-selling signal flows into the composite, capping its score.
+    nvda_item = next((i for i in brief.items if i.ticker == "NVDA"), None)
+    assert nvda_item is not None
+    assert nvda_item.intrinsic_score <= 0.40, (
+        f"Expected NVDA score capped by severe insider selling; "
+        f"got {nvda_item.intrinsic_score}"
+    )
 
 
 @pytest.mark.asyncio
 async def test_build_brief_default_insider_activities_unavailable(
     tmp_path: Path,
 ) -> None:
-    """When insider_activities is not provided (legacy callers), each
-    candidate gets '(insider data unavailable)' — preserves the failure-
-    mode signal rather than silently omitting the field."""
-    captured: dict = {}
+    """When insider_activities is omitted (legacy callers), build_brief
+    still runs — composite treats missing entries as None which has no
+    score effect (graceful degrade)."""
 
     async def fake_stage_0(client, ctx):
         return {"regime": "bull-trending"}
 
-    async def fake_stage_1(client, ws, candidates):
-        captured["candidates"] = candidates
-        return {"results": [
-            {"ticker": c["ticker"], "intrinsic_score": 0.6, "reason": "ok"}
-            for c in candidates
-        ]}
-
-    async def fake_stage_2_thesis(client, ws, td, s1, h, insider_activity=None):
+    async def fake_stage_2_thesis(client, ws, td, s1, h, insider_activity=None,
+                                  institutional_ownership=None):
         return None, None
 
     with patch("research_assistant.brief._stage_0_world_state", fake_stage_0), \
-         patch("research_assistant.brief._stage_1_filter", fake_stage_1), \
          patch("research_assistant.orchestrator._stage_2_thesis", fake_stage_2_thesis):
-        await build_brief(
+        brief = await build_brief(
             market_context={},
             universe=["NVDA"],
             watchlist_tickers_with_data={"NVDA": {"price": 150.0}},
             headlines_per_ticker={"NVDA": []},
             research_base=tmp_path,
         )
-    assert captured["candidates"][0]["insider_summary"] == "(insider data unavailable)"
+    # NVDA still ranked despite no insider data — score equals baseline (after
+    # bull-trending regime mult: 0.30 * 1.10 = 0.33).
+    nvda_item = next((i for i in brief.items if i.ticker == "NVDA"), None)
+    assert nvda_item is not None
+    assert nvda_item.intrinsic_score == pytest.approx(0.33, abs=1e-6)
 
 
 # ---------------------------------------------------------------------------

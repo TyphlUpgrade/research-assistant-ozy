@@ -491,10 +491,49 @@ async def _pipeline_inputs_for_universe(
     )
 
 
+def _attach_screener_evidence(items: list, screener_alerts: list) -> None:
+    """Merge `screener_alerts` onto matching BriefItems by ticker, in-place.
+
+    Each item's `screener_evidence` is REPLACED with the current run's hits
+    for that ticker (not appended) — the brief renders today's screener
+    state, not a historical union.
+    """
+    grouped: dict[str, list[dict]] = {}
+    for alert in screener_alerts:
+        grouped.setdefault(alert.ticker.upper(), []).append(
+            {"screener": alert.screener, **(alert.evidence or {})}
+        )
+    for item in items:
+        item.screener_evidence = list(grouped.get(item.ticker.upper(), []))
+
+
+def _brief_item_from_cache(raw: dict) -> "BriefItem":
+    """Construct a BriefItem from a cached dict, tolerating pre-PR-2A.1
+    payloads that lack `screener_evidence`. Per plan §PR 2A.1 acceptance
+    criterion 7 — graceful degrade to empty screener_evidence on legacy
+    caches; do not crash."""
+    from research_assistant.brief import BriefItem
+    return BriefItem(
+        ticker=raw["ticker"],
+        intrinsic_score=raw.get("intrinsic_score", 0.0),
+        stage_1_reason=raw.get("stage_1_reason", ""),
+        thesis_text=raw.get("thesis_text"),
+        conviction_score=raw.get("conviction_score"),
+        key_drivers=list(raw.get("key_drivers") or []),
+        risks=list(raw.get("risks") or []),
+        open_questions=list(raw.get("open_questions") or []),
+        evidence_anchors=list(raw.get("evidence_anchors") or []),
+        chain_id=raw.get("chain_id"),
+        screener_evidence=list(raw.get("screener_evidence") or []),
+    )
+
+
 async def _load_or_build_brief(
     args: argparse.Namespace,
     base: Path,
     cache_path: Path,
+    *,
+    screener_alerts: Optional[list] = None,
 ) -> tuple["Brief", _PipelineInputs, str]:
     """Returns (brief, pipeline_inputs, cache_branch).
 
@@ -507,15 +546,41 @@ async def _load_or_build_brief(
 
     Returns RuntimeError-shaped exits via the caller path (empty-universe
     case raises so the caller's exit-1 path stays in `_cmd_brief`).
+
+    `screener_alerts` (PR 2A.1, optional): list of SetupCandidate the caller
+    has pre-computed. When supplied on cache-miss it threads into
+    `build_brief` so the deterministic Stage-1 composite can use the
+    multi-source confirmation bonus. When supplied on cache-hit it attaches
+    onto cached items as `screener_evidence` (current-day hits surface on
+    yesterday's ranked items). Default empty list preserves the older
+    test-direct contract where callers don't pre-run screeners.
     """
+    screener_alerts = list(screener_alerts or [])
     from research_assistant.brief import (
         Brief,
-        BriefItem,
-        _deserialize_setup,
         build_brief,
         load_watchlist,
     )
+    from research_assistant.screeners import run_screeners_and_journal
     from research_assistant.universe import discover_universe
+
+    async def _maybe_run_screeners(
+        ins: _PipelineInputs, branch: str,
+    ) -> list:
+        """Run the screener pipeline + journal alerts (suppressed by
+        --skip-screeners). Pre-computed alerts passed in by the caller
+        short-circuit re-running."""
+        if screener_alerts:
+            return screener_alerts
+        if getattr(args, "skip_screeners", False):
+            return []
+        return list(await run_screeners_and_journal(
+            world_state=ins.world_state,
+            universe=ins.universe,
+            ticker_data=ins.ticker_data,
+            research_base=base,
+            cache_branch=branch,
+        ))
 
     if cache_path.exists() and not args.refresh:
         if not args.quiet:
@@ -525,20 +590,18 @@ async def _load_or_build_brief(
                 file=sys.stderr,
             )
         raw = json.loads(cache_path.read_text())
+        # PR 2A.1: pre-2A.1 caches carry a top-level `setups` field and
+        # individual items lack `screener_evidence`. Construct BriefItems
+        # field-by-field (instead of `BriefItem(**i)`) so unknown / dropped
+        # keys don't break loading. `setups` at the Brief level is gone.
         brief = Brief(
             date_et=raw["date_et"],
             chain_id=raw["chain_id"],
             world_state=raw["world_state"],
-            items=[BriefItem(**i) for i in raw["items"]],
+            items=[_brief_item_from_cache(i) for i in raw["items"]],
             cost_usd=raw.get("cost_usd", 0.0),
             discovered_universe=raw.get("discovered_universe", []),
-            # PR 1.3: backward-compatible default for pre-PR-1.3 caches that
-            # never wrote `setups`. The pipeline will repopulate this list
-            # below; the cached value is only used as a fallback when
-            # --skip-screeners is set.
-            setups=[_deserialize_setup(s) for s in raw.get("setups", []) or []],
         )
-
         # Option α re-fetch is suppressed when --skip-screeners is set:
         # the pipeline won't run, so there's no consumer for the data and
         # we keep the fast-path cheap.
@@ -561,6 +624,13 @@ async def _load_or_build_brief(
                 news_seed=universe[:5],
                 base_world_state=brief.world_state,
             )
+        # PR 2A.1: run screeners against today's inputs, attach hits onto
+        # cached items so the unified opportunity surface shows current
+        # screener evidence inline. iter-1 CRITICAL #1 regression contract
+        # is preserved — the pipeline still fires on cache-hit.
+        cache_hit_alerts = await _maybe_run_screeners(inputs, "hit")
+        if cache_hit_alerts:
+            _attach_screener_evidence(brief.items, cache_hit_alerts)
         return brief, inputs, "hit"
 
     # Cache-miss path.
@@ -610,6 +680,12 @@ async def _load_or_build_brief(
         fetch_insider=True,
     )
 
+    # PR 2A.1: run screeners BEFORE build_brief so the deterministic
+    # Stage-1 composite can use the multi-source confirmation bonus AND
+    # each survivor surfaces its screener_evidence inline. Journal alerts
+    # also fire here — the journal side-effect is preserved.
+    cache_miss_alerts = await _maybe_run_screeners(inputs, "miss")
+
     # build_brief expects the raw world_state_input (with sector_performance
     # already populated) as its market_context. _pipeline_inputs_for_universe
     # has produced exactly that shape in `inputs.world_state`.
@@ -619,6 +695,7 @@ async def _load_or_build_brief(
         watchlist_tickers_with_data=inputs.ticker_data,
         headlines_per_ticker=inputs.headlines_per_ticker,
         insider_activities=inputs.insider_activities,
+        screener_alerts=cache_miss_alerts,
         research_base=base,
     )
 
@@ -661,13 +738,17 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
         render_brief_top_level,
         write_brief_cache,
     )
-    from research_assistant.screeners import run_screeners_and_journal
 
     base = _resolve_base(args.base)
     today_et = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     cache_path = base / "briefs" / f"{today_et}.json"
 
     try:
+        # PR 2A.1: `_load_or_build_brief` now orchestrates the screener
+        # pipeline internally — it runs `run_screeners_and_journal` on both
+        # cache branches (preserving iter-1 CRITICAL #1) and threads the
+        # alerts into either build_brief (cache-miss) or item evidence
+        # attachment (cache-hit). `_cmd_brief` only renders + caches.
         brief, inputs, cache_branch = await _load_or_build_brief(
             args, base, cache_path,
         )
@@ -679,28 +760,17 @@ async def _cmd_brief(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # PR 1.3 iter-1 CRITICAL #1 fix: BOTH cache branches invoke the screener
-    # pipeline. `--skip-screeners` is the operator escape hatch (and the only
-    # path where pipeline_inputs may carry empty ticker_data on cache-hit).
     if args.skip_screeners:
         print(
             "[skip-screeners] Setup-finder skipped per --skip-screeners flag; "
-            "brief shows last-known setups from cache only.",
+            "brief shows last-known evidence only.",
             file=sys.stderr,
         )
     else:
-        setups = await run_screeners_and_journal(
-            world_state=inputs.world_state,
-            universe=inputs.universe,
-            ticker_data=inputs.ticker_data,
-            research_base=base,
-            cache_branch=cache_branch,
-        )
-        brief.setups = list(setups)
-        # Re-write the cache so the on-disk brief reflects the freshly
-        # computed setups (both branches: cache-miss overwrites the
+        # Re-write the cache so the on-disk brief reflects today's
+        # screener evidence (both branches: cache-miss overwrites the
         # build_brief-written file; cache-hit overwrites the prior day's
-        # cache with today's setups).
+        # cache with today's evidence).
         write_brief_cache(brief, base)
 
     if args.ticker:

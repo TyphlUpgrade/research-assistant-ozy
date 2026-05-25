@@ -1,11 +1,12 @@
 """
-Tests for the `## Setups` section in `render_brief_top_level` (PR 1.3).
+Tests for the unified opportunity-surface render in `render_brief_top_level`
+(PR 2A.1, supersedes the PR 1.3 `## Setups` section).
 
 Covers:
-- Empty setups list → `## Setups (0)` + `(no setups detected today)`
-- One sector_rotation candidate → rendered via per-screener formatter
-- `## Setups` appears ABOVE `## Opportunity surface` (ordering invariant)
-- Screener trace stages carry `cost_usd == 0` (no-LLM-at-screener contract)
+- The standalone `## Setups` section is GONE.
+- Screener evidence renders inline per item as `[screener: summary]` suffix.
+- An item with no screener_evidence still renders cleanly (no empty `[]` tag).
+- Screener trace stages still carry `cost_usd == 0` (no-LLM-at-screener contract).
 """
 from __future__ import annotations
 
@@ -14,11 +15,10 @@ from pathlib import Path
 
 import pytest
 
-from research_assistant.brief import Brief, render_brief_top_level
-from research_assistant.screeners import SetupCandidate
+from research_assistant.brief import Brief, BriefItem, render_brief_top_level
 
 
-def _empty_brief(setups: list[SetupCandidate] | None = None) -> Brief:
+def _brief_with_items(items: list[BriefItem]) -> Brief:
     return Brief(
         date_et="2026-05-25",
         chain_id="20260525T093000-test01",
@@ -27,75 +27,94 @@ def _empty_brief(setups: list[SetupCandidate] | None = None) -> Brief:
             "regime_confidence": 0.7,
             "dispersion": 0.3,
             "rationale": "Test rationale.",
-            "macro_signals": {"vix_level": 14.0, "vix_trend": "flat", "active_catalysts": []},
+            "macro_signals": {"vix_level": 14.0, "vix_trend": "flat",
+                              "active_catalysts": []},
         },
-        items=[],
+        items=items,
         cost_usd=0.1,
-        setups=list(setups or []),
     )
 
 
-def test_renders_empty_setups_section() -> None:
-    brief = _empty_brief()
+def test_no_standalone_setups_section() -> None:
+    """PR 2A.1: `## Setups` is removed. The render must not contain it."""
+    brief = _brief_with_items([])
     out = render_brief_top_level(brief)
-    assert "## Setups (0)" in out
-    assert "(no setups detected today)" in out
+    assert "## Setups" not in out
+    assert "(no setups detected today)" not in out
 
 
-def test_renders_single_setup() -> None:
-    setup = SetupCandidate(
+def test_opportunity_surface_renders_when_empty() -> None:
+    """Zero items still produces the surface header so absence is explicit."""
+    brief = _brief_with_items([])
+    out = render_brief_top_level(brief)
+    assert "## Opportunity surface (0 items)" in out
+
+
+def test_item_without_screener_evidence_renders_clean() -> None:
+    """An item with no screener hits renders without an empty `[...]` tag."""
+    item = BriefItem(
+        ticker="NVDA",
+        intrinsic_score=0.65,
+        stage_1_reason="trend_strong +0.10",
+        thesis_text="NVDA DC growth aligned with bull regime.",
+        conviction_score=0.72,
+        screener_evidence=[],
+    )
+    out = render_brief_top_level(_brief_with_items([item]))
+    assert "NVDA" in out
+    # The empty-brackets tag must not appear when no evidence is present.
+    assert "[]" not in out
+    assert "[: " not in out
+
+
+def test_screener_evidence_renders_inline() -> None:
+    """sector_rotation evidence surfaces inline as
+    `[sector_rotation: rank 7→2 on 30d basis]`."""
+    item = BriefItem(
         ticker="XLK",
-        screener="sector_rotation",
-        asof="2026-05-25",
-        entry_price=250.0,
-        evidence={
+        intrinsic_score=0.58,
+        stage_1_reason="screener_confirmations +0.08",
+        thesis_text="XLK rotation to top quartile.",
+        conviction_score=0.55,
+        screener_evidence=[{
+            "screener": "sector_rotation",
             "sector_etf": "XLK",
             "rs_rank_now": 2,
             "rs_rank_prior": 7,
             "basis_days": 30,
             "return_5d": 0.045,
             "return_30d": 0.11,
-        },
+        }],
     )
-    brief = _empty_brief(setups=[setup])
-    out = render_brief_top_level(brief)
-    assert "## Setups (1)" in out
-    # The sector_rotation formatter line includes the rank transition and basis.
+    out = render_brief_top_level(_brief_with_items([item]))
     assert "XLK" in out
-    assert "rank 7→2" in out
-    assert "30d basis" in out
+    assert "[sector_rotation: rank 7→2 on 30d basis]" in out
 
 
-def test_setups_section_above_opportunity_surface() -> None:
-    setup = SetupCandidate(
-        ticker="XLK",
-        screener="sector_rotation",
-        asof="2026-05-25",
-        entry_price=250.0,
-        evidence={
-            "sector_etf": "XLK",
-            "rs_rank_now": 2,
-            "rs_rank_prior": 7,
-            "basis_days": 30,
-            "return_5d": 0.045,
-            "return_30d": 0.11,
-        },
+def test_multiple_screener_hits_chain() -> None:
+    """An item with multiple screener hits renders all of them inline."""
+    item = BriefItem(
+        ticker="NVDA",
+        intrinsic_score=0.74,
+        stage_1_reason="multi-source",
+        thesis_text="Multi-source confirmation.",
+        conviction_score=0.65,
+        screener_evidence=[
+            {"screener": "sector_rotation", "rs_rank_now": 2,
+             "rs_rank_prior": 7, "basis_days": 30},
+            {"screener": "pead"},
+        ],
     )
-    brief = _empty_brief(setups=[setup])
-    out = render_brief_top_level(brief)
-    setups_idx = out.index("## Setups")
-    opp_idx = out.index("## Opportunity surface")
-    assert setups_idx < opp_idx, (
-        "## Setups must render before ## Opportunity surface; "
-        f"setups_idx={setups_idx}, opp_idx={opp_idx}"
-    )
+    out = render_brief_top_level(_brief_with_items([item]))
+    assert "[sector_rotation: rank 7→2 on 30d basis]" in out
+    assert "[pead]" in out
 
 
 @pytest.mark.parametrize("screener_name", ["sector_rotation"])
 def test_screener_stages_have_zero_cost(tmp_path: Path, screener_name: str) -> None:
     """No-LLM-at-screener contract: any trace event tagged with a screener
-    stage MUST have cost_usd == 0. Pins the architectural invariant the plan
-    calls out (PR 1.3 acceptance criterion)."""
+    stage MUST have cost_usd == 0. Architectural invariant — preserved
+    across PR 1.3 → PR 2A.1."""
     trace_dir = tmp_path / "traces" / "2026-05-25"
     trace_dir.mkdir(parents=True)
     chain_id = "20260525T093000-zero01"
