@@ -247,7 +247,11 @@ async def _stage_2_for_survivor(
     (the chain_id is shared across all survivors in a brief).
     """
     async with semaphore:
-        from research_assistant.orchestrator import _stage_2_note
+        from dataclasses import replace as _dc_replace
+        from research_assistant.orchestrator import (
+            _stage_2_note,
+            _stage_2_skeptic_check,
+        )
         note, s2_meta = await _stage_2_note(
             client, world_state, ticker_data, headlines,
             insider_activity=insider_activity,
@@ -284,7 +288,31 @@ async def _stage_2_for_survivor(
             error=None if note else "Stage 2 note parse/schema failed",
             symbol=ticker,
         )
-        return note
+        if note is None:
+            return None
+        # PR 2A.3: inline Skeptic adversarial check. Runs under the SAME
+        # semaphore (already acquired above) so concurrent Skeptic + Stage 2
+        # calls stay within `_STAGE_2_CONCURRENCY`. Skeptic sees only the
+        # bull/bear anchors + composite — never the raw ticker_data — so
+        # the prompt rendering test in test_stage_2_skeptic asserts the
+        # structural data-isolation contract.
+        pre_skeptic = note.composite_conviction
+        verdict, reasoning, adjusted = await _stage_2_skeptic_check(
+            client, note,
+            chain_id=chain_id,
+            traces_base=traces_base,
+        )
+        # `composite_conviction` on the returned Stage2Note is the POST-
+        # Skeptic value; the pre-Skeptic geomean is preserved for trace /
+        # debug via `composite_conviction_pre_skeptic`. dataclasses.replace
+        # is the canonical Stage2Note(frozen=True) mutation path.
+        return _dc_replace(
+            note,
+            composite_conviction=adjusted,
+            skeptic_verdict=verdict,
+            skeptic_reasoning=reasoning,
+            composite_conviction_pre_skeptic=pre_skeptic,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +489,12 @@ async def build_brief(
 
 
 def _stage_2_note_to_cache_dict(note: Optional[Stage2Note]) -> Optional[dict]:
-    """Serialize a Stage2Note into the cache JSON shape. None passes through."""
+    """Serialize a Stage2Note into the cache JSON shape. None passes through.
+
+    PR 2A.3: `composite_conviction` here is the POST-Skeptic value (matches
+    the displayed conviction). The pre-Skeptic value is preserved as a
+    separate field for trace inspection.
+    """
     if note is None:
         return None
     return {
@@ -473,6 +506,11 @@ def _stage_2_note_to_cache_dict(note: Optional[Stage2Note]) -> Optional[dict]:
         "conviction": dict(note.conviction),
         "composite_conviction": note.composite_conviction,
         "decision_tag": note.decision_tag,
+        # PR 2A.3 fields. Backward-compat readers (cli._brief_item_from_cache)
+        # default these to UNAVAILABLE / "" / None when absent.
+        "skeptic_verdict": note.skeptic_verdict,
+        "skeptic_reasoning": note.skeptic_reasoning,
+        "composite_conviction_pre_skeptic": note.composite_conviction_pre_skeptic,
     }
 
 
@@ -594,7 +632,38 @@ def _render_item_block(item: BriefItem) -> str:
             body.append(f"- {trigger}")
     body.append("")
     body.append(_format_conviction_line(note.conviction))
+    body.append(_format_skeptic_line(note))
     return "\n".join(body)
+
+
+def _format_skeptic_line(note: Stage2Note) -> str:
+    """Render the inline Skeptic verdict + reasoning (PR 2A.3).
+
+    Format:
+      AGREE             → `Skeptic: agreed`
+      WEAKEN            → `Skeptic: WEAKEN -15%  ·  <reasoning>`
+      STRONG_OBJECTION  → `Skeptic: STRONG_OBJECTION -35%  ·  <reasoning>`
+      UNAVAILABLE       → `Skeptic: (unavailable)`
+
+    Multipliers come from `SKEPTIC_ADJUSTMENT_MULTIPLIERS`; the percentage
+    shown is `(1 - multiplier) * 100` so render stays in sync with the
+    actual adjustment math (tuning the multiplier auto-tunes the render).
+    """
+    from research_assistant.orchestrator import SKEPTIC_ADJUSTMENT_MULTIPLIERS
+
+    verdict = note.skeptic_verdict
+    if verdict == "AGREE":
+        return "Skeptic: agreed"
+    if verdict == "UNAVAILABLE":
+        return "Skeptic: (unavailable)"
+    if verdict in ("WEAKEN", "STRONG_OBJECTION"):
+        multiplier = SKEPTIC_ADJUSTMENT_MULTIPLIERS.get(verdict, 1.0)
+        drop_pct = int(round((1.0 - multiplier) * 100))
+        reasoning = note.skeptic_reasoning or "(no reasoning)"
+        return f"Skeptic: {verdict} -{drop_pct}%  ·  {reasoning}"
+    # Defensive: unknown verdict (shouldn't happen — orchestrator clamps to
+    # SKEPTIC_VERDICTS) — render the raw string rather than crash the brief.
+    return f"Skeptic: {verdict}"
 
 
 def _format_conviction_line(conviction: dict[str, float]) -> str:
@@ -690,6 +759,13 @@ def render_brief_drill_down(brief: Brief, ticker: str) -> str:
             lines.append(f"- {trigger}")
         lines.append("")
     lines.append(_format_conviction_line(note.conviction))
+    lines.append(_format_skeptic_line(note))
+    if note.composite_conviction_pre_skeptic is not None and note.skeptic_verdict in (
+        "WEAKEN", "STRONG_OBJECTION",
+    ):
+        lines.append(
+            f"_Composite pre-Skeptic: {note.composite_conviction_pre_skeptic:.2f}_"
+        )
     lines.append("")
     lines.append(f"_Run `/research {item.ticker}` for full Skeptic + Defender DD._")
     return "\n".join(lines)

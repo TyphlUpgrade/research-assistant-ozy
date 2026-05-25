@@ -534,6 +534,10 @@ def _brief_item_from_cache(raw: dict) -> "BriefItem":
             composite = raw_note.get("composite_conviction")
             if composite is None:
                 composite = compute_composite_conviction(conviction)
+            # PR 2A.3: skeptic_* fields default to UNAVAILABLE on legacy
+            # caches (pre-2A.3) so the operator sees an explicit
+            # "Skeptic didn't run" tag rather than the brief crashing.
+            pre_skeptic_raw = raw_note.get("composite_conviction_pre_skeptic")
             stage_2_note = Stage2Note(
                 ticker=str(raw_note.get("ticker", raw["ticker"])).upper(),
                 observation=tuple(raw_note.get("observation") or ()),
@@ -543,6 +547,13 @@ def _brief_item_from_cache(raw: dict) -> "BriefItem":
                 conviction=conviction,
                 composite_conviction=float(composite),
                 decision_tag=str(raw_note.get("decision_tag", "WATCH")).upper(),
+                skeptic_verdict=str(
+                    raw_note.get("skeptic_verdict", "UNAVAILABLE"),
+                ).upper(),
+                skeptic_reasoning=str(raw_note.get("skeptic_reasoning", "")),
+                composite_conviction_pre_skeptic=(
+                    float(pre_skeptic_raw) if pre_skeptic_raw is not None else None
+                ),
             )
         except (TypeError, ValueError):
             stage_2_note = None

@@ -65,6 +65,26 @@ STAGE2_CONVICTION_DIMENSIONS: tuple[str, ...] = (
     "technical", "fundamental", "catalyst", "regime",
 )
 
+# Inline-Skeptic verdict enum (PR 2A.3). UNAVAILABLE is the graceful-degrade
+# sentinel used when the Skeptic call fails (network / parse / API outage);
+# operator should NOT treat UNAVAILABLE as AGREE — it's "we don't know".
+SKEPTIC_VERDICTS: tuple[str, ...] = (
+    "AGREE", "WEAKEN", "STRONG_OBJECTION", "UNAVAILABLE",
+)
+
+# Discrete adjustment multipliers applied to `composite_conviction` based on
+# Skeptic verdict. AGREE leaves the score unchanged; WEAKEN is a moderate
+# down-adjustment (~15%); STRONG_OBJECTION is a sharp down-adjustment (~35%).
+# UNAVAILABLE → 1.0 (no adjustment; we preserve the original score and rely on
+# the verdict tag to signal "Skeptic didn't run" to the operator). Module-level
+# so tuning is one edit, not buried in the helper.
+SKEPTIC_ADJUSTMENT_MULTIPLIERS: dict[str, float] = {
+    "AGREE": 1.00,
+    "WEAKEN": 0.85,
+    "STRONG_OBJECTION": 0.65,
+    "UNAVAILABLE": 1.00,
+}
+
 
 @dataclass(frozen=True)
 class Stage2Note:
@@ -91,8 +111,17 @@ class Stage2Note:
     bear_anchor: str
     what_would_change: tuple[str, ...]
     conviction: dict[str, float]                  # {technical, fundamental, catalyst, regime}
-    composite_conviction: float                   # geometric mean — see compute_composite_conviction
+    composite_conviction: float                   # POST-Skeptic value (see PR 2A.3 below)
     decision_tag: str                             # one of STAGE2_DECISION_TAGS
+    # PR 2A.3: inline Skeptic adversarial check. `composite_conviction`
+    # above is the POST-Skeptic value (displayed to operator). The pre-
+    # Skeptic geometric mean is preserved in `composite_conviction_pre_skeptic`
+    # for trace / debug. New fields default so cached Stage2Notes from
+    # before PR 2A.3 deserialize without crash; backward-compat path in
+    # cli._brief_item_from_cache also passes UNAVAILABLE explicitly.
+    skeptic_verdict: str = "UNAVAILABLE"          # one of SKEPTIC_VERDICTS
+    skeptic_reasoning: str = ""
+    composite_conviction_pre_skeptic: Optional[float] = None
 
 
 def compute_composite_conviction(conviction: dict[str, float]) -> float:
@@ -369,6 +398,100 @@ async def _stage_2_note(
         log.warning("Stage2Note parse failed (%s); raw=%r", exc, raw)
         return None, result
     return note, result
+
+
+async def _stage_2_skeptic_check(
+    client: ClaudeClient,
+    note: Stage2Note,
+    *,
+    chain_id: str,
+    traces_base: Path,
+) -> tuple[str, str, float]:
+    """Inline Skeptic adversarial pass on a Stage2Note (PR 2A.3).
+
+    Returns `(verdict, reasoning, composite_after_adjustment)`.
+
+    Skeptic challenges the bull/bear anchors and emits a discrete verdict that
+    drives a multiplicative adjustment to `composite_conviction`:
+        AGREE → 1.00
+        WEAKEN → 0.85
+        STRONG_OBJECTION → 0.65
+
+    Data isolation: the Skeptic prompt receives ONLY `bull_anchor`,
+    `bear_anchor`, and `composite_conviction`. NOT ticker_data, NOT headlines,
+    NOT screener evidence. If it had full data it would just be a second
+    Stage 2; the structural point of an adversarial pass is to challenge the
+    *read*, not redo the analysis.
+
+    Graceful degrade: on network failure, parse failure, or invalid verdict,
+    returns `("UNAVAILABLE", "(Skeptic call failed)", note.composite_conviction)`.
+    The brief still ships; the operator sees the explicit UNAVAILABLE tag and
+    can re-run or run `/research <TICKER>` for the full Stage 3 pass.
+
+    Emits a `stage_2_skeptic_check` trace event (distinct stage_id from
+    Stage 3 Skeptic in /research) so cost + verdict are visible in /trace.
+    """
+    template = _load_prompt("stage_2_skeptic_check")
+    prompt = _render(
+        template,
+        bull_anchor=note.bull_anchor,
+        bear_anchor=note.bear_anchor,
+        composite_conviction=f"{note.composite_conviction:.4f}",
+    )
+
+    parsed: Optional[dict] = None
+    s_meta: Optional[CallResult] = None
+    error: Optional[str] = None
+    try:
+        s_meta = await client.call(prompt, model="claude-sonnet-4-6")
+        parsed = parse_claude_response(s_meta.text)
+        if parsed is None:
+            error = "Skeptic JSON parse failed"
+    except Exception as exc:  # network / API outage / unexpected SDK error
+        log.warning("Skeptic call failed for %s: %s", note.ticker, exc)
+        error = f"Skeptic call exception: {type(exc).__name__}"
+
+    verdict = "UNAVAILABLE"
+    reasoning = "(Skeptic call failed)"
+    if parsed is not None:
+        raw_verdict = str(parsed.get("verdict", "")).strip().upper()
+        # Only the three live verdicts are valid model output. UNAVAILABLE is
+        # reserved for the graceful-degrade path — if a model emits it,
+        # treat as parse failure (don't let the LLM short-circuit the check).
+        if raw_verdict in ("AGREE", "WEAKEN", "STRONG_OBJECTION"):
+            verdict = raw_verdict
+            reasoning = str(parsed.get("reasoning", "")).strip() or "(no reasoning)"
+        else:
+            log.warning(
+                "Skeptic returned unknown verdict for %s: %r",
+                note.ticker, parsed.get("verdict"),
+            )
+            error = f"Skeptic unknown verdict: {parsed.get('verdict')!r}"
+
+    multiplier = SKEPTIC_ADJUSTMENT_MULTIPLIERS.get(verdict, 1.0)
+    adjusted = max(0.0, min(1.0, note.composite_conviction * multiplier))
+
+    append_stage_event(
+        chain_id=chain_id,
+        stage_id="stage_2_skeptic_check",
+        model=s_meta.model if s_meta else "claude-sonnet-4-6",
+        tokens_in=s_meta.input_tokens if s_meta else 0,
+        tokens_out=s_meta.output_tokens if s_meta else 0,
+        cost_usd=s_meta.cost_usd if s_meta else 0.0,
+        latency_ms=s_meta.latency_ms if s_meta else 0,
+        parsed={
+            "verdict": verdict,
+            "reasoning": reasoning,
+            "composite_pre": note.composite_conviction,
+            "composite_post": adjusted,
+            "multiplier": multiplier,
+        },
+        raw_response=s_meta.text if s_meta else None,
+        traces_base=traces_base,
+        error=error,
+        symbol=note.ticker,
+    )
+    return verdict, reasoning, adjusted
 
 
 async def _stage_3_skeptic(
