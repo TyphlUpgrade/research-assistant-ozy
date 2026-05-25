@@ -156,6 +156,36 @@ def test_review_export_csv(tmp_path: Path, capsys) -> None:
     assert expected_cols.issubset(set(rows[0].keys()))
 
 
+def test_export_csv_escapes_formula_injection(tmp_path: Path) -> None:
+    """OWASP-recommended: values starting with =, +, -, @, tab, CR must
+    be prefixed with ' so Excel/LibreOffice/Numbers render as text, not
+    formulas. Today's fields are all numeric/symbol but the journal
+    accepts arbitrary string evidence — guard before PR 2.2 widens it."""
+    asof = date.today().isoformat()
+    _write_alerts(tmp_path, asof, [
+        _row(ticker="=cmd|'/c calc'!A1", screener="sector_rotation", asof=asof),
+        _row(ticker="+SUM(1+1)", screener="sector_rotation", asof=asof),
+        _row(ticker="@formula", screener="sector_rotation", asof=asof),
+        _row(ticker="-1", screener="sector_rotation", asof=asof),
+        _row(ticker="XLK", screener="sector_rotation", asof=asof),  # benign baseline
+    ])
+    csv_path = tmp_path / "out" / "injection.csv"
+    rc = cli.main([
+        "--base", str(tmp_path),
+        "alerts", "review", "--window", "30d",
+        "--export-csv", str(csv_path),
+    ])
+    assert rc == 0
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    tickers = {r["ticker"] for r in rows}
+    assert "'=cmd|'/c calc'!A1" in tickers, "formula-prefix '=' must be escaped"
+    assert "'+SUM(1+1)" in tickers, "formula-prefix '+' must be escaped"
+    assert "'@formula" in tickers, "formula-prefix '@' must be escaped"
+    assert "'-1" in tickers, "formula-prefix '-' must be escaped"
+    assert "XLK" in tickers, "benign values pass through unchanged"
+
+
 @pytest.mark.parametrize("window", ["7d", "30d", "90d"])
 def test_review_window_arg_format(tmp_path: Path, window: str, capsys) -> None:
     rc = cli.main([

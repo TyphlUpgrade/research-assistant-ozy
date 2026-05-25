@@ -54,10 +54,12 @@ def compute_sector_performance(ticker_data: dict) -> dict:
     `data_loader._instrument_snapshot` already populated them) so screeners
     can see the raw numbers they need.
 
-    Field-name mapping:
-      ticker_data[etf]["return_5d"]   → snapshot["return_5d"]
-      ticker_data[etf]["return_30d"]  → snapshot["return_30d"]
-      ticker_data[etf]["price"]       → snapshot["price"]  (used as entry_price)
+    Field-name mapping (reads either key for return_5d because
+    `load_ticker_data` writes `recent_return_5d` while
+    `_instrument_snapshot` writes `return_5d`):
+      ticker_data[etf]["return_5d"] or ["recent_return_5d"]  → snapshot["return_5d"]
+      ticker_data[etf]["return_30d"]                          → snapshot["return_30d"]
+      ticker_data[etf]["price"]                               → snapshot["price"]
 
     Skips ETFs missing from `ticker_data` or lacking both return fields;
     returns whatever's available. Empty dict if nothing usable.
@@ -69,7 +71,7 @@ def compute_sector_performance(ticker_data: dict) -> dict:
         td = ticker_data.get(etf) or ticker_data.get(etf.upper())
         if not isinstance(td, dict):
             continue
-        r5 = td.get("return_5d")
+        r5 = td.get("return_5d") if td.get("return_5d") is not None else td.get("recent_return_5d")
         r30 = td.get("return_30d")
         if r5 is None and r30 is None:
             continue

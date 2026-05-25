@@ -821,9 +821,26 @@ def _render_alerts_review(
     return "\n".join(lines)
 
 
+# Spreadsheet formula prefixes — values starting with these are interpreted
+# as formulas by Excel/LibreOffice/Numbers on CSV open. Prefix with a single
+# quote so they render as plain text (OWASP-recommended escape).
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value):
+    """Escape leading formula characters; pass through None and numerics."""
+    if value is None or isinstance(value, (int, float)):
+        return value
+    s = str(value)
+    if s and s[0] in _CSV_FORMULA_PREFIXES:
+        return "'" + s
+    return s
+
+
 def _export_alerts_csv(alerts: list[dict], path: Path) -> None:
     """Flat CSV: one row per alert. Stable column order so operator
-    spreadsheets stay readable across runs."""
+    spreadsheets stay readable across runs. String fields are sanitized
+    against CSV formula injection."""
     import csv
     fieldnames = [
         "asof", "ticker", "screener", "entry_price",
@@ -835,7 +852,7 @@ def _export_alerts_csv(alerts: list[dict], path: Path) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in alerts:
-            writer.writerow({k: row.get(k) for k in fieldnames})
+            writer.writerow({k: _csv_safe(row.get(k)) for k in fieldnames})
 
 
 async def _cmd_alerts(args: argparse.Namespace) -> int:

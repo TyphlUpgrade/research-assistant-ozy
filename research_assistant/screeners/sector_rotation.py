@@ -129,7 +129,7 @@ def evaluate(
                     "rs_rank_prior": rp,
                     "basis_days": 30,
                     "return_5d": r5,
-                    "return_20d": r30,  # labelled return_20d per plan evidence shape
+                    "return_30d": r30,
                 },
             )
         )
@@ -146,7 +146,7 @@ def _render_line(c: SetupCandidate) -> str:
     return (
         f"- **{c.ticker}** (sector_rotation) — "
         f"rank {e['rs_rank_prior']}→{e['rs_rank_now']} on {e['basis_days']}d basis; "
-        f"5d {e['return_5d']:+.1%} / 20d {e['return_20d']:+.1%}"
+        f"5d {e['return_5d']:+.1%} / 30d {e['return_30d']:+.1%}"
     )
 
 

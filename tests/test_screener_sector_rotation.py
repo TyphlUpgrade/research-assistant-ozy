@@ -97,7 +97,7 @@ def test_fires_on_bottom_half_to_top_quartile_shift():
     assert c.evidence["rs_rank_prior"] == 7
     assert c.evidence["basis_days"] == 30
     assert "return_5d" in c.evidence
-    assert "return_20d" in c.evidence
+    assert "return_30d" in c.evidence
 
 
 def test_no_shift_suppresses():

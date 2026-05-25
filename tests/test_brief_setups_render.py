@@ -54,7 +54,7 @@ def test_renders_single_setup() -> None:
             "rs_rank_prior": 7,
             "basis_days": 30,
             "return_5d": 0.045,
-            "return_20d": 0.11,
+            "return_30d": 0.11,
         },
     )
     brief = _empty_brief(setups=[setup])
@@ -78,7 +78,7 @@ def test_setups_section_above_opportunity_surface() -> None:
             "rs_rank_prior": 7,
             "basis_days": 30,
             "return_5d": 0.045,
-            "return_20d": 0.11,
+            "return_30d": 0.11,
         },
     )
     brief = _empty_brief(setups=[setup])
