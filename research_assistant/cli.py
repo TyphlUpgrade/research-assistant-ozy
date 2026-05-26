@@ -507,6 +507,30 @@ def _attach_screener_evidence(items: list, screener_alerts: list) -> None:
         item.screener_evidence = list(grouped.get(item.ticker.upper(), []))
 
 
+def _append_cache_hit_screener_stubs(
+    brief: "Brief",
+    screener_alerts: list,
+    world_state: dict,
+) -> None:
+    """Cache-hit-path mirror of `_screener_only_stub_items` in build_brief.
+
+    When a re-run within the same ET day surfaces screener hits on tickers
+    absent from the cached items (e.g. sector ETFs the cached brief never
+    saw), append stub items in-place so the operator-facing render shows
+    them. Without this, today's XLV alert would still be invisible if the
+    cached brief was built before sector_rotation fired on it.
+    """
+    from research_assistant.brief import _screener_only_stub_items
+
+    stubs = _screener_only_stub_items(
+        screener_alerts=screener_alerts,
+        existing_items=brief.items,
+        world_state=world_state,
+        chain_id=brief.chain_id,
+    )
+    brief.items.extend(stubs)
+
+
 def _brief_item_from_cache(raw: dict) -> "BriefItem":
     """Construct a BriefItem from a cached dict.
 
@@ -676,6 +700,13 @@ async def _load_or_build_brief(
         cache_hit_alerts = await _maybe_run_screeners(inputs, "hit")
         if cache_hit_alerts:
             _attach_screener_evidence(brief.items, cache_hit_alerts)
+            # PR 2A.6: stub-inject screener-only tickers (alerts whose
+            # ticker isn't in the cached items list). Mirrors the
+            # build_brief cache-miss path so re-runs surface screener
+            # hits on non-watchlist tickers (sector ETFs) too.
+            _append_cache_hit_screener_stubs(
+                brief, cache_hit_alerts, inputs.world_state,
+            )
         return brief, inputs, "hit"
 
     # Cache-miss path.

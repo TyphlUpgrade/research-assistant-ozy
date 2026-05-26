@@ -498,6 +498,20 @@ async def build_brief(
             )
         items.append(item)
 
+    # PR 2A.6: append stub items for screener-emitted tickers that aren't
+    # in the watchlist universe (e.g. sector ETFs from sector_rotation).
+    # Without this, journaled alerts on non-watchlist tickers never reach
+    # the operator-facing surface — they only land in the journal. Stubs
+    # skip Stage 2 (the prompt is built for individual stocks, not ETFs;
+    # also saves LLM cost). The screener evidence renders inline so the
+    # operator sees the rotation flag without `/research`.
+    items.extend(_screener_only_stub_items(
+        screener_alerts=screener_alerts,
+        existing_items=items,
+        world_state=world_state,
+        chain_id=chain,
+    ))
+
     brief = Brief(
         date_et=date_et,
         chain_id=chain,
@@ -514,6 +528,83 @@ async def build_brief(
     write_brief_cache(brief, research_base)
 
     return brief
+
+
+def _synthesize_screener_ticker_data(
+    ticker: str, world_state: dict,
+) -> dict:
+    """Minimal ticker_data shape for a screener-emitted ticker not in the
+    watchlist load. Sector ETFs pull return_5d/return_30d/price from
+    `world_state["sector_performance"]`; other tickers return just the
+    symbol — the composite scoring degrades gracefully via `_finite()`
+    defaults so the screener bonus still lifts the score off baseline.
+    """
+    upper = ticker.upper()
+    data: dict = {"symbol": upper}
+    sector_perf = (
+        world_state.get("sector_performance")
+        if isinstance(world_state, dict) else None
+    )
+    if isinstance(sector_perf, dict):
+        snap = sector_perf.get(upper)
+        if isinstance(snap, dict):
+            r5 = snap.get("return_5d")
+            if r5 is not None:
+                data["recent_return_5d"] = r5
+            r30 = snap.get("return_30d")
+            if r30 is not None:
+                data["return_30d"] = r30
+            price = snap.get("price")
+            if price is not None:
+                data["price"] = price
+    return data
+
+
+def _screener_only_stub_items(
+    *,
+    screener_alerts: list[SetupCandidate],
+    existing_items: list[BriefItem],
+    world_state: dict,
+    chain_id: str,
+) -> list[BriefItem]:
+    """Build stub BriefItems for screener-emitted tickers that aren't in
+    `existing_items`. Each stub gets a meaningful `intrinsic_score` from
+    `compute_intrinsic_score` (so the operator sees baseline + regime +
+    screener bonus, typically ~0.40 for a single-source ETF rotation in
+    a bull regime) and renders with the screener evidence inline.
+    """
+    from research_assistant.composite import compute_intrinsic_score
+
+    existing = {item.ticker.upper() for item in existing_items}
+    grouped: dict[str, list[SetupCandidate]] = {}
+    for alert in screener_alerts:
+        upper = alert.ticker.upper()
+        if upper in existing:
+            continue
+        grouped.setdefault(upper, []).append(alert)
+
+    stubs: list[BriefItem] = []
+    for ticker in sorted(grouped):
+        alerts_for_ticker = grouped[ticker]
+        synthesized = _synthesize_screener_ticker_data(ticker, world_state)
+        score, breakdown = compute_intrinsic_score(
+            ticker_data=synthesized,
+            insider_summary=None,
+            world_state=world_state,
+            screener_alerts=alerts_for_ticker,
+        )
+        evidence = [
+            {"screener": a.screener, **(a.evidence or {})}
+            for a in alerts_for_ticker
+        ]
+        stubs.append(BriefItem(
+            ticker=ticker,
+            intrinsic_score=score,
+            stage_1_reason=_breakdown_summary(breakdown) or "(screener-only)",
+            screener_evidence=evidence,
+            chain_id=chain_id,
+        ))
+    return stubs
 
 
 def _stage_2_note_to_cache_dict(note: Optional[Stage2Note]) -> Optional[dict]:
