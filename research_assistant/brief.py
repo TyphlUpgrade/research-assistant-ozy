@@ -758,14 +758,17 @@ def _render_item_block(item: BriefItem) -> str:
 
 
 def _format_skeptic_line(note: Stage2Note) -> str:
-    """Render the inline Skeptic verdict + reasoning (PR 2A.3).
+    """Render the inline Skeptic verdict + reasoning (PR 2A.3 / PR 2A.7).
 
     Format:
-      AGREE             → `Skeptic: agreed`
+      AGREE             → `Skeptic: AGREE  ·  <reasoning>`
       WEAKEN            → `Skeptic: WEAKEN -15%  ·  <reasoning>`
       STRONG_OBJECTION  → `Skeptic: STRONG_OBJECTION -35%  ·  <reasoning>`
       UNAVAILABLE       → `Skeptic: (unavailable)`
 
+    PR 2A.7: AGREE now surfaces its reasoning (which the new prompt requires)
+    instead of being collapsed to "agreed" — that collapse was the
+    asymmetric-cost defect that biased the model toward objection verdicts.
     Multipliers come from `SKEPTIC_ADJUSTMENT_MULTIPLIERS`; the percentage
     shown is `(1 - multiplier) * 100` so render stays in sync with the
     actual adjustment math (tuning the multiplier auto-tunes the render).
@@ -773,14 +776,14 @@ def _format_skeptic_line(note: Stage2Note) -> str:
     from research_assistant.orchestrator import SKEPTIC_ADJUSTMENT_MULTIPLIERS
 
     verdict = note.skeptic_verdict
-    if verdict == "AGREE":
-        return "Skeptic: agreed"
     if verdict == "UNAVAILABLE":
         return "Skeptic: (unavailable)"
-    if verdict in ("WEAKEN", "STRONG_OBJECTION"):
+    if verdict in ("AGREE", "WEAKEN", "STRONG_OBJECTION"):
+        reasoning = note.skeptic_reasoning or "(no reasoning)"
+        if verdict == "AGREE":
+            return f"Skeptic: AGREE  ·  {reasoning}"
         multiplier = SKEPTIC_ADJUSTMENT_MULTIPLIERS.get(verdict, 1.0)
         drop_pct = int(round((1.0 - multiplier) * 100))
-        reasoning = note.skeptic_reasoning or "(no reasoning)"
         return f"Skeptic: {verdict} -{drop_pct}%  ·  {reasoning}"
     # Defensive: unknown verdict (shouldn't happen — orchestrator clamps to
     # SKEPTIC_VERDICTS) — render the raw string rather than crash the brief.

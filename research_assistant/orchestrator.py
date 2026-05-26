@@ -450,11 +450,13 @@ async def _stage_2_skeptic_check(
         WEAKEN → 0.85
         STRONG_OBJECTION → 0.65
 
-    Data isolation: the Skeptic prompt receives ONLY `bull_anchor`,
-    `bear_anchor`, and `composite_conviction`. NOT ticker_data, NOT headlines,
-    NOT screener evidence. If it had full data it would just be a second
-    Stage 2; the structural point of an adversarial pass is to challenge the
-    *read*, not redo the analysis.
+    Data isolation: the Skeptic prompt receives ONLY `bull_anchor` and
+    `bear_anchor`. NOT composite_conviction (PR 2A.7 — removed because the
+    model was using it as an "already priced upstream" escape valve to
+    AGREE on everything), NOT ticker_data, NOT headlines, NOT screener
+    evidence. The structural point of an adversarial pass is to challenge
+    the *read* on the anchors alone, not redo the analysis or rationalise
+    an upstream score.
 
     Graceful degrade: on network failure, parse failure, or invalid verdict,
     returns `("UNAVAILABLE", "(Skeptic call failed)", note.composite_conviction)`.
@@ -469,7 +471,6 @@ async def _stage_2_skeptic_check(
         template,
         bull_anchor=note.bull_anchor,
         bear_anchor=note.bear_anchor,
-        composite_conviction=f"{note.composite_conviction:.4f}",
     )
 
     parsed: Optional[dict] = None

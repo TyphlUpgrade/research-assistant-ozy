@@ -199,10 +199,12 @@ def test_skeptic_multiplier_table_pins_adjustment_math() -> None:
 async def test_skeptic_prompt_only_includes_anchors_not_full_data(
     tmp_path: Path,
 ) -> None:
-    """Critical contract: the Skeptic sees ONLY bull_anchor + bear_anchor +
-    composite_conviction. NOT observation, ticker_data, headlines, or
-    screener evidence. If Skeptic had full data it would just be a second
-    Stage 2 — defeating the structural point of an adversarial pass."""
+    """Critical contract: the Skeptic sees ONLY bull_anchor + bear_anchor.
+    NOT composite_conviction (PR 2A.7 — was giving the model an "already
+    priced upstream" escape valve to reflexively AGREE), NOT observation,
+    NOT ticker_data, NOT headlines, NOT screener evidence. If Skeptic had
+    full data it would just be a second Stage 2 — defeating the structural
+    point of an adversarial pass."""
     note = _sample_note()
     client = _FakeClient(json.dumps({"verdict": "AGREE", "reasoning": "agreed"}))
     await _stage_2_skeptic_check(
@@ -212,10 +214,12 @@ async def test_skeptic_prompt_only_includes_anchors_not_full_data(
     )
     prompt = client.last_prompt or ""
 
-    # ALLOWED: the two anchors + composite_conviction.
+    # ALLOWED: the two anchors only.
     assert note.bull_anchor in prompt
     assert note.bear_anchor in prompt
-    assert f"{note.composite_conviction:.4f}" in prompt
+    # FORBIDDEN (PR 2A.7): composite_conviction must not appear — see
+    # docstring above.
+    assert f"{note.composite_conviction:.4f}" not in prompt
 
     # FORBIDDEN: full-data leakage. Each of these should NOT appear in the
     # rendered prompt.
