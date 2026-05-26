@@ -372,3 +372,78 @@ async def test_stage_2_note_invocation_renders_prompt_without_stage_1(
     # not Stage 1). But intrinsic_score / breakdown must not appear there
     # either.
     assert "intrinsic_score" not in captured["system"]
+
+
+# ---------------------------------------------------------------------------
+# PR 2A.5 — CRITICAL #1: caller ticker wins over LLM payload ticker
+# ---------------------------------------------------------------------------
+
+def test_parse_stage2_note_ignores_llm_ticker_when_default_set() -> None:
+    """SECURITY: when default_ticker is provided the LLM payload ticker is
+    ignored — a prompt-injected response can't steer the file write path."""
+    payload = _valid_payload(ticker="ATTACKER")
+    note = parse_stage2_note(payload, default_ticker="NVDA")
+    assert note.ticker == "NVDA"
+
+
+def test_parse_stage2_note_uses_payload_ticker_when_no_default() -> None:
+    """When no default_ticker is supplied the payload ticker is used normally."""
+    payload = _valid_payload(ticker="NVDA")
+    note = parse_stage2_note(payload, default_ticker=None)
+    assert note.ticker == "NVDA"
+
+
+# ---------------------------------------------------------------------------
+# PR 2A.5 — MEDIUM #5: NaN / Inf rejection in conviction dimensions
+# ---------------------------------------------------------------------------
+
+def test_parse_stage2_note_rejects_nan_conviction() -> None:
+    """NaN in any conviction dimension must raise ValueError."""
+    payload = _valid_payload(conviction={
+        "technical": float("nan"),
+        "fundamental": 0.5,
+        "catalyst": 0.5,
+        "regime": 0.5,
+    })
+    with pytest.raises(ValueError, match="not finite"):
+        parse_stage2_note(payload)
+
+
+def test_parse_stage2_note_rejects_inf_conviction() -> None:
+    """Inf in any conviction dimension must raise ValueError."""
+    payload = _valid_payload(conviction={
+        "technical": 0.5,
+        "fundamental": float("inf"),
+        "catalyst": 0.5,
+        "regime": 0.5,
+    })
+    with pytest.raises(ValueError, match="not finite"):
+        parse_stage2_note(payload)
+
+
+def test_parse_stage2_note_clamps_out_of_range_conviction() -> None:
+    """Values outside [0, 1] are clamped, not rejected."""
+    payload = _valid_payload(conviction={
+        "technical": 1.5,    # clamps to 1.0
+        "fundamental": -0.2, # clamps to 0.0
+        "catalyst": 0.5,
+        "regime": 0.5,
+    })
+    note = parse_stage2_note(payload)
+    assert note.conviction["technical"] == pytest.approx(1.0)
+    assert note.conviction["fundamental"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# PR 2A.5 — MAJOR #1: conviction is a read-only MappingProxyType
+# ---------------------------------------------------------------------------
+
+def test_stage2note_conviction_is_immutable() -> None:
+    """Smoke #4: note.conviction['technical'] = 999 must raise TypeError.
+
+    Stage2Note is frozen=True but plain dicts are mutable in-place.
+    MappingProxyType blocks the mutation and matches the frozen intent.
+    """
+    note = parse_stage2_note(_valid_payload())
+    with pytest.raises(TypeError):
+        note.conviction["technical"] = 999  # type: ignore[index]

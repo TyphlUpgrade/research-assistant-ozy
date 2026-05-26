@@ -20,11 +20,13 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from types import MappingProxyType
+from typing import Any, Mapping, Optional
 
 from research_assistant.claude_sdk import CallResult, ClaudeClient
 from research_assistant.dossier_io import (
@@ -110,7 +112,7 @@ class Stage2Note:
     bull_anchor: str
     bear_anchor: str
     what_would_change: tuple[str, ...]
-    conviction: dict[str, float]                  # {technical, fundamental, catalyst, regime}
+    conviction: Mapping[str, float]                # {technical, fundamental, catalyst, regime} — MappingProxyType at runtime
     composite_conviction: float                   # POST-Skeptic value (see PR 2A.3 below)
     decision_tag: str                             # one of STAGE2_DECISION_TAGS
     # PR 2A.3: inline Skeptic adversarial check. `composite_conviction`
@@ -171,10 +173,14 @@ def parse_stage2_note(payload: dict, *, default_ticker: Optional[str] = None) ->
       - `decision_tag` arriving in unexpected case → uppercase + validate
         against STAGE2_DECISION_TAGS.
     """
-    if default_ticker is None:
-        ticker = str(payload.get("ticker", "")).upper()
+    # SECURITY: caller-supplied ticker wins unconditionally when provided.
+    # The LLM output is untrusted; allowing payload["ticker"] to override
+    # default_ticker means a prompt-injected response can drive arbitrary
+    # downstream file writes (stage2 journal path).
+    if default_ticker is not None:
+        ticker = str(default_ticker).strip().upper()
     else:
-        ticker = str(payload.get("ticker", default_ticker)).upper()
+        ticker = str(payload.get("ticker", "")).strip().upper()
     if not ticker:
         raise ValueError("Stage2Note missing required field: ticker")
 
@@ -212,12 +218,18 @@ def parse_stage2_note(payload: dict, *, default_ticker: Optional[str] = None) ->
     for dim in STAGE2_CONVICTION_DIMENSIONS:
         if dim not in raw_conviction:
             raise ValueError(f"Stage2Note conviction missing dimension: {dim}")
+        raw = raw_conviction[dim]
         try:
-            conviction[dim] = float(raw_conviction[dim])
+            v = float(raw)
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                f"Stage2Note conviction[{dim!r}] must be numeric; got {raw_conviction[dim]!r}"
+                f"Stage2Note conviction[{dim!r}] not numeric: {raw!r}"
             ) from exc
+        if math.isnan(v) or math.isinf(v):
+            raise ValueError(
+                f"Stage2Note conviction[{dim!r}] not finite: {raw!r}"
+            )
+        conviction[dim] = max(0.0, min(1.0, v))
 
     raw_tag = payload.get("decision_tag")
     if raw_tag is None:
@@ -243,7 +255,7 @@ def parse_stage2_note(payload: dict, *, default_ticker: Optional[str] = None) ->
         bull_anchor=bull_anchor,
         bear_anchor=bear_anchor,
         what_would_change=what_would_change,
-        conviction=conviction,
+        conviction=MappingProxyType(conviction),  # frozen view — matches frozen=True intent
         composite_conviction=composite,
         decision_tag=decision_tag,
         trajectory_summary=trajectory_summary,

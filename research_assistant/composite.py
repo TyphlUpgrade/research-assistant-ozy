@@ -16,7 +16,8 @@ place (the plan calls out educated-guess weights to be refined after
 """
 from __future__ import annotations
 
-from typing import Optional
+import math
+from typing import Any, Optional
 
 from research_assistant.edgar import InsiderActivitySummary
 from research_assistant.screeners import SetupCandidate
@@ -144,6 +145,22 @@ def _clip(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def _finite(v: Any, default: float = 0.0) -> float:
+    """Coerce `v` to a finite float, falling back to `default` on NaN/Inf/error.
+
+    Applied to all numeric ticker_data inputs entering `compute_intrinsic_score`
+    so a NaN or Inf from a data-loader glitch can't propagate into the scoring
+    math or the breakdown dict.
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f):
+        return default
+    return f
+
+
 # ---------------------------------------------------------------------------
 # Public scoring function
 # ---------------------------------------------------------------------------
@@ -175,7 +192,7 @@ def compute_intrinsic_score(
     breakdown["regime_multiplier"] = mult
 
     # Trend strength (return_30d gated)
-    r30 = ticker_data.get("return_30d") or 0.0
+    r30 = _finite(ticker_data.get("return_30d"), 0.0)
     if r30 > TREND_STRONG_THRESHOLD:
         score += TREND_STRONG_BONUS
         breakdown["trend_strong"] = TREND_STRONG_BONUS
@@ -184,14 +201,14 @@ def compute_intrinsic_score(
         breakdown["trend_moderate"] = TREND_MODERATE_BONUS
 
     # Anti-parabolic penalty (hard cap)
-    r5 = ticker_data.get("recent_return_5d") or 0.0
-    rsi = ticker_data.get("weekly_rsi_14") or 50.0
+    r5 = _finite(ticker_data.get("recent_return_5d"), 0.0)
+    rsi = _finite(ticker_data.get("weekly_rsi_14"), 50.0)
     if rsi > PARABOLIC_RSI_THRESHOLD and r5 > PARABOLIC_RETURN_5D_THRESHOLD:
         score = min(score, PARABOLIC_SCORE_CAP)
         breakdown["parabolic_cap"] = True
 
     # Volume confirmation
-    vr = ticker_data.get("volume_ratio") or 1.0
+    vr = _finite(ticker_data.get("volume_ratio"), 1.0)
     if vr > VOLUME_RATIO_THRESHOLD:
         score += VOLUME_EXPANSION_BONUS
         breakdown["volume_expansion"] = VOLUME_EXPANSION_BONUS

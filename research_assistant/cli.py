@@ -521,6 +521,7 @@ def _brief_item_from_cache(raw: dict) -> "BriefItem":
         cache pre-2A.2 is one ET-day old; refresh re-runs Stage 2 against
         the new schema).
     """
+    from types import MappingProxyType
     from research_assistant.brief import BriefItem
     from research_assistant.orchestrator import Stage2Note, compute_composite_conviction
 
@@ -544,7 +545,7 @@ def _brief_item_from_cache(raw: dict) -> "BriefItem":
                 bull_anchor=str(raw_note.get("bull_anchor", "")),
                 bear_anchor=str(raw_note.get("bear_anchor", "")),
                 what_would_change=tuple(raw_note.get("what_would_change") or ()),
-                conviction=conviction,
+                conviction=MappingProxyType(conviction),  # frozen view — matches frozen=True intent
                 composite_conviction=float(composite),
                 decision_tag=str(raw_note.get("decision_tag", "WATCH")).upper(),
                 skeptic_verdict=str(
