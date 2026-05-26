@@ -4,21 +4,24 @@ MODEL_TIER: sonnet (default; Opus opt-in via config)
 DERIVED_FROM: ozymandias/config/prompts/v4.1.0/stage_3_skeptic.txt @ df4f8a00beb4ec577a1cff82f168893f4037d917
 DELTAS:
   - PR 2A.7: ADDED explicit four-tier verdict rubric with anchored Δ ranges
-    (CONFIRM / TEMPER / CHALLENGE / INVALIDATE). Pre-2A.7 the prompt
-    said "adjusted_score may equal conviction_score" but provided no
-    rubric, so the model defaulted to adversarial discount on every
-    thesis. Empirical evidence (HPQ 5/23: 0.46 → 0.22): the Skeptic
-    never chose the "thesis survives" path.
-  - CAPPED total discount at -0.30 unless verdict is INVALIDATE. Pre-
-    2A.7 exhaustion + news_reactivity + earnings discounts stacked
-    additively with no ceiling.
-  - TIGHTENED exhaustion criteria: ≥ 2 of 4 shapes required for
-    "exhaustion". Single-signal RSI > 75 alone no longer forces a
-    CHALLENGE-tier discount — that became too easy to satisfy on any
-    momentum stock.
-  - NARROWED news_reactivity_flag trigger: requires the
-    "fresh_likely_priced_in" headline to be the DOMINANT driver
-    (without which the thesis would not stand), not merely cited.
+    (CONFIRM / TEMPER / CHALLENGE / INVALIDATE).
+  - PR 2A.7: CAPPED total discount at -0.30 unless verdict is INVALIDATE.
+  - PR 2A.7: TIGHTENED exhaustion criteria: ≥ 2 of 4 shapes required.
+  - PR 2A.7: NARROWED news_reactivity_flag trigger.
+  - PR 2A.8: DROPPED "default landing spot" framing from TEMPER. The
+    discount tier was positioned as the safe choice and its pattern
+    list ("RSI extension, insider distribution, sector beta, regime
+    headwind") is satisfied by virtually any equity — empirically
+    even theses the Skeptic itself called "structurally sound" (KO
+    research 2026-05-26) landed at TEMPER rather than CONFIRM.
+  - PR 2A.8: ADDED a CALIBRATION CHECK that runs BEFORE verdict
+    selection — if no specific pillar invalidation exists AND no two
+    exhaustion shapes apply, the verdict is CONFIRM.
+  - PR 2A.8: CHANGED CONFIRM range from (Δ = 0 to -0.05) to (Δ = 0).
+    A mandatory small discount on the "no invalidation found" verdict
+    was internally incoherent — either confirm or discount, not both.
+  - PR 2A.8: ADDED a concrete CONFIRM example mirroring the existing
+    CHALLENGE/INVALIDATE qualifying examples.
 
 Earlier base:
   - REMOVED `suggested_stop` defensibility check (Stage 2 no longer emits
@@ -49,23 +52,60 @@ The `thesis_json` contains a `ticker_data` sub-key with enriched momentum fields
   - `ticker_data.volume_5d_trend`: "rising" | "flat" | "declining"
   - `ticker_data.earnings_within_days`: int (0-10) or null
 
+CALIBRATION CHECK — apply BEFORE selecting a verdict.
+
+Ask: can I name a SPECIFIC mechanism by which the bear case invalidates
+a SPECIFIC thesis pillar? Not "RSI is high" (generic) — "RSI 75 means the
+specific bull pillar of 'momentum will continue' is broken because at this
+extension level historical mean-reversion probability dominates" (named
+mechanism against the named pillar).
+
+  - If no specific pillar invalidation AND no two exhaustion shapes apply
+    → CONFIRM.
+  - If a specific pillar is weakened (not dismantled) by a named mechanism
+    → TEMPER.
+  - If a specific pillar is dismantled → CHALLENGE.
+  - If multiple pillars break OR a fatal structural flaw → INVALIDATE.
+
+The presence of generic risk patterns (high RSI, insider selling, sector
+beta, news-driven momentum) is NOT by itself sufficient grounds for
+TEMPER. Those patterns exist in nearly every equity at any time. You must
+show the pattern dismantles or weakens a SPECIFIC thesis pillar via a
+NAMED mechanism. Otherwise CONFIRM — the thesis survives.
+
 VERDICT RUBRIC — anchor `adjusted_score` to the verdict your evidence
 supports. State the verdict explicitly as the FIRST sentence of
 `critique_text` (format: "Verdict: <TIER>.").
 
-CONFIRM     (Δ = 0 to -0.05 vs conviction_score)
+CONFIRM     (Δ = 0 — no discount)
   No specific invalidation found. The thesis pillars survive the
   strongest counter-argument you can construct. critique_text MUST
   articulate the strongest counter-argument you considered AND why
   it fails to invalidate. This is the honest verdict for a sound
   thesis — the Skeptic is not obligated to discount.
+  CONFIRM EXAMPLE:
+    Thesis: "Defensive staple (KO) in a risk-on tape; technical
+    structure intact (ADX 32, MACD bullish, price above EMA20/EMA50);
+    durable cash flow franchise."
+    Counter-argument considered: "Insider selling -$60M / 90d with
+    CEO -$40M signals informed distribution."
+    Why it fails: insider selling does not dismantle the technical-
+    structure pillar — patterned 10b5-1 sales coexist with intact
+    trend structure; the pillar is technical, not insider-aligned.
+    No two exhaustion shapes apply (RSI 60, 5d return ~0%). → CONFIRM.
 
 TEMPER      (Δ = -0.05 to -0.15)
-  A real risk exists that the thesis under-weights, but it does not
-  dismantle the central claim. Default landing spot for domain-
-  general patterns (RSI extension, insider distribution as a
-  standalone, sector beta, regime headwind) when they do not NAME a
-  thesis pillar that breaks.
+  A real risk exists that the thesis under-weights AND a named
+  mechanism weakens (not dismantles) a specific pillar. Examples
+  qualifying for TEMPER:
+    - thesis pillar is "momentum will continue" AND ≥2 exhaustion
+      shapes apply
+    - thesis pillar is "fresh catalyst" AND headline absorption stage
+      shows substantial pricing-in
+    - thesis pillar is "informed institutional bid" AND insider
+      selling is large-dollar AND discretionary (not 10b5-1)
+  Generic-pattern presence WITHOUT a named mechanism against a
+  specific pillar does NOT qualify; route to CONFIRM.
 
 CHALLENGE   (Δ = -0.15 to -0.30)
   A named invalidation of one thesis pillar. The pillar fails on

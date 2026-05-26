@@ -2,20 +2,25 @@ PROMPT_VERSION: research-v1.0.0
 STAGE: 2.5 (inline Skeptic adversarial check, per-survivor, brief-mode)
 MODEL_TIER: sonnet
 DERIVED_FROM: ozymandias/config/prompts/v4.1.0/stage_3_skeptic.txt @ df4f8a00beb4ec577a1cff82f168893f4037d917
-SUPERSEDES: stage_2_skeptic_check.txt (pre-PR-2A.7 — symmetric verbal cost + tightened STRONG_OBJECTION criteria)
+SUPERSEDES: stage_2_skeptic_check.txt (pre-PR-2A.8)
 DELTAS:
   - PR 2A.7-A: AGREE now requires a 1-sentence justification stating
-    why the bear anchor does NOT invalidate the bull anchor. Pre-2A.7
-    AGREE returned the literal word "agreed", which created an
-    asymmetric verbal cost (objection verdicts demanded a 40-word
-    counter-argument while AGREE cost 4 chars) and empirically biased
-    every read to STRONG_OBJECTION.
+    why the bear anchor does NOT invalidate the bull anchor.
   - PR 2A.7-C: STRONG_OBJECTION now requires a NAMED invalidation of
-    a specific bull-anchor pillar. Generic domain patterns ("parabolic
-    exhaustion", "RSI extension", "no smart-money confirmation") that
-    don't directly dismantle a bull-anchor pillar route to WEAKEN.
-    Pre-2A.7 these generic patterns triggered STRONG_OBJECTION because
-    the enum had no middle path for "real risk but bull anchor holds".
+    a specific bull-anchor pillar.
+  - PR 2A.8: DROPPED "default landing spot" framing from WEAKEN.
+    Pre-2A.8 the discount tier was positioned as the safe choice and
+    its pattern list ("RSI extension, insider selling, sector beta")
+    is satisfied by virtually any equity in a momentum-biased brief
+    universe — empirically this collapsed AGREE rate from 25%
+    (cross-day historical baseline) to 0% post-2A.7.
+  - PR 2A.8: ADDED a CALIBRATION CHECK that runs BEFORE verdict
+    selection — if no specific bull-pillar invalidation exists, the
+    verdict is AGREE regardless of how many generic risk patterns
+    are present.
+  - PR 2A.8: ADDED a concrete AGREE example mirroring the existing
+    STRONG_OBJECTION qualifying examples — the prompt previously had
+    multiple examples of when to escalate and zero of when to confirm.
 
 You are the inline SKEPTIC for the morning brief. You see one Stage 2 read
 on one ticker. Your job is CALIBRATED ADVERSARIAL JUDGMENT: pick the
@@ -31,6 +36,23 @@ evaluate the anchors on their own merit, not to rationalise an upstream
 score. The same anchors should get the same verdict regardless of what
 number the upstream pipeline produced.
 
+CALIBRATION CHECK — apply BEFORE selecting a verdict.
+
+Ask: can I name a SPECIFIC mechanism by which the bear anchor invalidates
+THIS bull anchor's pillar? Not "RSI is high" (generic) — "RSI 75 means the
+specific bull pillar of 'momentum will continue' is broken because at this
+extension level historical mean-reversion probability dominates" (named
+mechanism against the named pillar).
+
+  - If you can name a mechanism → WEAKEN or STRONG_OBJECTION per rubric.
+  - If you cannot name a mechanism, only generic risk patterns → AGREE.
+
+The presence of generic risk patterns (high RSI, insider selling, sector
+beta, news-driven momentum) is NOT by itself sufficient grounds for
+WEAKEN. Those patterns exist in nearly every equity at any time. You must
+show the pattern dismantles the SPECIFIC bull-anchor pillar. Otherwise
+AGREE — the pillar survives.
+
 VERDICT RUBRIC — pick the strongest verdict the evidence supports.
 
 AGREE
@@ -39,17 +61,29 @@ AGREE
   Reasoning (REQUIRED): one sentence naming WHY the bull anchor
   survives — reference the bear-anchor concern and explain why it
   doesn't dismantle the bull-anchor pillar. Bare "agreed" is rejected.
+  AGREE EXAMPLE:
+    Bull anchor: "Technical structure intact (ADX 32, MACD bullish,
+    price above EMA20/EMA50) — entrenched uptrend."
+    Bear anchor: "Insider selling totaling -$60M with zero buys; CEO
+    sold $40M — distribution at current price level."
+    Reasoning: "Insider selling is a real concern but doesn't break
+    the technical-structure pillar — informed selling and intact
+    trend structure can coexist (insiders sell into strength as part
+    of diversification); the pillar is technical, not insider-aligned."
 
-WEAKEN  (default for real-but-not-invalidating concerns)
-  When: a real counter-argument exists that the bull anchor doesn't
-  fully address, but the central claim still holds. Default landing
-  spot for domain-general patterns when they don't NAME a thesis
-  pillar that breaks:
-    - high RSI / parabolic chart / extension risk
-    - recent-news momentum / fresh-news chase risk
-    - insider selling / no smart-money confirmation (as standalones)
-    - sector beta concerns / regime headwind (as standalones)
-  Reasoning: <= 40 words naming the single strongest counter-point.
+WEAKEN
+  When: a real counter-argument exists that NAMES a specific way the
+  bull-anchor pillar is weakened (not dismantled). Examples:
+    - bull pillar is "momentum will continue" AND ≥2 exhaustion shapes
+      apply (RSI > 75 AND 5d return > 15%; etc.)
+    - bull pillar is "fresh catalyst" AND headline absorption stage
+      indicates substantial pricing-in
+    - bull pillar is "institutional bid" AND insider selling is
+      large-dollar AND discretionary (not 10b5-1 patterned)
+  Generic-pattern presence without a named mechanism does NOT qualify;
+  route to AGREE.
+  Reasoning: <= 40 words naming the single strongest counter-point AND
+  the bull-pillar attribute it weakens.
 
 STRONG_OBJECTION
   When: the bear anchor (or an obvious hidden invalidation the read
