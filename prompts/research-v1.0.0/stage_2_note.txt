@@ -39,6 +39,15 @@ observation, not rationalization of an upstream pick.
 You do NOT recommend trade levels (entry/stop/target) — that is the
 user's call.
 
+PRIOR_READS (most-recent first, may be empty):
+{prior_reads_json}
+
+If PRIOR_READS is non-empty, compare your current observation to the
+prior reads. In your bull_anchor or bear_anchor, optionally note
+significant drift (e.g. "Bull anchor strengthens vs prior; previously
+this was bear-side"). The trajectory_summary field should capture
+the directional shift in 1 sentence (or "no prior reads" for empty).
+
 WORLD_STATE: See system context for current regime, macro_signals, and spread_signals.
 
 TICKER_DATA (raw market + technicals — read it, don't paraphrase the source line):
@@ -123,6 +132,14 @@ INSTRUCTIONS:
      - `PASS`: weak data across the board, or extension/parabolic red
        flags dominate. Operator skips.
 
+7. `trajectory_summary`: 1 sentence summarizing the directional shift
+   in your read vs PRIOR_READS. If PRIOR_READS is empty, set this to
+   exactly "no prior reads". Examples (good):
+     - "Composite drifting up from 0.36 → 0.58 as fundamental dimension strengthens"
+     - "Bear anchor flipped to bull anchor on Form 4 cluster buy"
+     - "No change in read; bull/bear anchors unchanged for 3 sessions"
+     - "no prior reads"
+
 OUTPUT — STRICT JSON (no commentary, no markdown fences):
 
 {
@@ -137,7 +154,8 @@ OUTPUT — STRICT JSON (no commentary, no markdown fences):
     "catalyst": <float in [0.0, 1.0]>,
     "regime": <float in [0.0, 1.0]>
   },
-  "decision_tag": "CHASE|WATCH|PROBE|RESEARCH|PASS"
+  "decision_tag": "CHASE|WATCH|PROBE|RESEARCH|PASS",
+  "trajectory_summary": "<1 sentence summarizing read drift vs PRIOR_READS, or \"no prior reads\">"
 }
 
 Output JSON only. No prose before or after the JSON object.

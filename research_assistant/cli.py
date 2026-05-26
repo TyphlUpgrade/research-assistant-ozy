@@ -554,6 +554,9 @@ def _brief_item_from_cache(raw: dict) -> "BriefItem":
                 composite_conviction_pre_skeptic=(
                     float(pre_skeptic_raw) if pre_skeptic_raw is not None else None
                 ),
+                # PR 2A.4: backward compat — pre-2A.4 caches lack this field;
+                # default to "" so loading doesn't crash.
+                trajectory_summary=str(raw_note.get("trajectory_summary", "") or ""),
             )
         except (TypeError, ValueError):
             stage_2_note = None
@@ -1129,6 +1132,105 @@ async def _cmd_alerts(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# trajectory <TICKER> (PR 2A.4)
+# ---------------------------------------------------------------------------
+
+def _truncate(text: str, limit: int = 100) -> str:
+    """Operator-readable truncation for anchor rendering. Single-line —
+    collapse internal whitespace so a multi-line bear anchor doesn't break
+    the indented render."""
+    flat = " ".join(str(text).split())
+    if len(flat) <= limit:
+        return flat
+    return flat[: limit - 1].rstrip() + "…"
+
+
+def _format_trajectory_entry(
+    entry: dict,
+    *,
+    prior_composite: Optional[float] = None,
+) -> str:
+    """One trajectory row, indented per the PR 2A.4 render contract.
+
+    Format:
+      2026-05-15 · conviction 0.42 (Skeptic AGREE) · WATCH
+        Bull: <truncated bull_anchor>
+        Bear: <truncated bear_anchor>
+
+    `prior_composite` is unused in the per-row render (kept for future
+    "→ delta" rendering); the trailing summary line owns the multi-day
+    drift narrative.
+    """
+    asof = entry.get("asof", "?")
+    composite = entry.get("composite_conviction")
+    composite_str = (
+        f"{float(composite):.2f}" if isinstance(composite, (int, float)) else "?"
+    )
+    verdict = entry.get("skeptic_verdict", "UNAVAILABLE")
+    tag = entry.get("decision_tag", "?")
+    bull = _truncate(entry.get("bull_anchor", ""))
+    bear = _truncate(entry.get("bear_anchor", ""))
+    return (
+        f"{asof} · conviction {composite_str} (Skeptic {verdict}) · {tag}\n"
+        f"  Bull: {bull}\n"
+        f"  Bear: {bear}"
+    )
+
+
+def _render_trajectory(ticker: str, history: list[dict]) -> str:
+    """Render the full Stage 2 trajectory in operator-readable markdown.
+
+    `history` is chronological (oldest-first) — `read_stage2_full_history`
+    returns that order. Trailing line summarises the composite drift across
+    the window when ≥2 entries exist.
+    """
+    if not history:
+        return f"# {ticker} — Stage 2 trajectory\n\n(no history)"
+    first_date = history[0].get("asof", "?")
+    last_date = history[-1].get("asof", "?")
+    header = (
+        f"# {ticker} — Stage 2 trajectory ({len(history)} notes, "
+        f"{first_date} to {last_date})"
+    )
+    rows = [header, ""]
+    for entry in history:
+        rows.append(_format_trajectory_entry(entry))
+        rows.append("")
+    # Trailing drift summary across the rendered window.
+    composites = [
+        e.get("composite_conviction") for e in history
+        if isinstance(e.get("composite_conviction"), (int, float))
+    ]
+    if len(composites) >= 2:
+        start, end = composites[0], composites[-1]
+        days = len(history) - 1
+        rows.append(
+            f"Trajectory: composite drifted from {start:.2f} → {end:.2f} "
+            f"over {days} entries"
+        )
+    return "\n".join(rows)
+
+
+def _cmd_trajectory(args: argparse.Namespace) -> int:
+    from research_assistant.journal import read_stage2_full_history
+
+    base = _resolve_base(args.base)
+    ticker = args.ticker.upper()
+    history = read_stage2_full_history(ticker, base)
+    if not history:
+        print(f"No Stage 2 history for {ticker}.", file=sys.stderr)
+        return 0
+    # `--limit N` truncates to the LAST N entries (most-recent-first window).
+    if args.limit is not None and args.limit >= 0:
+        history = history[-args.limit:]
+    if args.json:
+        print(json.dumps(history, indent=2, default=str))
+    else:
+        print(_render_trajectory(ticker, history))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Top-level parser
 # ---------------------------------------------------------------------------
 
@@ -1227,6 +1329,19 @@ def _build_parser() -> argparse.ArgumentParser:
              "Stage-2 anchors. Omit for /research chains (single survivor).",
     )
 
+    # trajectory <TICKER> — render Stage 2 trajectory (PR 2A.4)
+    ptraj = sub.add_parser(
+        "trajectory",
+        help="Render Stage 2 trajectory for a ticker from the per-ticker journal",
+    )
+    ptraj.add_argument("ticker", help="Ticker symbol, e.g. NVDA")
+    ptraj.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit to N most-recent entries (default: all)",
+    )
+
     return p
 
 
@@ -1243,6 +1358,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "trace":          _cmd_trace,
         "dossier":        _cmd_dossier,
         "defender-check": _cmd_defender_check,
+        "trajectory":     _cmd_trajectory,
     }
     handler = handlers.get(args.cmd)
     if handler is None:

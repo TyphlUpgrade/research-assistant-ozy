@@ -122,6 +122,12 @@ class Stage2Note:
     skeptic_verdict: str = "UNAVAILABLE"          # one of SKEPTIC_VERDICTS
     skeptic_reasoning: str = ""
     composite_conviction_pre_skeptic: Optional[float] = None
+    # PR 2A.4: cross-day trajectory awareness. The LLM observes PRIOR_READS
+    # in the prompt and summarises its directional drift in one sentence
+    # here. Default empty so cached Stage2Notes from before PR 2A.4
+    # deserialize without crash; backward-compat path in
+    # cli._brief_item_from_cache treats missing as "".
+    trajectory_summary: str = ""
 
 
 def compute_composite_conviction(conviction: dict[str, float]) -> float:
@@ -225,6 +231,12 @@ def parse_stage2_note(payload: dict, *, default_ticker: Optional[str] = None) ->
 
     composite = compute_composite_conviction(conviction)
 
+    # PR 2A.4: trajectory_summary is OPTIONAL — older payloads (pre-PR-2A.4)
+    # may not carry it, and the prompt instructs the model to emit
+    # "no prior reads" when PRIOR_READS is empty. Default to "" so the
+    # parser stays permissive across both cases.
+    trajectory_summary = str(payload.get("trajectory_summary", "") or "")
+
     return Stage2Note(
         ticker=ticker,
         observation=observation,
@@ -234,6 +246,7 @@ def parse_stage2_note(payload: dict, *, default_ticker: Optional[str] = None) ->
         conviction=conviction,
         composite_conviction=composite,
         decision_tag=decision_tag,
+        trajectory_summary=trajectory_summary,
     )
 
 
@@ -366,6 +379,7 @@ async def _stage_2_note(
     insider_activity: Optional[InsiderActivitySummary] = None,
     institutional_ownership: Optional[InstitutionalOwnership] = None,
     screener_evidence: Optional[list[dict]] = None,
+    prior_reads: Optional[list[dict]] = None,
     default_ticker: Optional[str] = None,
 ) -> tuple[Optional[Stage2Note], Optional[CallResult]]:
     """Invoke Stage 2 (Sonnet structured-note). Returns (note, call_metadata).
@@ -377,6 +391,12 @@ async def _stage_2_note(
     Stage 1 score / breakdown is NOT a parameter — that's the data
     isolation principle that PR 2A.2 enforces structurally. The signature
     literally cannot leak Stage 1's read into Stage 2.
+
+    PR 2A.4: `prior_reads` is the compact history persisted via
+    `journal.append_stage2_note`, most-recent first. Rendered into the
+    prompt as the `PRIOR_READS` block; the LLM observes drift and writes
+    a `trajectory_summary` sentence. Empty list (or None) → empty JSON
+    array; the prompt's "no prior reads" escape covers the new-ticker case.
     """
     template = _load_prompt("stage_2_note")
     prompt = _render(
@@ -386,6 +406,7 @@ async def _stage_2_note(
         insider_activity_block=InsiderActivitySummary.render_for_prompt(insider_activity),
         institutional_ownership_block=InstitutionalOwnership.render_for_prompt(institutional_ownership),
         screener_evidence_block=_render_screener_evidence_block(screener_evidence or []),
+        prior_reads_json=json.dumps(prior_reads or [], indent=2),
     )
     system = f"WORLD_STATE for this session:\n{json.dumps(world_state, indent=2)}"
     result = await client.call(prompt, model="claude-sonnet-4-6", system=system)

@@ -371,9 +371,11 @@ async def test_build_brief_threads_insider_summary_into_composite(
     # No Stage 2 survivors — keep the test fast and focused.
     # PR 2A.2: brief.build_brief now calls `_stage_2_note` (not
     # `_stage_2_thesis`). The fake matches the new keyword-arg signature.
+    # PR 2A.4: `prior_reads` added to signature.
     async def fake_stage_2_note(client, ws, td, h, *, insider_activity=None,
                                 institutional_ownership=None,
-                                screener_evidence=None, default_ticker=None):
+                                screener_evidence=None, prior_reads=None,
+                                default_ticker=None):
         return None, None
 
     nvda_summary = _summary(
@@ -433,9 +435,11 @@ async def test_build_brief_default_insider_activities_unavailable(
         return {"regime": "bull-trending"}
 
     # PR 2A.2: brief.build_brief now calls `_stage_2_note`.
+    # PR 2A.4: `prior_reads` added to signature.
     async def fake_stage_2_note(client, ws, td, h, *, insider_activity=None,
                                 institutional_ownership=None,
-                                screener_evidence=None, default_ticker=None):
+                                screener_evidence=None, prior_reads=None,
+                                default_ticker=None):
         return None, None
 
     with patch("research_assistant.brief._stage_0_world_state", fake_stage_0), \

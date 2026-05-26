@@ -231,6 +231,7 @@ async def _stage_2_for_survivor(
     *,
     chain_id: str,
     traces_base: Path,
+    research_base: Path,
     insider_activity: Optional[InsiderActivitySummary] = None,
     screener_evidence: Optional[list[dict]] = None,
 ) -> Optional[Stage2Note]:
@@ -245,17 +246,29 @@ async def _stage_2_for_survivor(
     Emits a `stage_2_note` trace event stamped with the survivor's symbol
     so downstream filters (Defender, /trace) can scope to one survivor
     (the chain_id is shared across all survivors in a brief).
+
+    PR 2A.4: Loads up to 5 prior compact notes via `read_stage2_history`
+    BEFORE the LLM call and threads them into the prompt's PRIOR_READS
+    block. After Skeptic adjusts the composite, persists the final
+    post-Skeptic note via `append_stage2_note` so subsequent runs see
+    today's read in their PRIOR_READS context.
     """
     async with semaphore:
         from dataclasses import replace as _dc_replace
+        from research_assistant.journal import (
+            append_stage2_note,
+            read_stage2_history,
+        )
         from research_assistant.orchestrator import (
             _stage_2_note,
             _stage_2_skeptic_check,
         )
+        prior_reads = read_stage2_history(ticker, research_base, limit=5)
         note, s2_meta = await _stage_2_note(
             client, world_state, ticker_data, headlines,
             insider_activity=insider_activity,
             screener_evidence=screener_evidence or [],
+            prior_reads=prior_reads,
             default_ticker=ticker,
         )
         # Serialize note → dict for trace persistence so /trace stays
@@ -273,6 +286,7 @@ async def _stage_2_for_survivor(
                 "conviction": dict(note.conviction),
                 "composite_conviction": note.composite_conviction,
                 "decision_tag": note.decision_tag,
+                "trajectory_summary": note.trajectory_summary,
             }
         append_stage_event(
             chain_id=chain_id,
@@ -306,13 +320,26 @@ async def _stage_2_for_survivor(
         # Skeptic value; the pre-Skeptic geomean is preserved for trace /
         # debug via `composite_conviction_pre_skeptic`. dataclasses.replace
         # is the canonical Stage2Note(frozen=True) mutation path.
-        return _dc_replace(
+        final_note = _dc_replace(
             note,
             composite_conviction=adjusted,
             skeptic_verdict=verdict,
             skeptic_reasoning=reasoning,
             composite_conviction_pre_skeptic=pre_skeptic,
         )
+        # PR 2A.4: persist the final (post-Skeptic) compact note. Append-only;
+        # no dedup at write time — operator may re-run brief and we want
+        # every read recorded for trajectory analysis. Failure here must
+        # NOT crash the brief (the operator-facing render is the canonical
+        # surface; persistence is auxiliary).
+        try:
+            append_stage2_note(final_note, research_base)
+        except OSError as exc:
+            log.warning(
+                "append_stage2_note failed for %s (%s); brief still ships",
+                ticker, exc,
+            )
+        return final_note
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +447,7 @@ async def build_brief(
             semaphore,
             chain_id=chain,
             traces_base=traces_base,
+            research_base=research_base,
             insider_activity=insider_activities.get(s["ticker"]),
             screener_evidence=list(s.get("screener_evidence", [])),
         )
@@ -511,6 +539,8 @@ def _stage_2_note_to_cache_dict(note: Optional[Stage2Note]) -> Optional[dict]:
         "skeptic_verdict": note.skeptic_verdict,
         "skeptic_reasoning": note.skeptic_reasoning,
         "composite_conviction_pre_skeptic": note.composite_conviction_pre_skeptic,
+        # PR 2A.4 field. Backward-compat reader treats missing as "".
+        "trajectory_summary": note.trajectory_summary,
     }
 
 
