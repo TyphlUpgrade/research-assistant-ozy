@@ -456,6 +456,43 @@ metric). The reverted PR-2 implementation is reconstructable from the plan doc.
 Deferred by operator decision: PR-1's `/research` results were judged
 sufficient on their own; PR-2 resumes only if the brief surface needs it.
 
+## 17. Insider `net_dollars` conflates discretionary sales with comp mechanics
+
+Status: **OPEN** (found 2026-05-29 during an MRVL `/probe`). Signal-quality
+bug, same flavor as the intraday-volume artifact (commit `0f7b3a3`).
+
+`Form4Transaction.net_dollars` (`edgar/form4.py:79-85`) signs every
+non-derivative disposal negative (`shares × price_per_share`), and
+`aggregate_insider_activity` (`edgar/form4.py:~508`) sums ALL disposals into
+`net_dollars` — including **code-F (shares surrendered for tax withholding on
+vesting)** — while `sales_count` counts only **code-S (open-market sales)**.
+Result: the headline "net -$X / N sales / 0 buys" can be heavily negative from
+routine vesting/tax mechanics even when discretionary selling is small.
+
+Empirical (MRVL, 2026-05-29): aggregate codes were M×25, F×25, S×13. The COO's
+-$20.7M was entirely M/F (PSU vesting + tax withholding, zero S) yet rolled into
+the -$148.9M "net selling" headline — only 13 of 63 transactions were actual
+sales, but `net_dollars` treated the F-code disposals as "distribution."
+
+Why it matters: `net_dollars` is the load-bearing insider signal. It feeds
+(a) the composite `INSIDER_SELLING_SCORE_CAP` (caps intrinsic at 0.40 when
+net ≤ -$10M AND sales_count ≥ 3 AND buys_count == 0) and (b) the Stage 2/3
+prompts' "informed institutional distribution" reasoning. F-code tax-withholding
+is NOT informed selling, so counting it inflates the bearish "smart money
+exiting" read across every ticker (seen this session on IONQ / CRDO / MU / AAL /
+MRVL).
+
+Candidate fix: expose a `discretionary_net_dollars` (S/P codes only) alongside
+the all-disposals `net_dollars`; key the cap + the prompt "distribution" framing
+on the discretionary figure, keep the full figure for supply-overhang context.
+Decision needed: does any disposal count as supply (current behavior), or only
+discretionary sales count as informed-distribution signal? For the pillar the
+Skeptic actually uses, discretionary-only is the right denominator.
+
+Related gap: `/probe --filing 4` retrieves only the latest SINGLE Form 4 (it got
+the COO's vesting filing, not the CEO's), so per-insider 10b5-1 / code resolution
+needs a targeted multi-filing pull — a separate probe/EDGAR enhancement.
+
 ---
 
 ## Tracked TBDs (process / validation, not build queue)
