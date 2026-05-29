@@ -493,6 +493,40 @@ Related gap: `/probe --filing 4` retrieves only the latest SINGLE Form 4 (it got
 the COO's vesting filing, not the CEO's), so per-insider 10b5-1 / code resolution
 needs a targeted multi-filing pull — a separate probe/EDGAR enhancement.
 
+## 18. Skeptic uncertainty-discount regression on 10b5-1 status
+
+Status: **OPEN** (found 2026-05-29 during the post-#17 MRVL `/research`). Sits
+in the lineage of PR 2A.7 / 2A.8 / 2A.9, all of which closed a specific Skeptic
+escape hatch ("priced into composite" → "default landing spot" → "uncertainty
+premium"). #18 closes the next one: even with the honest discretionary insider
+figure in hand (commit `037728e`), the Skeptic discounted MRVL to TEMPER on:
+
+> *"if any significant portion of those sales are discretionary code-S
+> rather than 10b5-1 plan disposals, the 'institutional accumulation' pillar
+> is directly weakened."*
+
+This is the exact pattern `stage_3_skeptic.txt`'s "UNCERTAINTY IS NOT GROUNDS
+FOR DISCOUNT" clause already forbids — the unknown S-vs-10b5-1 split is a risk
+factor that does NOT dismantle a pillar via a named mechanism, so it should
+route to `open_questions_added`, not `adjusted_score`. The Skeptic regressed.
+
+Empirical (MRVL, 2026-05-29 22:23 UTC): gate opens cleanly (ADX 47.1, volume
+expanding 2.07x, no voiding, zero exhaustion shapes confirmed), yet the verdict
+was TEMPER on the 10b5-1 conditional. By the rubric the verdict should have
+been CONFIRM with the 10b5-1 question logged as an open question.
+
+Mitigation (one shipping in this PR): the `stage_2_block` head now labels the
+figure as **"discretionary net"** when it diverges from total disposals (vs
+the previous bare "net"), so the Skeptic recognises it as already filtered and
+doesn't reach back for an unknown-split mystery framing. That removes one
+trigger but does NOT close the 10b5-1 axis itself.
+
+Candidate prompt fix (FOLLOWUPS #18): extend the 2A.9 forbiddance in
+`stage_3_skeptic.txt` to explicitly call out 10b5-1 plan-status uncertainty —
+"do not discount because the S/P codes' 10b5-1 status is unknown; route to
+`open_questions_added`." Calibration check against the KO/JNJ/MU/IONQ/CRDO
+suite + the MRVL fixture before shipping.
+
 ---
 
 ## Tracked TBDs (process / validation, not build queue)
