@@ -184,16 +184,24 @@ class InsiderActivitySummary:
         distinct-officer span — a coordinated cluster is alpha-relevant
         even though the underlying transactions are pre-window."""
         lines: list[str] = []
+        # When non-discretionary disposals (vesting / tax-withholding)
+        # materially inflate the all-disposals figure, label the number as
+        # `discretionary net` and show the total alongside — the unambiguous
+        # `discretionary` label closes the calibration leak where the Skeptic
+        # latched onto the figure as an unknown-split mystery (FOLLOWUPS #18,
+        # post-#17 follow-up). When there's no divergence the bare `net` label
+        # is kept (back-compat with the long-standing one-line format).
+        diverges = abs(self.net_dollars - self.discretionary_net_dollars) >= 1e6
+        net_label = "discretionary net" if diverges else "net"
         head = (
             f"{self.sales_count} sales / {self.buys_count} buys last "
-            f"{self.window_days}d, net {_fmt_dollars(self.discretionary_net_dollars)}"
+            f"{self.window_days}d, {net_label} "
+            f"{_fmt_dollars(self.discretionary_net_dollars)}"
         )
-        # Surface the split only when non-discretionary disposals (vesting /
-        # tax-withholding) materially inflate the all-disposals figure, so the
-        # Skeptic reasons on discretionary selling, not comp mechanics (#17).
-        if abs(self.net_dollars - self.discretionary_net_dollars) >= 1e6:
+        if diverges:
             head += (
-                f" ({_fmt_dollars(self.net_dollars)} incl. vesting/tax disposals)"
+                f" (vs {_fmt_dollars(self.net_dollars)} total disposals "
+                f"incl. vesting/tax)"
             )
         if self.latest_transaction_date:
             head += f", latest {self.latest_transaction_date}"

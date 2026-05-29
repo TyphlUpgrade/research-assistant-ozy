@@ -1039,9 +1039,11 @@ def test_stage_2_block_surfaces_discretionary_vs_total_split() -> None:
         by_officer=[], latest_transaction_date="2026-05-22",
     )
     head = s.stage_2_block().splitlines()[0]
-    assert "net -$24.3M" in head
-    assert "incl. vesting/tax disposals" in head
-    assert "-$148.9M" in head
+    # New format: "discretionary net <X> (vs <Y> total disposals incl. vesting/tax)"
+    # so the Skeptic sees the figure is already filtered, not an unknown split.
+    assert "discretionary net -$24.3M" in head
+    assert "vs -$148.9M total disposals" in head
+    assert "incl. vesting/tax" in head
 
 
 def test_stage_1_line_appends_late_disclosure_clause() -> None:
