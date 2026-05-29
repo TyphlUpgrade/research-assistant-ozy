@@ -420,6 +420,42 @@ Two items promote from optional to load-bearing on this surface:
 Discord is additive. CC-terminal `.claude/skills/` keeps working as the
 primary surface.
 
+## 16. Swing-horizon realignment — brief surface (PR-2)
+
+Status: **OPEN** (backlogged 2026-05-29). PR-1 shipped — see Closed below.
+
+Full design + ADR: `.omc/plans/2026-05-28-swing-horizon-realignment.md`
+(ralplan consensus, Architect SOUND + Critic APPROVE).
+
+Motivation: the cascade carried an inherited long-horizon bias-defense prior,
+but the product's mission is swing trading (days-to-weeks) — so in a
+momentum/euphoria tape it could never produce a buy. PR-1 fixed the `/research`
+path (prompt-only, shipped). PR-2 carries the same realignment to the BRIEF
+surface and is the remaining work:
+- `composite.py`: euphoria regime multiplier 0.90 → 1.00 (neutral for signal;
+  risk surfaced via a `late_cycle_regime` tag); parabolic hard cap 0.40 → 0.55
+  (keep `min(score, CAP)` semantics so bonuses can't rescue; 0.55 clears the
+  0.4 brief survivor floor so a confirmed momentum leader ranks).
+- `stage_2_skeptic_check.txt`: an anchor-text-native momentum-continuation
+  AGREE clause (the brief inline Skeptic sees only the two anchors, so it gates
+  on anchor semantics, NOT TA fields — intentionally different from the
+  `/research` gate).
+
+CALIBRATION LESSON (PR-2 measurement gate, 2026-05-29 — do NOT lose): a first
+cut of the anchor-native AGREE clause overshot the brief AGREE band to 50%
+(ceiling 35%). Root cause: the "generic extension" carve-out was too broad and
+swallowed NAMED bearish mechanisms (INTC's bearish-MACD divergence + declining
+volume got waved through as "generic extension"). Fix before resuming: the
+carve-out must apply ONLY to pure RSI / percentile / "extended" / "priced-in"
+language and EXCLUDE bear anchors that name a bearish-indicator state (MACD
+bearish/divergence, MA breakdown, declining-volume-on-the-move). Then
+re-measure the brief AGREE rate into [20%, 35%] (that band is the brief AGREE
+rate specifically; the `/research` CONFIRM rate is a separate per-surface
+metric). The reverted PR-2 implementation is reconstructable from the plan doc.
+
+Deferred by operator decision: PR-1's `/research` results were judged
+sufficient on their own; PR-2 resumes only if the brief surface needs it.
+
 ---
 
 ## Tracked TBDs (process / validation, not build queue)
@@ -442,6 +478,15 @@ here so they don't fall out of memory.
 
 ## Closed
 
+- **Swing-horizon realignment — `/research` path (PR-1, PR 2A.10).** Shipped
+  2026-05-29 in commit `0ed13f5`. `stage_2_thesis.txt` + `stage_3_skeptic.txt`:
+  swing HOLDING HORIZON blocks (no-DCF is not a demerit for the trade horizon;
+  depth floor preserved) + a TA-field-native MOMENTUM-CONTINUATION CONFIRM gate
+  (uptrend + adx_14d≥20 + MACD bullish + volume confirmation; voided by
+  rsi_14d≥80 / range_pct_20d≥95 / roc_5d≥25; fail-closed on missing trend data;
+  self-names the path in `critique_text`). Measurement gate (7-name re-score):
+  AGREE/CONFIRM moved off 0% (AAL clean CONFIRM), anti-yes-man guards all fired,
+  zero CONFIRM on any voiding ticker. Brief surface continuation = #16.
 - **v1 #1 — dynamic universe discovery.** Closed by `universe_fetcher`
   graduating to Ozy in v1.x (see `tests/test_import_boundaries.py:45`).
 - **v1.x #1 — per-ticker observations stream — write phase.** Shipped
