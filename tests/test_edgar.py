@@ -903,6 +903,84 @@ def test_aggregate_form4_with_no_owner_still_counts_transactions() -> None:
     assert s.by_officer == []
 
 
+def test_aggregate_discretionary_excludes_f_code() -> None:
+    """FOLLOWUPS #17: net_dollars sums ALL non-derivative disposals (incl.
+    code-F tax-withholding on vesting), but discretionary_net_dollars counts
+    only open-market P/S — so comp mechanics don't masquerade as distribution."""
+    owner = Form4Owner(
+        cik="0000000001", name="CEO EXAMPLE", is_officer=True, officer_title="CEO",
+    )
+    filing = Form4Filing(
+        accession_number="A1", filing_date="2026-05-20",
+        period_of_report="2026-05-20", issuer_cik="0000000010",
+        issuer_ticker="MRVL", owners=[owner],
+        non_derivative=[
+            Form4Transaction(
+                date="2026-05-20", code="S", shares=10_000, price_per_share=200.0,
+                acquired_disposed="D", security_title="Common Stock",
+            ),
+            Form4Transaction(
+                date="2026-05-20", code="F", shares=100_000, price_per_share=200.0,
+                acquired_disposed="D", security_title="Common Stock",
+            ),
+        ],
+    )
+    s = aggregate_insider_activity([filing], as_of=date(2026, 5, 22))
+    assert s.net_dollars == pytest.approx(-22_000_000)               # S + F disposals
+    assert s.discretionary_net_dollars == pytest.approx(-2_000_000)  # only the S sale
+    assert s.sales_count == 1                                        # F is not an S
+    assert s.code_mix == {"S": 1, "F": 1}
+
+
+def test_stage_2_block_top_filters_pure_vesting_officer() -> None:
+    """FOLLOWUPS #17 (per-officer): an officer whose entire window activity is
+    vesting (code-F) has discretionary_net_dollars=0 and must NOT appear in the
+    'top' distributors line, even if their full net_dollars dominates."""
+    ceo = Form4Owner(
+        cik="0000000001", name="CEO", is_officer=True, officer_title="CEO",
+    )
+    coo = Form4Owner(
+        cik="0000000002", name="COO", is_officer=True, officer_title="COO",
+    )
+    ceo_filing = Form4Filing(
+        accession_number="A1", filing_date="2026-05-20",
+        period_of_report="2026-05-20", issuer_cik="0000000010",
+        issuer_ticker="MRVL", owners=[ceo],
+        non_derivative=[
+            Form4Transaction(
+                date="2026-05-20", code="S", shares=10_000, price_per_share=200.0,
+                acquired_disposed="D", security_title="Common Stock",
+            ),
+        ],
+    )
+    coo_filing = Form4Filing(
+        accession_number="A2", filing_date="2026-05-20",
+        period_of_report="2026-05-20", issuer_cik="0000000010",
+        issuer_ticker="MRVL", owners=[coo],
+        non_derivative=[
+            Form4Transaction(
+                date="2026-05-20", code="F", shares=100_000, price_per_share=200.0,
+                acquired_disposed="D", security_title="Common Stock",
+            ),
+        ],
+    )
+    s = aggregate_insider_activity(
+        [ceo_filing, coo_filing], as_of=date(2026, 5, 22),
+    )
+    coo_oa = next(o for o in s.by_officer if o.name == "COO")
+    ceo_oa = next(o for o in s.by_officer if o.name == "CEO")
+    # COO: -$20M all-F vesting but zero discretionary.
+    assert coo_oa.net_dollars == pytest.approx(-20_000_000)
+    assert coo_oa.discretionary_net_dollars == 0
+    # CEO: -$2M discretionary S-code sale.
+    assert ceo_oa.discretionary_net_dollars == pytest.approx(-2_000_000)
+    top_line = next(
+        ln for ln in s.stage_2_block().splitlines() if ln.startswith("top:")
+    )
+    assert "CEO -$2.0M" in top_line
+    assert "COO" not in top_line  # pure-vesting officer filtered out
+
+
 # --- summary rendering -----------------------------------------------------
 
 def test_stage_1_line_matches_spec_format() -> None:
@@ -911,7 +989,8 @@ def test_stage_1_line_matches_spec_format() -> None:
     s = InsiderActivitySummary(
         window_days=90, window_start="2026-02-21", window_end="2026-05-22",
         total_filings=4, buys_count=0, sales_count=4,
-        net_dollars=-42_000_000, code_mix={"S": 4}, deriv_code_mix={},
+        net_dollars=-42_000_000, discretionary_net_dollars=-42_000_000,
+        code_mix={"S": 4}, deriv_code_mix={},
         by_officer=[], latest_transaction_date="2026-05-19",
     )
     assert s.stage_1_line() == "insider net flow last 90d: -$42.0M / 4 sales / 0 buys"
@@ -921,18 +1000,20 @@ def test_stage_2_block_renders_three_lines() -> None:
     s = InsiderActivitySummary(
         window_days=90, window_start="2026-02-21", window_end="2026-05-22",
         total_filings=2, buys_count=1, sales_count=1,
-        net_dollars=-16_600_000,
+        net_dollars=-16_600_000, discretionary_net_dollars=-16_600_000,
         code_mix={"S": 1, "P": 1, "A": 1},
         deriv_code_mix={"M": 1},
         by_officer=[
             OfficerActivity(
                 cik="11", name="HUANG", relationship="President & CEO",
                 sales_count=1, net_shares=-120_000, net_dollars=-18_000_000,
+                discretionary_net_dollars=-18_000_000,
                 latest_transaction_date="2026-05-19",
             ),
             OfficerActivity(
                 cik="22", name="KRESS", relationship="EVP & CFO",
                 buys_count=1, net_shares=10_000, net_dollars=1_400_000,
+                discretionary_net_dollars=1_400_000,
                 latest_transaction_date="2026-04-10",
             ),
         ],
@@ -946,6 +1027,23 @@ def test_stage_2_block_renders_three_lines() -> None:
     assert lines[2] == "top: President & CEO -$18.0M; EVP & CFO $1.4M"
 
 
+def test_stage_2_block_surfaces_discretionary_vs_total_split() -> None:
+    """FOLLOWUPS #17: when non-discretionary disposals materially inflate the
+    all-disposals figure, the head shows discretionary as 'net' and annotates
+    the total so the Skeptic reasons on real selling, not comp mechanics."""
+    s = InsiderActivitySummary(
+        window_days=90, window_start="2026-02-21", window_end="2026-05-22",
+        total_filings=3, buys_count=0, sales_count=13,
+        net_dollars=-148_900_000, discretionary_net_dollars=-24_300_000,
+        code_mix={"M": 25, "F": 25, "S": 13}, deriv_code_mix={},
+        by_officer=[], latest_transaction_date="2026-05-22",
+    )
+    head = s.stage_2_block().splitlines()[0]
+    assert "net -$24.3M" in head
+    assert "incl. vesting/tax disposals" in head
+    assert "-$148.9M" in head
+
+
 def test_stage_1_line_appends_late_disclosure_clause() -> None:
     """When late-disclosure activity is present, stage_1_line surfaces it
     as a `· N late-disclosed (M officers)` suffix so Stage 1 can weight
@@ -953,7 +1051,8 @@ def test_stage_1_line_appends_late_disclosure_clause() -> None:
     s = InsiderActivitySummary(
         window_days=90, window_start="2026-02-21", window_end="2026-05-22",
         total_filings=4, buys_count=0, sales_count=4,
-        net_dollars=-42_000_000, code_mix={"S": 4}, deriv_code_mix={},
+        net_dollars=-42_000_000, discretionary_net_dollars=-42_000_000,
+        code_mix={"S": 4}, deriv_code_mix={},
         by_officer=[], latest_transaction_date="2026-05-19",
         disclosed_filings_count=10, late_disclosure_count=6,
         late_disclosure_officers=5, latest_disclosure_date="2026-05-18",
@@ -970,11 +1069,12 @@ def test_stage_2_block_appends_disclosure_line_when_late() -> None:
     s = InsiderActivitySummary(
         window_days=90, window_start="2026-02-21", window_end="2026-05-22",
         total_filings=1, buys_count=0, sales_count=1,
-        net_dollars=-500_000, code_mix={"S": 1}, deriv_code_mix={},
+        net_dollars=-500_000, discretionary_net_dollars=-500_000,
+        code_mix={"S": 1}, deriv_code_mix={},
         by_officer=[
             OfficerActivity(
                 cik="11", name="CFO", relationship="Chief Financial Officer",
-                sales_count=1, net_dollars=-500_000,
+                sales_count=1, net_dollars=-500_000, discretionary_net_dollars=-500_000,
             ),
         ],
         latest_transaction_date="2026-05-06",

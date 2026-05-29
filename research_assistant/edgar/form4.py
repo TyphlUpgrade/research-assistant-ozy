@@ -112,7 +112,11 @@ class OfficerActivity:
     sales_count: int = 0            # code-S transactions, non-derivative
     other_count: int = 0            # all other codes, non-derivative
     net_shares: float = 0.0         # signed; non-derivative only
-    net_dollars: float = 0.0        # signed; non-derivative only
+    net_dollars: float = 0.0        # signed; non-derivative, ALL disposals
+    # Discretionary (open-market P/S only) per-officer net $ — the signal the
+    # stage_2_block "top" line renders, so a pure-vesting officer (e.g. F-only)
+    # doesn't read as distribution (FOLLOWUPS #17).
+    discretionary_net_dollars: float = 0.0
     latest_transaction_date: Optional[str] = None
 
 
@@ -141,6 +145,12 @@ class InsiderActivitySummary:
     # window regardless of transaction date. Cluster late-disclosures
     # (multiple insiders catching up on old trades in the same week) are
     # themselves a behavioral signal — often tied to a near-term catalyst.
+    # Discretionary (open-market P/S codes only) net $ — the "informed
+    # selling/buying" signal. `net_dollars` above sums ALL non-derivative
+    # disposals including code-F tax-withholding on vesting and other
+    # compensation mechanics, which overstates distribution (FOLLOWUPS #17).
+    # Key signal logic on this figure; keep `net_dollars` for supply context.
+    discretionary_net_dollars: float = 0.0
     disclosed_filings_count: int = 0
     late_disclosure_count: int = 0           # disclosed in window, transacted before
     late_disclosure_officers: int = 0        # distinct CIKs across late filings
@@ -155,7 +165,7 @@ class InsiderActivitySummary:
         surfaces the cluster signal so Stage 1 can weight it."""
         line = (
             f"insider net flow last {self.window_days}d: "
-            f"{_fmt_dollars(self.net_dollars)} / "
+            f"{_fmt_dollars(self.discretionary_net_dollars)} / "
             f"{self.sales_count} sales / {self.buys_count} buys"
         )
         if self.late_disclosure_count > 0:
@@ -176,18 +186,28 @@ class InsiderActivitySummary:
         lines: list[str] = []
         head = (
             f"{self.sales_count} sales / {self.buys_count} buys last "
-            f"{self.window_days}d, net {_fmt_dollars(self.net_dollars)}"
+            f"{self.window_days}d, net {_fmt_dollars(self.discretionary_net_dollars)}"
         )
+        # Surface the split only when non-discretionary disposals (vesting /
+        # tax-withholding) materially inflate the all-disposals figure, so the
+        # Skeptic reasons on discretionary selling, not comp mechanics (#17).
+        if abs(self.net_dollars - self.discretionary_net_dollars) >= 1e6:
+            head += (
+                f" ({_fmt_dollars(self.net_dollars)} incl. vesting/tax disposals)"
+            )
         if self.latest_transaction_date:
             head += f", latest {self.latest_transaction_date}"
         lines.append(head)
         if self.code_mix:
             ordered = sorted(self.code_mix.items(), key=lambda kv: -kv[1])
             lines.append("codes: " + ", ".join(f"{c}×{n}" for c, n in ordered))
-        top = [o for o in self.by_officer if o.net_dollars != 0][:3]
+        # Per-officer top line: filter and render on DISCRETIONARY so a pure-
+        # vesting officer (e.g. all-F-code) isn't shown as a distributor (#17).
+        top = [o for o in self.by_officer if o.discretionary_net_dollars != 0][:3]
         if top:
             officer_strs = [
-                f"{o.relationship} {_fmt_dollars(o.net_dollars)}" for o in top
+                f"{o.relationship} {_fmt_dollars(o.discretionary_net_dollars)}"
+                for o in top
             ]
             lines.append("top: " + "; ".join(officer_strs))
         if self.late_disclosure_count > 0:
@@ -470,6 +490,7 @@ def aggregate_insider_activity(
     buys_count = 0
     sales_count = 0
     net_dollars = 0.0
+    discretionary_net_dollars = 0.0
     code_mix: dict[str, int] = {}
     deriv_code_mix: dict[str, int] = {}
     by_officer: dict[str, OfficerActivity] = {}
@@ -507,8 +528,13 @@ def aggregate_insider_activity(
                 oa.other_count += 1
             tx_value = t.net_dollars
             net_dollars += tx_value
+            is_discretionary = t.code in (_BUY_CODE, _SALE_CODE)
+            if is_discretionary:
+                discretionary_net_dollars += tx_value
             if oa is not None:
                 oa.net_dollars += tx_value
+                if is_discretionary:
+                    oa.discretionary_net_dollars += tx_value
                 sign = 1 if t.acquired_disposed == "A" else -1
                 oa.net_shares += sign * t.shares
                 if t.date and (
@@ -523,8 +549,10 @@ def aggregate_insider_activity(
                 continue
             deriv_code_mix[t.code] = deriv_code_mix.get(t.code, 0) + 1
 
+    # Sort by abs(discretionary): the "top" line is meant to surface the most
+    # impactful discretionary actors, not pure-vesting noise (FOLLOWUPS #17).
     by_officer_sorted = sorted(
-        by_officer.values(), key=lambda o: -abs(o.net_dollars)
+        by_officer.values(), key=lambda o: -abs(o.discretionary_net_dollars)
     )
 
     return InsiderActivitySummary(
@@ -535,6 +563,7 @@ def aggregate_insider_activity(
         buys_count=buys_count,
         sales_count=sales_count,
         net_dollars=net_dollars,
+        discretionary_net_dollars=discretionary_net_dollars,
         code_mix=code_mix,
         deriv_code_mix=deriv_code_mix,
         by_officer=by_officer_sorted,

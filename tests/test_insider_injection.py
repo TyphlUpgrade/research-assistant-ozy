@@ -44,23 +44,32 @@ def _summary(**overrides) -> InsiderActivitySummary:
         window_days=90, window_start="2026-02-21", window_end="2026-05-22",
         total_filings=2, buys_count=1, sales_count=1,
         net_dollars=-16_600_000,
+        discretionary_net_dollars=-16_600_000,
         code_mix={"S": 1, "P": 1, "A": 1},
         deriv_code_mix={"M": 1},
         by_officer=[
             OfficerActivity(
                 cik="11", name="HUANG", relationship="President & CEO",
                 sales_count=1, net_shares=-120_000, net_dollars=-18_000_000,
+                discretionary_net_dollars=-18_000_000,
                 latest_transaction_date="2026-05-19",
             ),
             OfficerActivity(
                 cik="22", name="KRESS", relationship="EVP & CFO",
                 buys_count=1, net_shares=10_000, net_dollars=1_400_000,
+                discretionary_net_dollars=1_400_000,
                 latest_transaction_date="2026-04-10",
             ),
         ],
         latest_transaction_date="2026-05-19",
     )
     defaults.update(overrides)
+    # When a caller overrides net_dollars without specifying discretionary,
+    # mirror it (these fixtures model real S/P open-market sales where the two
+    # coincide); explicit `discretionary_net_dollars=...` lets a test model the
+    # FOLLOWUPS #17 divergence.
+    if "net_dollars" in overrides and "discretionary_net_dollars" not in overrides:
+        defaults["discretionary_net_dollars"] = overrides["net_dollars"]
     return InsiderActivitySummary(**defaults)
 
 

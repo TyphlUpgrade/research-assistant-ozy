@@ -43,9 +43,14 @@ def _empty_insider_summary(
     buys_count: int = 0,
     sales_count: int = 0,
     net_dollars: float = 0.0,
+    discretionary_net_dollars: Optional[float] = None,
     late_disclosure_count: int = 0,
 ) -> InsiderActivitySummary:
-    """Minimal InsiderActivitySummary for scoring tests."""
+    """Minimal InsiderActivitySummary for scoring tests.
+
+    `discretionary_net_dollars` defaults to `net_dollars` (most fixtures model
+    real open-market sales where the two coincide); pass it explicitly to model
+    the FOLLOWUPS #17 divergence where comp mechanics inflate `net_dollars`."""
     return InsiderActivitySummary(
         window_days=90,
         window_start="2026-02-24",
@@ -54,6 +59,10 @@ def _empty_insider_summary(
         buys_count=buys_count,
         sales_count=sales_count,
         net_dollars=net_dollars,
+        discretionary_net_dollars=(
+            net_dollars if discretionary_net_dollars is None
+            else discretionary_net_dollars
+        ),
         code_mix={},
         deriv_code_mix={},
         by_officer=[],
@@ -256,6 +265,46 @@ def test_severe_insider_selling_cap() -> None:
             _setup_alert("pead"),
             _setup_alert("pre_catalyst"),
         ],
+    )
+    assert breakdown.get("insider_selling_cap") is True
+    assert score <= INSIDER_SELLING_SCORE_CAP
+
+
+def test_insider_selling_cap_uses_discretionary_not_total() -> None:
+    """FOLLOWUPS #17: a large all-disposals net (-$100M, inflated by F-code
+    tax-withholding) must NOT trip the cap when DISCRETIONARY selling is small
+    (-$2M). The cap keys on discretionary_net_dollars, not net_dollars."""
+    summary = _empty_insider_summary(
+        total_filings=5,
+        buys_count=0,
+        sales_count=3,                       # meets the S-count guard
+        net_dollars=-100_000_000.0,          # inflated by vesting/tax disposals
+        discretionary_net_dollars=-2_000_000.0,  # actual open-market selling
+    )
+    score, breakdown = compute_intrinsic_score(
+        ticker_data={"return_30d": 0.30},
+        insider_summary=summary,
+        world_state={},
+        screener_alerts=[],
+    )
+    assert "insider_selling_cap" not in breakdown
+
+
+def test_insider_selling_cap_fires_on_discretionary() -> None:
+    """Conversely, genuine discretionary selling (-$15M) below the threshold
+    with ≥3 sales and zero buys still trips the cap."""
+    summary = _empty_insider_summary(
+        total_filings=4,
+        buys_count=0,
+        sales_count=4,
+        net_dollars=-15_000_000.0,
+        discretionary_net_dollars=-15_000_000.0,
+    )
+    score, breakdown = compute_intrinsic_score(
+        ticker_data={"return_30d": 0.30, "volume_ratio": 2.0},
+        insider_summary=summary,
+        world_state={"regime": "bull-trending"},
+        screener_alerts=[],
     )
     assert breakdown.get("insider_selling_cap") is True
     assert score <= INSIDER_SELLING_SCORE_CAP

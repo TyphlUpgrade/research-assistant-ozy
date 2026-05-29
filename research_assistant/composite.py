@@ -215,11 +215,15 @@ def compute_intrinsic_score(
 
     # Insider activity (uses structured dataclass directly)
     if insider_summary is not None and insider_summary.total_filings > 0:
-        if insider_summary.net_dollars > INSIDER_BUYING_DOLLAR_THRESHOLD:
+        # Key on DISCRETIONARY (open-market P/S) net $, not the all-disposals
+        # figure — code-F tax-withholding on vesting is comp mechanics, not
+        # informed buying/selling, and would otherwise inflate the signal and
+        # spuriously trip the cap (FOLLOWUPS #17).
+        if insider_summary.discretionary_net_dollars > INSIDER_BUYING_DOLLAR_THRESHOLD:
             score += INSIDER_BUYING_BONUS
             breakdown["insider_buying"] = INSIDER_BUYING_BONUS
         elif (
-            insider_summary.net_dollars < INSIDER_SELLING_DOLLAR_THRESHOLD
+            insider_summary.discretionary_net_dollars < INSIDER_SELLING_DOLLAR_THRESHOLD
             and insider_summary.sales_count >= INSIDER_SELLING_MIN_SALES
             and insider_summary.buys_count == 0
         ):
