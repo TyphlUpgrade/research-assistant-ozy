@@ -7,7 +7,7 @@ expected output shapes against synthetic bars.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pandas as pd
@@ -81,6 +81,27 @@ def test_volume_ratio_vs_20d_basic() -> None:
 
 def test_volume_ratio_short_returns_none() -> None:
     assert _volume_ratio_vs_20d(pd.Series([100] * 5)) is None
+
+
+def test_volume_ratio_drops_partial_current_session_bar() -> None:
+    """Intraday runs: the latest bar (dated today ET) carries partial volume.
+    It must be dropped so the ratio compares full days, not a 4%-of-average
+    in-progress bar. 21 full days (vol 100) + today's partial (vol 2) → the
+    partial bar is dropped, leaving 100/100 = 1.0 (not 2/100 = 0.02)."""
+    idx = pd.date_range(end="2026-05-29", periods=22, freq="B")
+    v = pd.Series([100.0] * 21 + [2.0], index=idx)  # last bar = 2026-05-29
+    # Without the fix this would be ~0.02; with the partial bar dropped it's 1.0.
+    assert _volume_ratio_vs_20d(v, asof_date=date(2026, 5, 29)) == 1.0
+
+
+def test_volume_ratio_keeps_complete_bar_when_last_not_today() -> None:
+    """When the latest bar predates the as-of session (e.g. a weekend/after-
+    hours run where today's bar hasn't formed), it is a completed bar and is
+    used as-is — no trim."""
+    idx = pd.date_range(end="2026-05-29", periods=21, freq="B")  # ends Fri 5/29
+    v = pd.Series([100.0] * 20 + [150.0], index=idx)
+    # As-of the following Monday: last bar (5/29) is complete → use it. 150/100.
+    assert _volume_ratio_vs_20d(v, asof_date=date(2026, 6, 1)) == 1.5
 
 
 def test_weekly_rsi_14_needs_min_history() -> None:

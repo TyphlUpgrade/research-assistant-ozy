@@ -27,8 +27,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -109,11 +110,33 @@ def _weekly_rsi_14(daily_close: pd.Series) -> Optional[float]:
         return None
 
 
-def _volume_ratio_vs_20d(volume: pd.Series) -> Optional[float]:
-    """Today's volume / 20d-avg volume."""
+def _volume_ratio_vs_20d(
+    volume: pd.Series, *, asof_date: Optional[date] = None
+) -> Optional[float]:
+    """Most-recent COMPLETED daily bar's volume / prior-20-bar average.
+
+    When the cascade runs intraday (e.g. the morning brief, right after the
+    open), yfinance's latest daily bar is the in-progress session carrying
+    only partial accumulated volume — dividing that by full-day averages
+    produced a spuriously tiny ratio (~0.04 at the open) that corrupted the
+    volume signal across every ticker. When the latest bar is dated the
+    current ET session we drop it and use the last completed bar, keeping this
+    a full-day-vs-full-day comparison. Tradeoff: after the close (today's bar
+    is complete) the ratio lags by one session — acceptable for a daily
+    participation signal, and far better than the partial-bar artifact.
+
+    `asof_date` overrides "today" (ET) for deterministic testing.
+    """
     if volume is None or len(volume) < 21:
         return None
     try:
+        last_ts = volume.index[-1]
+        last_date = last_ts.date() if hasattr(last_ts, "date") else None
+        today_et = asof_date or datetime.now(ZoneInfo("America/New_York")).date()
+        if last_date is not None and last_date == today_et:
+            volume = volume.iloc[:-1]  # drop the in-progress partial bar
+        if len(volume) < 21:
+            return None
         avg20 = float(volume.iloc[-21:-1].mean())
         today = float(volume.iloc[-1])
         if avg20 <= 0:
