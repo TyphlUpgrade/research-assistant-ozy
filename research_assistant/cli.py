@@ -1243,6 +1243,71 @@ def _render_trajectory(ticker: str, history: list[dict]) -> str:
     return "\n".join(rows)
 
 
+_HORIZON_FIELD_BY_ARG = {
+    "5d": "return_5d",
+    "10d": "return_10d",
+    "30d": "return_30d",
+}
+
+
+async def _cmd_scoreboard(args: argparse.Namespace) -> int:
+    """Render verdict→outcome calibration over the Stage 2 journal (FOLLOWUPS #19).
+
+    Lazy-enriches forward returns from yfinance (cached in
+    `.research/stage2_returns/`); zero-fetch on re-run when horizons are
+    already filled.
+    """
+    from ozymandias.data.adapters.yfinance_adapter import YFinanceAdapter
+
+    from research_assistant.scoreboard import (
+        BarsBackedPriceAdapter, enrich_stage2_rows, read_all_stage2,
+        render_scoreboard,
+    )
+
+    base = _resolve_base(args.base)
+    rows = read_all_stage2(base)
+
+    horizon_field = _HORIZON_FIELD_BY_ARG.get(args.horizon, "return_10d")
+
+    if not rows:
+        # Skip the adapter construction (and the import-time yfinance side
+        # effects) when there's nothing to enrich.
+        entries = []
+    else:
+        # Wrap the raw yfinance adapter (which exposes fetch_bars) in the
+        # bars-backed price shim that exposes the fetch_price_at protocol
+        # scoreboard uses. One DataFrame fetch per ticker, reused across
+        # all horizon lookups.
+        adapter = BarsBackedPriceAdapter(YFinanceAdapter())
+        try:
+            entries = await enrich_stage2_rows(rows, adapter, base)
+        except Exception as exc:
+            logging.warning("scoreboard enrichment failed: %s", exc)
+            entries = []
+
+    if args.json:
+        # JSON shape: full ScoredEntry list, easy for piping into other tools.
+        payload = [
+            {
+                "ticker": e.ticker,
+                "asof": e.asof,
+                "recorded_at": e.recorded_at,
+                "composite_conviction": e.composite_conviction,
+                "skeptic_verdict": e.skeptic_verdict,
+                "decision_tag": e.decision_tag,
+                "entry_price": e.entry_price,
+                "return_5d": e.return_5d,
+                "return_10d": e.return_10d,
+                "return_30d": e.return_30d,
+            }
+            for e in entries
+        ]
+        print(json.dumps(payload, indent=2, default=str))
+    else:
+        print(render_scoreboard(entries, horizon_field=horizon_field))
+    return 0
+
+
 def _cmd_trajectory(args: argparse.Namespace) -> int:
     from research_assistant.journal import read_stage2_full_history
 
@@ -1374,6 +1439,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Limit to N most-recent entries (default: all)",
     )
 
+    # scoreboard — verdict→outcome calibration over Stage 2 journal (FOLLOWUPS #19)
+    psb = sub.add_parser(
+        "scoreboard",
+        help="Verdict→return calibration over the Stage 2 journal "
+             "(operator-facing; lazy-enriches forward returns from yfinance)",
+    )
+    psb.add_argument(
+        "--horizon",
+        choices=("5d", "10d", "30d"),
+        default="10d",
+        help="Forward-return horizon to feature in the rendered output "
+             "(default: 10d). All three horizons are enriched regardless; "
+             "this only selects which to render.",
+    )
+
     return p
 
 
@@ -1391,6 +1471,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "dossier":        _cmd_dossier,
         "defender-check": _cmd_defender_check,
         "trajectory":     _cmd_trajectory,
+        "scoreboard":     lambda a: asyncio.run(_cmd_scoreboard(a)),
     }
     handler = handlers.get(args.cmd)
     if handler is None:
