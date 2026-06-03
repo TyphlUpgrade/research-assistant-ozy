@@ -1118,6 +1118,7 @@ async def _cmd_alerts(args: argparse.Namespace) -> int:
 
     from ozymandias.data.adapters.yfinance_adapter import YFinanceAdapter
     from research_assistant.journal import enrich_window, read_alerts_window
+    from research_assistant.price import BarsBackedPriceAdapter
 
     if args.alerts_cmd != "review":
         print(f"Unknown alerts subcommand: {args.alerts_cmd}", file=sys.stderr)
@@ -1134,9 +1135,14 @@ async def _cmd_alerts(args: argparse.Namespace) -> int:
     start_date = end_date - timedelta(days=days)
     alerts = read_alerts_window(base, start_date.isoformat(), end_date.isoformat())
 
-    # Lazy-enrich horizons (plan §B1). Adapter exposes async fetch_price_at.
+    # Lazy-enrich horizons (plan §B1). `enrich_window` expects an adapter
+    # that exposes `async fetch_price_at(symbol, target_date)`. The raw
+    # YFinanceAdapter exposes `fetch_bars` instead, so we wrap it with
+    # the bars-backed price shim. Without this wrap the enrichment path
+    # silently fails — every `return_*` field in `.research/alerts/`
+    # ends up null (production bug fixed alongside this commit).
     if alerts:
-        adapter = YFinanceAdapter()
+        adapter = BarsBackedPriceAdapter(YFinanceAdapter())
         adapter.research_base = base
         try:
             await enrich_window(alerts, adapter)
@@ -1259,9 +1265,9 @@ async def _cmd_scoreboard(args: argparse.Namespace) -> int:
     """
     from ozymandias.data.adapters.yfinance_adapter import YFinanceAdapter
 
+    from research_assistant.price import BarsBackedPriceAdapter
     from research_assistant.scoreboard import (
-        BarsBackedPriceAdapter, enrich_stage2_rows, read_all_stage2,
-        render_scoreboard,
+        enrich_stage2_rows, read_all_stage2, render_scoreboard,
     )
 
     base = _resolve_base(args.base)

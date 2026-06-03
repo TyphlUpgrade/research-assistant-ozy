@@ -624,7 +624,50 @@ months away; if #20 lands first, #18 retires unstarted.
 
 ## 19. `/scoreboard` — operator-facing verdict→outcome calibration
 
-Status: **OPEN** (scoped 2026-06-02 after MRVL/DELL both ran sharply higher on
+Status: **PARTIAL — Phase 1 shipped 2026-06-02 (commit `d1428ab`); Phase 1.5
++ Phase 2 + Phase 3 open**. Architect review on 2026-06-03 surfaced a
+silently-dropped surface from the original spec: candidate-coverage /
+hit-rate. The other three Phase 1 surfaces (verdict stratification,
+conviction decile, anchor-only vs full-data comparison) are either
+shipped or correctly deferred. Re-scoped:
+
+- **Phase 1 (shipped)**: `python -m research_assistant scoreboard` reads
+  the Stage 2 journal, joins forward returns (5d/10d/30d) from yfinance
+  cached at `.research/stage2_returns/`, renders verdict→return
+  stratification + conviction decile analysis. Brief-inline Skeptic
+  verdicts only. Operator-facing only.
+- **Phase 1.5 (OPEN — next ship for this followup)**: candidate-coverage
+  / hit-rate surface. Detects *under-firing* — tickers that ran but the
+  cascade never surfaced. This is the surface that actually catches the
+  failure mode that motivated #19 (MRVL/DELL on 6/02). Cheaper than
+  initially estimated because the screener-alerts journal already
+  contains the candidate universe; needs the alerts-bug fix (separate)
+  + a join by `(ticker, asof)` between alerts and stage2 journals.
+  Reports: "of top-quartile movers in the alerts journal over window W,
+  what fraction were surfaced in the brief at conviction ≥ X?" at
+  thresholds X ∈ {0.4, 0.5, 0.6}. Scope: ~150-200 LOC. Ship before
+  Phase 2.
+- **Phase 2 (OPEN)**: regime + momentum-gate stratification. Requires
+  extending the Stage 2 journal schema additively with `regime` and
+  `momentum_gate_state` (per its existing additive-only contract).
+  `orchestrator.py:680,883` already passes `regime` at write time;
+  Phase 2 plumbs it into `Stage2Note` + `_note_to_row`.
+- **Phase 3 (OPEN)**: anchor-only (`stage_2_skeptic_check`) vs full-data
+  (`stage_3_skeptic`) Skeptic comparison. Stage 3 verdicts live in
+  trace JSONLs, not the journal — needs trace-event reader + join by
+  `(ticker, chain_id)`. The renderer already accepts a `verdict_order`
+  parameter (landed in Phase 1's review-followup commit) so Phase 3
+  passes the Stage 3 vocabulary without refactoring the rendering layer.
+
+Phase 1 caveat: the rendered output now carries an inline note ("ⓘ This
+view scores tickers we surfaced; it does NOT detect tickers we missed
+— see #19 Phase 1.5") so an operator reading scoreboard without
+Phase 1.5 cannot conclude "the cascade is calibrated."
+
+Original scope notes preserved below — superseded by the phased breakout
+above.
+
+Original status (pre-2026-06-03): **OPEN** (scoped 2026-06-02 after MRVL/DELL both ran sharply higher on
 6/02 against the cascade's 5/29 TEMPER on MRVL). Gates the deferred
 "richer-inputs" spec at `.omc/specs/richer-inputs-v1.md` — measurement before
 intervention.

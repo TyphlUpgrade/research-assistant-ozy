@@ -401,107 +401,156 @@ def test_render_unrecognized_verdict_surfaced():
     assert "unrecognized" in out
 
 
+def test_render_unrecognized_verdict_with_no_enriched_returns_renders_na():
+    """The unrecognized-verdict branch has a `'n/a'` fallback for
+    `median=None`; covers the case where a non-default-vocabulary verdict
+    appears with zero enriched returns."""
+    entries = [
+        _scored(composite=0.5, verdict="MYSTERY_VERDICT", r10=None),
+    ]
+    out = scoreboard.render_scoreboard(entries, horizon_field="return_10d")
+    assert "MYSTERY_VERDICT" in out
+    assert "unrecognized" in out
+    assert "n/a" in out
+
+
+def test_render_with_custom_verdict_order_uses_stage3_vocabulary():
+    """Phase 3 will pass Stage 3 Skeptic verdicts here. Verify the
+    renderer accepts an arbitrary verdict_order tuple and surfaces
+    known buckets in that order, leaving the rest in `(unrecognized)`."""
+    entries = [
+        _scored(composite=0.6, verdict="CONFIRM", r10=0.10),
+        _scored(composite=0.6, verdict="CONFIRM", r10=0.15),
+        _scored(composite=0.4, verdict="TEMPER", r10=-0.02),
+        _scored(composite=0.2, verdict="CHALLENGE", r10=-0.10),
+        _scored(composite=0.5, verdict="LEFTOVER_BRIEF_VERDICT", r10=0.01),
+    ]
+    out = scoreboard.render_scoreboard(
+        entries,
+        horizon_field="return_10d",
+        verdict_order=("CONFIRM", "TEMPER", "CHALLENGE", "INVALIDATE"),
+    )
+    assert "**CONFIRM**" in out
+    assert "**TEMPER**" in out
+    assert "**CHALLENGE**" in out
+    # LEFTOVER_BRIEF_VERDICT is not in the passed vocabulary → renders
+    # under the "(unrecognized)" tail.
+    assert "LEFTOVER_BRIEF_VERDICT" in out
+    assert "unrecognized" in out
+
+
+def test_render_includes_under_firing_caveat():
+    """Operators reading the scoreboard without the hit-rate surface
+    could falsely conclude the cascade is calibrated. The renderer must
+    surface this caveat so the caveat is unavoidable when reading the
+    output."""
+    entries = [_scored(composite=0.5, verdict="AGREE", r10=0.05)]
+    out = scoreboard.render_scoreboard(entries, horizon_field="return_10d")
+    assert "Type II error" in out or "tickers we missed" in out
+    assert "Phase 1.5" in out
+
+
 # ---------------------------------------------------------------------------
-# BarsBackedPriceAdapter — the shim that wraps yfinance's fetch_bars
+# Ticker validation — defense in depth at the reader
 # ---------------------------------------------------------------------------
 
-class _StubBarsInner:
-    """Fake `fetch_bars`-style adapter for testing the price shim.
+def test_enrich_drops_row_with_invalid_ticker(tmp_path: Path, caplog):
+    """Rows with malformed tickers (path-traversal attempts, lookalikes,
+    or just journal corruption) are dropped from enrichment results with
+    a warning, never threaded into a filesystem path."""
+    today = date.today()
+    asof = today - timedelta(days=60)
+    rows = [
+        _stage2_row(ticker="VALID", asof=asof.isoformat()),
+        _stage2_row(ticker="../etc/passwd", asof=asof.isoformat()),
+        _stage2_row(ticker="not_a_ticker", asof=asof.isoformat()),
+        _stage2_row(ticker="", asof=asof.isoformat()),
+    ]
+    adapter = _CannedAdapter({
+        ("VALID", asof): 100.0,
+        ("VALID", asof + timedelta(days=5)): 105.0,
+        ("VALID", asof + timedelta(days=10)): 110.0,
+        ("VALID", asof + timedelta(days=30)): 120.0,
+    })
+    with caplog.at_level("WARNING"):
+        entries = asyncio.run(
+            scoreboard.enrich_stage2_rows(rows, adapter, tmp_path)
+        )
+    # Only the VALID row survives.
+    assert len(entries) == 1
+    assert entries[0].ticker == "VALID"
+    # No file was created outside the stage2_returns directory for the
+    # malformed tickers — confirm by listing what's actually there.
+    returns_dir = tmp_path / "stage2_returns"
+    written = sorted(p.name for p in returns_dir.iterdir() if p.is_file())
+    assert written == ["VALID.jsonl"]
+    # No `etc/` subdir was created from `../etc/passwd`.
+    assert not (tmp_path / "etc").exists()
+    # At least one drop was logged.
+    assert any("invalid ticker" in r.message for r in caplog.records)
 
-    `bars_by_symbol` maps a symbol to a list of (date, close) pairs in
-    ascending date order. fetch_bars returns a tiny DataFrame-like object
-    matching what the shim needs (DatetimeIndex with `.date` + a `close`
-    column accessible via `df["close"]`).
+
+# ---------------------------------------------------------------------------
+# Horizon-fetch failure when entry-price succeeds
+# ---------------------------------------------------------------------------
+
+class _PartialFailureAdapter:
+    """Returns entry_price OK, but raises on subsequent horizon fetches.
+
+    Tests the path where the adapter succeeds on the first call (asof
+    price) and then transiently fails on the next (5d / 10d / 30d). The
+    row should still be persisted (entry_price was real) and horizons
+    should land as null so the next run can try to fill them.
     """
 
-    def __init__(self, bars_by_symbol: dict[str, list[tuple[date, float]]]):
-        self.bars_by_symbol = bars_by_symbol
-        self.fetch_count = 0
+    def __init__(self, entry_price: float):
+        self.entry_price = entry_price
+        self.calls: list[date] = []
 
-    async def fetch_bars(self, symbol: str, interval: str, period: str):
-        self.fetch_count += 1
-        bars = self.bars_by_symbol.get(symbol)
-        if bars is None:
-            import pandas as pd
-            return pd.DataFrame()
-        import pandas as pd
-        idx = pd.to_datetime([b[0] for b in bars])
-        return pd.DataFrame(
-            {"close": [b[1] for b in bars]},
-            index=idx,
-        )
+    async def fetch_price_at(self, ticker: str, target):  # noqa: D401
+        self.calls.append(target)
+        if len(self.calls) == 1:
+            return self.entry_price
+        raise RuntimeError("transient horizon failure")
 
 
-def test_bars_backed_adapter_returns_close_on_target():
-    inner = _StubBarsInner({
-        "FOO": [
-            (date(2026, 5, 1), 100.0),
-            (date(2026, 5, 2), 101.0),
-            (date(2026, 5, 3), 102.0),
-        ],
-    })
-    shim = scoreboard.BarsBackedPriceAdapter(inner)
-    got = asyncio.run(shim.fetch_price_at("FOO", date(2026, 5, 2)))
-    assert got == pytest.approx(101.0)
+def test_enrich_persists_row_when_horizon_fetch_fails(tmp_path: Path):
+    today = date.today()
+    asof = today - timedelta(days=60)
+    row = _stage2_row(ticker="PART", asof=asof.isoformat())
+    adapter = _PartialFailureAdapter(entry_price=100.0)
+    entries = asyncio.run(
+        scoreboard.enrich_stage2_rows([row], adapter, tmp_path)
+    )
+    assert len(entries) == 1
+    e = entries[0]
+    assert e.entry_price == pytest.approx(100.0)
+    assert e.return_5d is None
+    assert e.return_10d is None
+    assert e.return_30d is None
+    # Row IS cached because we have a real entry price — the horizons
+    # being None is expected (refresh-on-mature handles future retries).
+    cache_path = tmp_path / "stage2_returns" / "PART.jsonl"
+    assert cache_path.exists()
 
 
-def test_bars_backed_adapter_falls_back_to_last_bar_before_target():
-    """Weekend / holiday case: target has no bar; use most recent prior bar."""
-    inner = _StubBarsInner({
-        "FOO": [
-            (date(2026, 5, 1), 100.0),  # Friday
-            (date(2026, 5, 4), 105.0),  # Monday (skip weekend)
-        ],
-    })
-    shim = scoreboard.BarsBackedPriceAdapter(inner)
-    # Sunday 2026-05-03 — no bar exists; expect the Friday close.
-    got = asyncio.run(shim.fetch_price_at("FOO", date(2026, 5, 3)))
-    assert got == pytest.approx(100.0)
+# ---------------------------------------------------------------------------
+# Oversize-line guard — defense in depth at the reader
+# ---------------------------------------------------------------------------
+
+def test_read_all_stage2_skips_oversize_lines(tmp_path: Path, caplog):
+    path = tmp_path / "stage2" / "BIG.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        f.write(json.dumps(_stage2_row(ticker="BIG", asof="2026-05-01")) + "\n")
+        # 32KB oversize row — over the 16KB guard.
+        f.write(json.dumps({"x": "a" * 32_000}) + "\n")
+        f.write(json.dumps(_stage2_row(ticker="BIG", asof="2026-05-02")) + "\n")
+    with caplog.at_level("WARNING"):
+        rows = scoreboard.read_all_stage2(tmp_path)
+    assert len(rows) == 2  # oversize row skipped, two valid rows survive
+    assert any("line >" in r.message for r in caplog.records)
 
 
-def test_bars_backed_adapter_returns_none_before_history():
-    inner = _StubBarsInner({
-        "FOO": [(date(2026, 5, 10), 100.0)],
-    })
-    shim = scoreboard.BarsBackedPriceAdapter(inner)
-    got = asyncio.run(shim.fetch_price_at("FOO", date(2026, 5, 1)))
-    assert got is None
-
-
-def test_bars_backed_adapter_caches_per_symbol():
-    """Multiple price lookups for the same symbol → one fetch_bars call."""
-    inner = _StubBarsInner({
-        "FOO": [
-            (date(2026, 5, 1), 100.0),
-            (date(2026, 5, 5), 110.0),
-            (date(2026, 5, 10), 120.0),
-        ],
-    })
-    shim = scoreboard.BarsBackedPriceAdapter(inner)
-
-    async def _go():
-        a = await shim.fetch_price_at("FOO", date(2026, 5, 1))
-        b = await shim.fetch_price_at("FOO", date(2026, 5, 5))
-        c = await shim.fetch_price_at("FOO", date(2026, 5, 10))
-        return a, b, c
-
-    a, b, c = asyncio.run(_go())
-    assert (a, b, c) == (pytest.approx(100.0), pytest.approx(110.0), pytest.approx(120.0))
-    assert inner.fetch_count == 1
-
-
-def test_bars_backed_adapter_unknown_symbol_returns_none():
-    inner = _StubBarsInner({})
-    shim = scoreboard.BarsBackedPriceAdapter(inner)
-    got = asyncio.run(shim.fetch_price_at("MISSING", date(2026, 5, 1)))
-    assert got is None
-
-
-def test_bars_backed_adapter_fetch_exception_returns_none():
-    class _BadInner:
-        async def fetch_bars(self, symbol, interval, period):
-            raise RuntimeError("network down")
-
-    shim = scoreboard.BarsBackedPriceAdapter(_BadInner())
-    got = asyncio.run(shim.fetch_price_at("FOO", date(2026, 5, 1)))
-    assert got is None
+# Shim tests live in tests/test_price.py — the `BarsBackedPriceAdapter`
+# moved to `research_assistant/price.py` after the 2026-06-03 review.
