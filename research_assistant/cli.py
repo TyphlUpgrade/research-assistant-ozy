@@ -1255,6 +1255,12 @@ _HORIZON_FIELD_BY_ARG = {
     "30d": "return_30d",
 }
 
+_HIT_RATE_HORIZON_BY_ARG = {
+    "7d": "return_7d",
+    "30d": "return_30d",
+    "90d": "return_90d",
+}
+
 
 async def _cmd_scoreboard(args: argparse.Namespace) -> int:
     """Render verdict→outcome calibration over the Stage 2 journal (FOLLOWUPS #19).
@@ -1262,23 +1268,38 @@ async def _cmd_scoreboard(args: argparse.Namespace) -> int:
     Lazy-enriches forward returns from yfinance (cached in
     `.research/stage2_returns/`); zero-fetch on re-run when horizons are
     already filled.
+
+    Two surfaces in the output:
+    - **Phase 1** — verdict stratification + conviction decile over
+      Stage 2 entries. Scores tickers the cascade surfaced.
+    - **Phase 1.5** — hit rate over alerts that subsequently moved.
+      Detects under-firing (tickers we missed). Disabled with
+      `--no-hit-rate` if the operator only wants the Phase 1 view.
     """
+    from datetime import date, timedelta
+
     from ozymandias.data.adapters.yfinance_adapter import YFinanceAdapter
 
+    from research_assistant.journal import enrich_window, read_alerts_window
     from research_assistant.price import BarsBackedPriceAdapter
     from research_assistant.scoreboard import (
-        enrich_stage2_rows, read_all_stage2, render_scoreboard,
+        compute_hit_rate, enrich_stage2_rows, read_all_stage2, render_hit_rate,
+        render_scoreboard,
     )
 
     base = _resolve_base(args.base)
     rows = read_all_stage2(base)
 
     horizon_field = _HORIZON_FIELD_BY_ARG.get(args.horizon, "return_10d")
+    hit_rate_horizon = _HIT_RATE_HORIZON_BY_ARG.get(
+        args.hit_rate_horizon, "return_30d",
+    )
 
     if not rows:
         # Skip the adapter construction (and the import-time yfinance side
         # effects) when there's nothing to enrich.
         entries = []
+        adapter = None
     else:
         # Wrap the raw yfinance adapter (which exposes fetch_bars) in the
         # bars-backed price shim that exposes the fetch_price_at protocol
@@ -1291,26 +1312,64 @@ async def _cmd_scoreboard(args: argparse.Namespace) -> int:
             logging.warning("scoreboard enrichment failed: %s", exc)
             entries = []
 
+    hit_rate: dict | None = None
+    if not args.no_hit_rate:
+        # Pull alerts in the window and ensure they're forward-return
+        # enriched. enrich_window LWW-appends so subsequent re-reads pick
+        # up the new horizons.
+        end_date = date.today()
+        start_date = end_date - timedelta(days=args.alerts_window_days)
+        alerts = read_alerts_window(
+            base, start_date.isoformat(), end_date.isoformat(),
+        )
+        if alerts:
+            # Reuse the same adapter if we already built one; otherwise
+            # construct one just for the alerts-enrichment path.
+            if adapter is None:
+                adapter = BarsBackedPriceAdapter(YFinanceAdapter())
+            adapter.research_base = base
+            try:
+                await enrich_window(alerts, adapter)
+            except Exception as exc:
+                logging.warning("scoreboard alerts enrichment failed: %s", exc)
+            # Re-read so LWW-superseded enrichment rows are folded back in.
+            alerts = read_alerts_window(
+                base, start_date.isoformat(), end_date.isoformat(),
+            )
+        hit_rate = compute_hit_rate(
+            alerts, entries,
+            horizon_field=hit_rate_horizon,
+            lookback_days=args.lookback_days,
+            top_quantile=args.top_quantile,
+        )
+
     if args.json:
-        # JSON shape: full ScoredEntry list, easy for piping into other tools.
-        payload = [
-            {
-                "ticker": e.ticker,
-                "asof": e.asof,
-                "recorded_at": e.recorded_at,
-                "composite_conviction": e.composite_conviction,
-                "skeptic_verdict": e.skeptic_verdict,
-                "decision_tag": e.decision_tag,
-                "entry_price": e.entry_price,
-                "return_5d": e.return_5d,
-                "return_10d": e.return_10d,
-                "return_30d": e.return_30d,
-            }
-            for e in entries
-        ]
+        # JSON shape: full ScoredEntry list + hit-rate dict, easy for
+        # piping into other tools.
+        payload = {
+            "entries": [
+                {
+                    "ticker": e.ticker,
+                    "asof": e.asof,
+                    "recorded_at": e.recorded_at,
+                    "composite_conviction": e.composite_conviction,
+                    "skeptic_verdict": e.skeptic_verdict,
+                    "decision_tag": e.decision_tag,
+                    "entry_price": e.entry_price,
+                    "return_5d": e.return_5d,
+                    "return_10d": e.return_10d,
+                    "return_30d": e.return_30d,
+                }
+                for e in entries
+            ],
+            "hit_rate": hit_rate,
+        }
         print(json.dumps(payload, indent=2, default=str))
     else:
         print(render_scoreboard(entries, horizon_field=horizon_field))
+        if hit_rate is not None:
+            print()
+            print(render_hit_rate(hit_rate))
     return 0
 
 
@@ -1449,15 +1508,52 @@ def _build_parser() -> argparse.ArgumentParser:
     psb = sub.add_parser(
         "scoreboard",
         help="Verdict→return calibration over the Stage 2 journal "
-             "(operator-facing; lazy-enriches forward returns from yfinance)",
+             "(operator-facing; lazy-enriches forward returns from yfinance). "
+             "Includes a hit-rate surface that joins the alerts journal "
+             "to detect under-firing.",
     )
     psb.add_argument(
         "--horizon",
         choices=("5d", "10d", "30d"),
         default="10d",
-        help="Forward-return horizon to feature in the rendered output "
-             "(default: 10d). All three horizons are enriched regardless; "
-             "this only selects which to render.",
+        help="Stage 2 forward-return horizon to feature in the rendered "
+             "output (default: 10d). All three horizons are enriched "
+             "regardless; this only selects which to render.",
+    )
+    psb.add_argument(
+        "--hit-rate-horizon",
+        choices=("7d", "30d", "90d"),
+        default="30d",
+        help="Alerts-journal horizon for the hit-rate analysis (default: 30d). "
+             "Alerts use 7d/30d/90d, different from the Stage 2 5d/10d/30d.",
+    )
+    psb.add_argument(
+        "--no-hit-rate",
+        action="store_true",
+        help="Skip the hit-rate / under-firing surface (Phase 1.5). "
+             "Faster — avoids the alerts-enrichment fetch.",
+    )
+    psb.add_argument(
+        "--alerts-window-days",
+        type=int,
+        default=60,
+        help="Window over alerts journal for hit-rate analysis (default: 60d). "
+             "Should be ≥ hit-rate-horizon + lookback so movers have a "
+             "chance to mature.",
+    )
+    psb.add_argument(
+        "--lookback-days",
+        type=int,
+        default=3,
+        help="Brief asof window after alert.asof that counts as 'surfaced' "
+             "(default: 3). Smaller = stricter; larger dilutes the signal.",
+    )
+    psb.add_argument(
+        "--top-quantile",
+        type=float,
+        default=0.75,
+        help="Top quantile cutoff for 'movers' (default: 0.75 = top quartile). "
+             "Use 0.5 = top half for sparser data.",
     )
 
     return p

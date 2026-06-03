@@ -636,17 +636,25 @@ shipped or correctly deferred. Re-scoped:
   cached at `.research/stage2_returns/`, renders verdict→return
   stratification + conviction decile analysis. Brief-inline Skeptic
   verdicts only. Operator-facing only.
-- **Phase 1.5 (OPEN — next ship for this followup)**: candidate-coverage
-  / hit-rate surface. Detects *under-firing* — tickers that ran but the
-  cascade never surfaced. This is the surface that actually catches the
-  failure mode that motivated #19 (MRVL/DELL on 6/02). Cheaper than
-  initially estimated because the screener-alerts journal already
-  contains the candidate universe; needs the alerts-bug fix (separate)
-  + a join by `(ticker, asof)` between alerts and stage2 journals.
-  Reports: "of top-quartile movers in the alerts journal over window W,
-  what fraction were surfaced in the brief at conviction ≥ X?" at
-  thresholds X ∈ {0.4, 0.5, 0.6}. Scope: ~150-200 LOC. Ship before
-  Phase 2.
+- **Phase 1.5 (shipped 2026-06-03)**: candidate-coverage / hit-rate
+  surface. Detects *under-firing* — tickers that ran but the cascade
+  never surfaced at meaningful conviction. Joins the alerts journal
+  (`.research/alerts/*.jsonl`, the system's record of "interesting
+  candidates") with the Stage 2 journal by `(ticker, asof + lookback)`
+  and reports: of top-quantile movers, what fraction were surfaced
+  within `lookback_days` of the alert at composite_conviction ≥ X
+  for X ∈ {0.4, 0.5, 0.6}? Operator flags: `--hit-rate-horizon`
+  (7d/30d/90d), `--top-quantile` (default 0.75), `--lookback-days`
+  (default 3), `--alerts-window-days` (default 60), `--no-hit-rate`.
+
+  Empirical note (2026-06-03 smoke): only the sector_rotation screener
+  is currently firing alerts, and those alerts are on sector ETFs
+  (XLB, XLK, …), not stocks the brief separately surfaces. So today's
+  hit-rate output shows 0/3 surfaced at all thresholds — correct
+  given the only "movers" are sector ETFs the brief doesn't pick
+  individually. The surface will produce meaningful signal once
+  stock-level screeners (momentum, breakout) are added to the
+  pipeline.
 - **Phase 2 (OPEN)**: regime + momentum-gate stratification. Requires
   extending the Stage 2 journal schema additively with `regime` and
   `momentum_gate_state` (per its existing additive-only contract).

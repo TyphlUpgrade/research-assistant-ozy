@@ -24,15 +24,16 @@ Phase scope per FOLLOWUPS #19 audit (2026-06-02 / revised 2026-06-03):
   `render_scoreboard(verdict_order=...)` so Phase 3 can swap in the
   Stage 3 vocabulary without refactoring.
 
-- **Phase 1.5 (deferred):** candidate-coverage / hit-rate surface — the
-  surface that detects *under-firing* (tickers that ran but the cascade
-  never surfaced). Phase 1's verdict-stratification + decile-analysis
-  score the verdicts that exist; neither catches the Type II error that
-  motivated #19 in the first place (MRVL/DELL on 2026-06-02, both ran
-  sharply higher after the cascade tempered them). An operator reading
-  Phase 1 output should NOT conclude "the cascade is calibrated" without
-  the hit-rate view. See `render_scoreboard` output for the explicit
-  caveat in the rendered text.
+- **Phase 1.5 (shipped 2026-06-03):** candidate-coverage / hit-rate
+  surface — detects *under-firing* (tickers that ran but the cascade
+  never surfaced at meaningful conviction). Joins the alerts journal
+  (`.research/alerts/*.jsonl`, the system's record of "interesting
+  candidates") with the Stage 2 journal by `(ticker, asof window)` and
+  reports: of top-quartile movers (alerts with forward returns in the
+  top quartile of the window), what fraction were surfaced in a brief
+  within `lookback_days` of the alert at composite_conviction ≥ X for
+  thresholds X ∈ {0.4, 0.5, 0.6}? See `compute_hit_rate` +
+  `render_hit_rate`.
 
 - **Phase 2 (deferred):** regime + momentum-gate stratification. Requires
   extending the Stage 2 journal schema additively with `regime` and
@@ -558,15 +559,12 @@ def render_scoreboard(
             "hasn't elapsed for any journaled date). Rerun in "
             f"{horizon_field.replace('return_', '').replace('d', '')}+ days."
         )
-    # The under-firing caveat. Phase 1 measures whether the verdicts and
-    # convictions the cascade emitted predict returns on the tickers it
-    # surfaced — it does NOT measure tickers the cascade declined to
-    # surface that subsequently moved. Reading this scoreboard as "the
-    # cascade is well-calibrated" is unsafe without the Phase 1.5
-    # hit-rate surface (deferred, FOLLOWUPS #19).
+    # This section scores tickers the cascade surfaced. The "Hit rate"
+    # section below (rendered separately by `render_hit_rate`) covers the
+    # complementary axis — tickers that moved but the cascade missed.
     lines.append(
-        "ⓘ This view scores tickers we surfaced; it does NOT detect tickers "
-        "we missed (Type II error). See FOLLOWUPS #19 Phase 1.5."
+        "ⓘ This view scores tickers we surfaced. The Hit-rate section "
+        "below covers Type II error (tickers we missed)."
     )
     lines.append("")
 
@@ -639,4 +637,207 @@ def render_scoreboard(
                 f"{d['count']}{warn} | {d['median_return']:+.2%} |"
             )
 
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.5 — candidate-coverage / hit-rate
+# ---------------------------------------------------------------------------
+
+# The alerts journal uses different forward-return horizons (7d/30d/90d)
+# than the Stage 2 scoreboard (5d/10d/30d). These constants pin the alerts
+# horizon names so callers don't typo them.
+ALERTS_HORIZON_FIELDS = ("return_7d", "return_30d", "return_90d")
+
+# Default conviction thresholds to slice the surface coverage by. At ≥0.4
+# the brief survivor floor; ≥0.5 = moderate confidence; ≥0.6 = high
+# (anything above 0.6 today is the top end of the observed range — see
+# Phase 1 deciles 0.06–0.60).
+DEFAULT_CONVICTION_THRESHOLDS: tuple[float, ...] = (0.4, 0.5, 0.6)
+
+# Default top-quantile cutoff for "movers". 0.75 = top quartile. Operator
+# can pass a smaller cut (e.g. 0.5 = top half) when the alerts journal is
+# sparse and quartile cuts produce only 1-2 movers.
+DEFAULT_TOP_QUANTILE = 0.75
+
+# Default lookback window — how many days after an alert fires does the
+# brief have to surface the ticker before we count it as "missed"? Three
+# days covers same-day + next two trading days; longer windows let stale
+# brief reactions count and dilute the signal.
+DEFAULT_LOOKBACK_DAYS = 3
+
+
+def compute_hit_rate(
+    alerts: list[dict],
+    entries: list[ScoredEntry],
+    *,
+    horizon_field: str = "return_30d",
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    conviction_thresholds: tuple[float, ...] = DEFAULT_CONVICTION_THRESHOLDS,
+    top_quantile: float = DEFAULT_TOP_QUANTILE,
+) -> dict:
+    """Of top-quantile movers in `alerts`, what fraction did the cascade
+    surface in `entries` at composite_conviction ≥ threshold, within
+    `lookback_days` of the alert?
+
+    Args:
+        alerts: rows from `read_alerts_window`. Caller is responsible for
+            picking the window; alerts WITHOUT an enriched `horizon_field`
+            return are skipped (their horizon hasn't elapsed yet).
+        entries: `ScoredEntry` list from `enrich_stage2_rows`.
+        horizon_field: which alerts-horizon field to use. Must be one of
+            ALERTS_HORIZON_FIELDS.
+        lookback_days: brief asof ∈ [alert.asof, alert.asof + lookback_days]
+            counts as "the brief surfaced this alert."
+        conviction_thresholds: ascending list of thresholds to bucket
+            surfaces by.
+        top_quantile: 0.75 = top quartile; 0.5 = top half.
+
+    Returns dict with structure:
+        {
+            "total_alerts": int,                    # all alerts passed in
+            "enriched_alerts": int,                 # alerts with non-null horizon
+            "movers": int,                          # alerts ≥ cutoff
+            "cutoff_return": float | None,          # the cutoff value used
+            "by_threshold": [
+                {
+                    "threshold": float,
+                    "surfaced": int,
+                    "hit_rate": float,  # surfaced / movers; 0.0 when movers==0
+                    "small_n": bool,    # movers < _SMALL_N_WARN
+                },
+                ...
+            ],
+            "horizon_field": str,
+            "lookback_days": int,
+            "top_quantile": float,
+        }
+
+    Both AGREE-on-empty and the explicit "0/0 = undefined hit rate" cases
+    use 0.0 for `hit_rate`; check `movers` before reading it.
+    """
+    if horizon_field not in ALERTS_HORIZON_FIELDS:
+        raise ValueError(
+            f"horizon_field must be one of {ALERTS_HORIZON_FIELDS}, "
+            f"got {horizon_field!r}"
+        )
+
+    enriched_alerts = [
+        a for a in alerts
+        if isinstance(a.get(horizon_field), (int, float))
+    ]
+    base = {
+        "total_alerts": len(alerts),
+        "enriched_alerts": len(enriched_alerts),
+        "movers": 0,
+        "cutoff_return": None,
+        "by_threshold": [],
+        "horizon_field": horizon_field,
+        "lookback_days": lookback_days,
+        "top_quantile": top_quantile,
+    }
+    if not enriched_alerts:
+        return base
+
+    # Top-quantile cutoff. With small N this is fragile; the renderer
+    # surfaces a small-N warning so the operator doesn't over-interpret.
+    returns = sorted(a[horizon_field] for a in enriched_alerts)
+    cutoff_value = _quantile(returns, top_quantile)
+    movers = [
+        a for a in enriched_alerts
+        if a[horizon_field] >= cutoff_value
+    ]
+    base["movers"] = len(movers)
+    base["cutoff_return"] = cutoff_value
+
+    # Pre-index stage 2 entries by ticker for O(1) lookup.
+    entries_by_ticker: dict[str, list[ScoredEntry]] = {}
+    for e in entries:
+        entries_by_ticker.setdefault(e.ticker, []).append(e)
+
+    by_threshold: list[dict] = []
+    for thresh in conviction_thresholds:
+        surfaced = 0
+        for alert in movers:
+            ticker = alert.get("ticker")
+            asof_str = alert.get("asof")
+            if not ticker or not asof_str:
+                continue
+            alert_asof = _parse_asof(asof_str)
+            if alert_asof is None:
+                continue
+            window_end = alert_asof + timedelta(days=lookback_days)
+            for e in entries_by_ticker.get(ticker, []):
+                e_asof = _parse_asof(e.asof)
+                if e_asof is None:
+                    continue
+                if alert_asof <= e_asof <= window_end and e.composite_conviction >= thresh:
+                    surfaced += 1
+                    break  # one surface per alert is enough
+        hit_rate = surfaced / len(movers) if movers else 0.0
+        by_threshold.append({
+            "threshold": thresh,
+            "surfaced": surfaced,
+            "hit_rate": hit_rate,
+            "small_n": len(movers) < _SMALL_N_WARN,
+        })
+    base["by_threshold"] = by_threshold
+    return base
+
+
+def render_hit_rate(result: dict) -> str:
+    """Operator-facing text output for the hit-rate analysis."""
+    lines: list[str] = []
+    horizon_label = result["horizon_field"].replace("return_", "")
+    pct = int(round(result["top_quantile"] * 100))
+    top_label = "quartile" if pct == 75 else "half" if pct == 50 else f"{100 - pct}%"
+    lines.append(
+        f"## Hit rate — top-{top_label} movers ({horizon_label} horizon, "
+        f"alerts journal)"
+    )
+    lines.append("")
+    lines.append(
+        f"Alerts in window: {result['total_alerts']} "
+        f"(enriched at {horizon_label}: {result['enriched_alerts']})"
+    )
+    if result["enriched_alerts"] == 0:
+        lines.append("")
+        lines.append(
+            f"(no alerts have enriched {horizon_label} returns yet — "
+            f"rerun once alerts older than {horizon_label} accumulate)"
+        )
+        return "\n".join(lines)
+
+    if result["movers"] == 0:
+        lines.append("")
+        lines.append("(no movers above the top-quantile cutoff)")
+        return "\n".join(lines)
+
+    cutoff = result["cutoff_return"]
+    lines.append(
+        f"Movers (top {top_label}, {horizon_label} ≥ {cutoff:+.2%}): "
+        f"{result['movers']}"
+    )
+    if result["movers"] < _SMALL_N_WARN:
+        lines.append(
+            f"⚠ SMALL N: only {result['movers']} movers — hit-rate "
+            "percentages below are dominated by single-ticker outcomes."
+        )
+    lines.append(f"Lookback window: alert.asof + {result['lookback_days']}d.")
+    lines.append("")
+    lines.append("| Conviction threshold | Surfaced | Hit rate |")
+    lines.append("|---|---|---|")
+    for b in result["by_threshold"]:
+        lines.append(
+            f"| ≥{b['threshold']:.2f} | "
+            f"{b['surfaced']} / {result['movers']} | "
+            f"{b['hit_rate']:.0%} |"
+        )
+    lines.append("")
+    lines.append(
+        "Interpretation: 0% hit rate at high thresholds with non-zero at "
+        "low thresholds = cascade sees these tickers but expresses "
+        "structurally low conviction. 0% across all thresholds = cascade "
+        "never surfaced them at all."
+    )
     return "\n".join(lines)

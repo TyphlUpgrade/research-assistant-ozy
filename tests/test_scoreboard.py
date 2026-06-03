@@ -441,13 +441,12 @@ def test_render_with_custom_verdict_order_uses_stage3_vocabulary():
 
 def test_render_includes_under_firing_caveat():
     """Operators reading the scoreboard without the hit-rate surface
-    could falsely conclude the cascade is calibrated. The renderer must
-    surface this caveat so the caveat is unavoidable when reading the
-    output."""
+    could falsely conclude the cascade is calibrated. The renderer
+    forward-references the Hit-rate section in the caveat."""
     entries = [_scored(composite=0.5, verdict="AGREE", r10=0.05)]
     out = scoreboard.render_scoreboard(entries, horizon_field="return_10d")
     assert "Type II error" in out or "tickers we missed" in out
-    assert "Phase 1.5" in out
+    assert "Hit-rate" in out
 
 
 # ---------------------------------------------------------------------------
@@ -554,3 +553,247 @@ def test_read_all_stage2_skips_oversize_lines(tmp_path: Path, caplog):
 
 # Shim tests live in tests/test_price.py — the `BarsBackedPriceAdapter`
 # moved to `research_assistant/price.py` after the 2026-06-03 review.
+
+
+# ---------------------------------------------------------------------------
+# Phase 1.5 — hit-rate / candidate-coverage
+# ---------------------------------------------------------------------------
+
+def _alert(
+    *,
+    ticker: str,
+    asof: str,
+    return_7d: float | None = None,
+    return_30d: float | None = None,
+    return_90d: float | None = None,
+    screener: str = "sector_rotation",
+    entry_price: float = 100.0,
+) -> dict:
+    return {
+        "schema_version": 1,
+        "ticker": ticker,
+        "screener": screener,
+        "asof": asof,
+        "entry_price": entry_price,
+        "evidence": {},
+        "created_at": f"{asof}T00:00:00+00:00",
+        "return_7d": return_7d,
+        "return_30d": return_30d,
+        "return_90d": return_90d,
+        "enriched_at": f"{asof}T12:00:00+00:00" if return_30d is not None else None,
+    }
+
+
+def test_compute_hit_rate_empty_alerts():
+    result = scoreboard.compute_hit_rate(
+        [], [], horizon_field="return_30d",
+    )
+    assert result["total_alerts"] == 0
+    assert result["enriched_alerts"] == 0
+    assert result["movers"] == 0
+    assert result["cutoff_return"] is None
+    assert result["by_threshold"] == []
+
+
+def test_compute_hit_rate_no_enriched_alerts():
+    alerts = [_alert(ticker="AAA", asof="2026-05-01", return_30d=None)]
+    result = scoreboard.compute_hit_rate(
+        alerts, [], horizon_field="return_30d",
+    )
+    assert result["total_alerts"] == 1
+    assert result["enriched_alerts"] == 0
+    assert result["movers"] == 0
+
+
+def test_compute_hit_rate_invalid_horizon_field_raises():
+    with pytest.raises(ValueError, match="horizon_field"):
+        scoreboard.compute_hit_rate([], [], horizon_field="return_99d")
+
+
+def test_compute_hit_rate_movers_identified_above_quartile_cutoff():
+    """8 alerts with returns 0.01 to 0.08; top quartile cutoff at ~0.0625;
+    top quartile should be the highest 2-3 alerts."""
+    alerts = [
+        _alert(ticker=f"T{i}", asof="2026-04-01", return_30d=0.01 * (i + 1))
+        for i in range(8)
+    ]
+    result = scoreboard.compute_hit_rate(
+        alerts, [], horizon_field="return_30d", top_quantile=0.75,
+    )
+    assert result["enriched_alerts"] == 8
+    # top quartile of [0.01..0.08] → cutoff near 0.0625
+    assert result["movers"] >= 2
+    assert result["movers"] <= 3
+    assert result["cutoff_return"] is not None
+    assert result["cutoff_return"] > 0.05
+
+
+def test_compute_hit_rate_surfaces_match_via_lookback_window():
+    """Mover alert on day D; Stage 2 entry for the same ticker on D+2 with
+    conviction 0.55. With lookback_days=3, the entry counts as surfaced
+    at thresholds ≤0.55 and not at >0.55."""
+    alerts = [
+        _alert(ticker="ABC", asof="2026-04-01", return_30d=0.20),
+    ]
+    entries = [
+        _scored(ticker="ABC", composite=0.55, verdict="AGREE", r10=None),
+    ]
+    # Patch the entry's asof to be 2 days after the alert.
+    entries[0] = scoreboard.ScoredEntry(
+        ticker=entries[0].ticker,
+        asof="2026-04-03",
+        recorded_at=entries[0].recorded_at,
+        composite_conviction=entries[0].composite_conviction,
+        skeptic_verdict=entries[0].skeptic_verdict,
+        decision_tag=entries[0].decision_tag,
+        entry_price=entries[0].entry_price,
+        return_5d=entries[0].return_5d,
+        return_10d=entries[0].return_10d,
+        return_30d=entries[0].return_30d,
+    )
+    result = scoreboard.compute_hit_rate(
+        alerts, entries,
+        horizon_field="return_30d",
+        lookback_days=3,
+        conviction_thresholds=(0.40, 0.50, 0.60),
+    )
+    assert result["movers"] == 1
+    by_t = {b["threshold"]: b for b in result["by_threshold"]}
+    assert by_t[0.40]["surfaced"] == 1  # 0.55 >= 0.40
+    assert by_t[0.40]["hit_rate"] == pytest.approx(1.0)
+    assert by_t[0.50]["surfaced"] == 1  # 0.55 >= 0.50
+    assert by_t[0.60]["surfaced"] == 0  # 0.55 < 0.60
+    assert by_t[0.60]["hit_rate"] == pytest.approx(0.0)
+
+
+def test_compute_hit_rate_excludes_entries_outside_lookback_window():
+    """Stage 2 entry on D+10 is outside the default 3d lookback — must
+    NOT count as surfaced even though the ticker matches."""
+    alerts = [_alert(ticker="ABC", asof="2026-04-01", return_30d=0.20)]
+    entries = [
+        scoreboard.ScoredEntry(
+            ticker="ABC",
+            asof="2026-04-11",  # 10 days after alert
+            recorded_at="2026-04-11T12:00:00+00:00",
+            composite_conviction=0.80,
+            skeptic_verdict="AGREE",
+            decision_tag="WATCH",
+            entry_price=100.0,
+            return_5d=None,
+            return_10d=None,
+            return_30d=None,
+        ),
+    ]
+    result = scoreboard.compute_hit_rate(
+        alerts, entries, horizon_field="return_30d", lookback_days=3,
+    )
+    assert result["movers"] == 1
+    # No threshold should show this entry as surfaced.
+    for b in result["by_threshold"]:
+        assert b["surfaced"] == 0
+        assert b["hit_rate"] == pytest.approx(0.0)
+
+
+def test_compute_hit_rate_with_zero_movers_returns_zero_hit_rate():
+    """If all alert returns are negative and top_quantile=0.75, the
+    'movers' set is still the top 25% by return but those returns are
+    negative — define what hit_rate even means here."""
+    alerts = [
+        _alert(ticker=f"T{i}", asof="2026-04-01", return_30d=-0.05)
+        for i in range(4)
+    ]
+    result = scoreboard.compute_hit_rate(
+        alerts, [], horizon_field="return_30d", top_quantile=0.75,
+    )
+    # All four alerts are tied at -0.05; the cutoff equals -0.05 and all
+    # four count as movers (because >= cutoff). hit_rate at all thresholds
+    # is 0.0 because no entries.
+    assert result["movers"] >= 1
+    for b in result["by_threshold"]:
+        assert b["hit_rate"] == pytest.approx(0.0)
+
+
+def test_compute_hit_rate_only_first_qualifying_entry_per_alert_counted():
+    """An alert with two qualifying Stage 2 entries should still count
+    once — the metric is 'did the cascade surface this ticker?', not
+    'how many times did the cascade surface this ticker?'."""
+    alerts = [_alert(ticker="ABC", asof="2026-04-01", return_30d=0.20)]
+    entries = [
+        scoreboard.ScoredEntry(
+            ticker="ABC", asof="2026-04-01",
+            recorded_at="2026-04-01T08:00:00+00:00",
+            composite_conviction=0.55, skeptic_verdict="AGREE",
+            decision_tag="WATCH", entry_price=100.0,
+            return_5d=None, return_10d=None, return_30d=None,
+        ),
+        scoreboard.ScoredEntry(
+            ticker="ABC", asof="2026-04-02",
+            recorded_at="2026-04-02T08:00:00+00:00",
+            composite_conviction=0.65, skeptic_verdict="AGREE",
+            decision_tag="WATCH", entry_price=100.0,
+            return_5d=None, return_10d=None, return_30d=None,
+        ),
+    ]
+    result = scoreboard.compute_hit_rate(
+        alerts, entries,
+        horizon_field="return_30d",
+        conviction_thresholds=(0.40,),
+    )
+    assert result["by_threshold"][0]["surfaced"] == 1  # not 2
+
+
+def test_render_hit_rate_empty_window():
+    out = scoreboard.render_hit_rate({
+        "total_alerts": 0,
+        "enriched_alerts": 0,
+        "movers": 0,
+        "cutoff_return": None,
+        "by_threshold": [],
+        "horizon_field": "return_30d",
+        "lookback_days": 3,
+        "top_quantile": 0.75,
+    })
+    assert "Hit rate" in out
+    assert "no alerts" in out.lower() or "Alerts in window: 0" in out
+
+
+def test_render_hit_rate_with_movers_renders_table():
+    result = {
+        "total_alerts": 10,
+        "enriched_alerts": 8,
+        "movers": 2,
+        "cutoff_return": 0.0625,
+        "by_threshold": [
+            {"threshold": 0.40, "surfaced": 1, "hit_rate": 0.5, "small_n": True},
+            {"threshold": 0.50, "surfaced": 0, "hit_rate": 0.0, "small_n": True},
+        ],
+        "horizon_field": "return_30d",
+        "lookback_days": 3,
+        "top_quantile": 0.75,
+    }
+    out = scoreboard.render_hit_rate(result)
+    assert "Movers" in out
+    assert "+6.25%" in out  # cutoff_return formatted
+    assert "SMALL N" in out  # 2 < 5
+    assert "≥0.40" in out
+    assert "1 / 2" in out
+    assert "50%" in out
+    assert "Interpretation" in out
+
+
+def test_render_hit_rate_top_half_label():
+    """top_quantile=0.5 should render as 'top-half', not 'top-quartile'."""
+    result = {
+        "total_alerts": 4,
+        "enriched_alerts": 4,
+        "movers": 2,
+        "cutoff_return": 0.05,
+        "by_threshold": [
+            {"threshold": 0.40, "surfaced": 1, "hit_rate": 0.5, "small_n": True},
+        ],
+        "horizon_field": "return_30d",
+        "lookback_days": 3,
+        "top_quantile": 0.5,
+    }
+    out = scoreboard.render_hit_rate(result)
+    assert "top-half" in out
