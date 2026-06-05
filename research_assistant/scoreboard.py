@@ -252,15 +252,24 @@ def _cache_path(base: Path, ticker: str) -> Path:
     return candidate
 
 
-def read_return_cache(base: Path, ticker: str) -> dict[str, dict]:
+def read_return_cache(base: Path, ticker: str) -> dict[tuple[str, str], dict]:
     """Read the sidecar return cache for a ticker. Returns a dict keyed by
-    `recorded_at` with the most-recent enrichment row per key (LWW — later
-    rows in the file supersede earlier ones)."""
-    out: dict[str, dict] = {}
+    `(source, recorded_at)` with the most-recent enrichment row per key
+    (LWW — later rows in the file supersede earlier ones).
+
+    Brief and research entries share the same per-ticker cache file but
+    must NOT collide on a `recorded_at`-only key: a race between brief
+    and research writing the same microsecond timestamp would have
+    silently clobbered one side's cached returns. Cached rows without a
+    `source` field (written before the schema was tagged) default to
+    `"brief"`.
+    """
+    out: dict[tuple[str, str], dict] = {}
     for row in _read_jsonl(_cache_path(base, ticker)):
-        key = row.get("recorded_at")
-        if key:
-            out[key] = row
+        recorded_at = row.get("recorded_at")
+        if recorded_at:
+            source = row.get("source") or "brief"
+            out[(source, recorded_at)] = row
     return out
 
 
@@ -315,7 +324,7 @@ def _enrichment_complete(cached: dict, today: date) -> bool:
 
 
 async def _enrich_one(
-    row: dict, cached: dict[str, dict], adapter, today: date
+    row: dict, cached: dict[tuple[str, str], dict], adapter, today: date
 ) -> Optional[tuple[dict, bool]]:
     """Compute the return-cache entry for one Stage 2 row.
 
@@ -337,15 +346,17 @@ async def _enrich_one(
     recorded_at = row.get("recorded_at")
     ticker = row.get("ticker")
     asof_str = row.get("asof")
+    source = row.get("source") or "brief"
     if not ticker or not asof_str:
         return None
     asof_dt = _parse_asof(asof_str)
     if asof_dt is None:
         return None
 
-    if recorded_at and recorded_at in cached:
-        if _enrichment_complete(cached[recorded_at], today):
-            return (cached[recorded_at], True)
+    cache_key = (source, recorded_at) if recorded_at else None
+    if cache_key and cache_key in cached:
+        if _enrichment_complete(cached[cache_key], today):
+            return (cached[cache_key], True)
         # Cached entry exists but some elapsed horizons are still null —
         # this is the "horizon matured since last run" case. Fall through
         # to re-fetch.
@@ -364,6 +375,7 @@ async def _enrich_one(
         "recorded_at": recorded_at,
         "ticker": ticker,
         "asof": asof_str,
+        "source": source,
         "entry_price": entry_price,
         "enriched_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -412,7 +424,7 @@ async def enrich_stage2_rows(
     sem = asyncio.Semaphore(_ENRICH_CONCURRENCY)
 
     # Validate tickers and pre-load caches once per ticker.
-    by_ticker: dict[str, dict[str, dict]] = {}
+    by_ticker: dict[str, dict[tuple[str, str], dict]] = {}
     for row in rows:
         raw_ticker = row.get("ticker")
         validated = _safe_ticker(raw_ticker)
@@ -446,8 +458,15 @@ async def enrich_stage2_rows(
                 and enriched.get("entry_price") is not None
             ):
                 append_return_cache(base, ticker, enriched)
-                cache[recorded_at] = enriched
-            pre = row.get("pre_skeptic_conviction")
+                enriched_source = enriched.get("source") or "brief"
+                cache[(enriched_source, recorded_at)] = enriched
+            # `composite_conviction_pre_skeptic` is the journal canonical
+            # name (matches the Stage2Note field). `pre_skeptic_conviction`
+            # is the alias used by `read_all_research`'s row projection.
+            # Accept either for forward-compat as we converge on one name.
+            pre = row.get("composite_conviction_pre_skeptic")
+            if pre is None:
+                pre = row.get("pre_skeptic_conviction")
             pre_float = float(pre) if isinstance(pre, (int, float)) else None
             return ScoredEntry(
                 ticker=ticker,
@@ -562,14 +581,17 @@ def decile_analysis(
 
 # Discount-magnitude buckets in absolute conviction points.
 # `(lo, hi, label)` — hi is exclusive on the upper edge except the last
-# bucket which is open-ended. 0-point bucket isolates AGREE-shaped reads
-# where the Skeptic didn't move the score at all.
+# bucket which is open-ended. The first bucket captures the case where
+# the Skeptic actually RAISED conviction (post > pre); without it those
+# rows were silently dropped from calibration. The 0-pt bucket isolates
+# AGREE-shaped reads where the Skeptic didn't move the score.
 _DISCOUNT_BUCKETS: tuple[tuple[float, float, str], ...] = (
-    (-0.001, 0.005, "0 pts"),       # essentially no discount
-    (0.005,  0.05,  "0–5 pts"),
-    (0.05,   0.10,  "5–10 pts"),
-    (0.10,   0.20,  "10–20 pts"),
-    (0.20,   float("inf"), "20+ pts"),
+    (-float("inf"), -0.005, "Skeptic raised"),     # post > pre by ≥0.005
+    (-0.005,         0.005, "0 pts"),              # essentially no discount
+    ( 0.005,         0.05,  "0–5 pts"),
+    ( 0.05,          0.10,  "5–10 pts"),
+    ( 0.10,          0.20,  "10–20 pts"),
+    ( 0.20,          float("inf"), "20+ pts"),
 )
 
 

@@ -296,6 +296,34 @@ class TestReadUnifiedHistory:
         assert len(history) == 1
         assert history[0].ticker == "AAPL"
 
+    def test_invalid_ticker_shape_raises(self, tmp_path: Path):
+        # Defense against path-traversal-shaped tickers reaching the
+        # filesystem layer via `read_dossier`. Same regex the journal
+        # write path enforces — reject at the read boundary too.
+        with pytest.raises(ValueError, match="Invalid ticker"):
+            read_unified_history("../../etc/passwd", tmp_path)
+        with pytest.raises(ValueError, match="Invalid ticker"):
+            read_unified_history("AAPL/SECRET", tmp_path)
+        with pytest.raises(ValueError, match="Invalid ticker"):
+            read_unified_history("", tmp_path)
+        with pytest.raises(ValueError, match="Invalid ticker"):
+            read_unified_history("TOOLONG7CHARS", tmp_path)
+
+    def test_brief_journal_pre_skeptic_field_populated(self, tmp_path: Path):
+        # Schema-additive: brief journal rows now persist
+        # composite_conviction_pre_skeptic. The reader projects it
+        # onto Stage2HistoryEntry.pre_skeptic_conviction so brief
+        # entries can participate in discount-magnitude calibration.
+        from dataclasses import replace as _dc_replace
+        note = _make_stage2_note("AAPL", composite=0.42, verdict="WEAKEN")
+        note = _dc_replace(note, composite_conviction_pre_skeptic=0.55)
+        append_stage2_note(note, tmp_path)
+
+        history = read_unified_history("AAPL", tmp_path)
+        assert len(history) == 1
+        assert history[0].pre_skeptic_conviction == pytest.approx(0.55)
+        assert history[0].composite_conviction == pytest.approx(0.42)
+
     def test_skeptic_summary_without_verdict_prefix_returns_unavailable(
         self, tmp_path: Path,
     ):
@@ -368,7 +396,9 @@ class TestReadUnifiedHistory:
 
 class TestTraceReader:
     def test_missing_file_returns_empty_enrichment(self, tmp_path: Path):
-        result = read_chain_enrichment("20260601T120000-nofile", tmp_path)
+        # `nofile` is intentionally non-hex so the regex rejects it
+        # outright, not just the missing-file path.
+        result = read_chain_enrichment("20260601T120000-aaaaaa", tmp_path)
         assert result == TraceEnrichment()
 
     def test_malformed_chain_id_returns_empty(self, tmp_path: Path):
@@ -377,9 +407,27 @@ class TestTraceReader:
         # an empty enrichment.
         assert read_chain_enrichment("not-a-chain-id", tmp_path) == TraceEnrichment()
         assert read_chain_enrichment("", tmp_path) == TraceEnrichment()
+        # Non-hex suffix is rejected by the regex.
+        assert read_chain_enrichment(
+            "20260601T120000-nothex", tmp_path,
+        ) == TraceEnrichment()
+        # Wrong-length suffix is rejected.
+        assert read_chain_enrichment(
+            "20260601T120000-abc", tmp_path,
+        ) == TraceEnrichment()
+
+    def test_path_traversal_chain_id_rejected(self, tmp_path: Path):
+        # If an attacker (or operator typo) crafts a chain_id whose
+        # date-prefix passes regex but whose tail contains path
+        # traversal tokens, the reader must NOT resolve to anything
+        # outside the trace tree. The tightened regex `^...$` rejects
+        # this outright; the resolve()/relative_to() guard is defense
+        # in depth.
+        evil = "20260601T120000-../../etc"
+        assert read_chain_enrichment(evil, tmp_path) == TraceEnrichment()
 
     def test_full_enrichment_recovered(self, tmp_path: Path):
-        chain_id = "20260601T120000-fullok"
+        chain_id = "20260601T120000-fff001"
         _seed_trace(
             tmp_path, chain_id,
             stage_2_conviction=0.55,
@@ -397,7 +445,7 @@ class TestTraceReader:
         # A chain that wrote Stage 2 but failed before Stage 3 (rare but
         # possible on a crash mid-cascade). Stage 2 fields recovered;
         # adjusted_score stays None.
-        chain_id = "20260601T120000-partial"
+        chain_id = "20260601T120000-aabbcc"
         _seed_trace(
             tmp_path, chain_id,
             stage_2_conviction=0.55,
@@ -412,7 +460,7 @@ class TestTraceReader:
     def test_trace_with_corrupt_lines_ignored(self, tmp_path: Path):
         # Half-flushed write or operator-edited trace shouldn't kill the
         # reader. Corrupt JSON lines are skipped; valid lines still read.
-        chain_id = "20260601T120000-corrupt"
+        chain_id = "20260601T120000-cccc01"
         path = _chain_id_to_trace_path(chain_id, tmp_path)
         assert path is not None
         path.parent.mkdir(parents=True, exist_ok=True)

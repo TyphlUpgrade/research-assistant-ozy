@@ -157,6 +157,12 @@ def _note_to_row(note: "Stage2Note") -> dict:
         "bear_anchor": _sanitize_text(note.bear_anchor, _ANCHOR_MAX_LEN),
         "conviction": dict(note.conviction),
         "composite_conviction": note.composite_conviction,
+        # Pre-Skeptic conviction is already on the Stage2Note (set in
+        # brief.py:_dc_replace before write). Persisting it here is
+        # additive per the SCHEMA CONTRACT and unlocks the discount-
+        # magnitude calibration view in scoreboard for brief entries
+        # (research entries get the same value from trace events).
+        "composite_conviction_pre_skeptic": note.composite_conviction_pre_skeptic,
         "decision_tag": note.decision_tag,
         "skeptic_verdict": note.skeptic_verdict,
     }

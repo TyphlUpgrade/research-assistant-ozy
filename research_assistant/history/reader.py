@@ -32,6 +32,7 @@ from research_assistant.history.trace_reader import (
     read_chain_enrichment,
 )
 from research_assistant.journal import read_stage2_full_history
+from research_assistant.journal.stage2_notes import _TICKER_RE
 
 
 _ET = ZoneInfo("America/New_York")
@@ -134,6 +135,9 @@ def _journal_rows_to_entries(
         composite = row.get("composite_conviction")
         if not isinstance(composite, (int, float)):
             composite = None
+        pre = row.get("composite_conviction_pre_skeptic")
+        if not isinstance(pre, (int, float)):
+            pre = None
         conviction = row.get("conviction")
         if not isinstance(conviction, dict):
             conviction = None
@@ -145,6 +149,7 @@ def _journal_rows_to_entries(
                 source="brief",
                 chain_id=None,  # journal schema doesn't carry chain_id today
                 composite_conviction=float(composite) if composite is not None else None,
+                pre_skeptic_conviction=float(pre) if pre is not None else None,
                 skeptic_verdict=row.get("skeptic_verdict") or None,
                 decision_tag=row.get("decision_tag") or None,
                 conviction_dimensions=dict(conviction) if conviction else None,
@@ -227,8 +232,16 @@ def read_unified_history(
     `traces_base` defaults to `base / "traces"`. Override for testing
     (so a fixture can point the reader at an isolated trace tree
     independent of the main `base` path).
+
+    Raises ValueError if `ticker` doesn't match the SEC ticker shape —
+    same regex the journal write path uses, so a path-traversal-shaped
+    symbol (e.g. `../../etc`) gets rejected before any filesystem
+    operation. Public entry point, so the guard belongs here rather
+    than in each downstream reader.
     """
-    ticker_upper = ticker.upper()
+    ticker_upper = str(ticker or "").strip().upper()
+    if not _TICKER_RE.match(ticker_upper):
+        raise ValueError(f"Invalid ticker for history read: {ticker!r}")
     traces = traces_base if traces_base is not None else (base / "traces")
     journal = _journal_rows_to_entries(
         ticker_upper, read_stage2_full_history(ticker_upper, base)

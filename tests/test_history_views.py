@@ -166,15 +166,15 @@ class TestHistoryBrief:
 class TestCohortGrid:
     def test_two_tickers_two_dates(self, tmp_path: Path):
         _seed_ledger(
-            tmp_path, "MU", "20260601T120000-mu0001",
+            tmp_path, "MU", "20260601T120000-aaaaa1",
             "2026-06-01T12:00:00+00:00", verdict_word="CHALLENGE",
         )
-        _seed_trace(tmp_path / "traces", "20260601T120000-mu0001", pre=0.48, post=0.22)
+        _seed_trace(tmp_path / "traces", "20260601T120000-aaaaa1", pre=0.48, post=0.22)
         _seed_ledger(
-            tmp_path, "MRVL", "20260602T120000-mrvl01",
+            tmp_path, "MRVL", "20260602T120000-bbbbb1",
             "2026-06-02T12:00:00+00:00", verdict_word="WEAKEN",
         )
-        _seed_trace(tmp_path / "traces", "20260602T120000-mrvl01", pre=0.50, post=0.42)
+        _seed_trace(tmp_path / "traces", "20260602T120000-bbbbb1", pre=0.50, post=0.42)
 
         grid = build_cohort_grid(["MU", "MRVL"], tmp_path)
 
@@ -192,7 +192,7 @@ class TestCohortGrid:
         # Two reads on the same day; the later one (by recorded_at) wins
         # the cell. Reflects what the operator most likely cares about.
         _seed_ledger(
-            tmp_path, "MU", "20260601T100000-mu0010",
+            tmp_path, "MU", "20260601T100000-aaaa10",
             "2026-06-01T10:00:00+00:00", verdict_word="WEAKEN",
         )
         # Second chain on same day, written later
@@ -204,12 +204,12 @@ class TestCohortGrid:
         assert existing is not None
         existing.ledger.append(LedgerEntry(
             timestamp="2026-06-01T14:00:00+00:00", kind="thesis",
-            summary="late thesis", evidence_anchor="20260601T140000-mu0020",
+            summary="late thesis", evidence_anchor="20260601T140000-aaaa20",
         ))
         existing.ledger.append(LedgerEntry(
             timestamp="2026-06-01T14:00:00+00:00", kind="skeptic",
             summary="Verdict: CHALLENGE. late critique",
-            evidence_anchor="20260601T140000-mu0020",
+            evidence_anchor="20260601T140000-aaaa20",
         ))
         write_dossier_atomic(existing, tmp_path)
 
@@ -232,11 +232,11 @@ class TestCohortGrid:
 class TestFilterVerdicts:
     def test_unfiltered_returns_all_history(self, tmp_path: Path):
         _seed_ledger(
-            tmp_path, "MU", "20260601T120000-mu0001",
+            tmp_path, "MU", "20260601T120000-aaaaa1",
             "2026-06-01T12:00:00+00:00", verdict_word="CHALLENGE",
         )
         _seed_ledger(
-            tmp_path, "MRVL", "20260602T120000-mrvl01",
+            tmp_path, "MRVL", "20260602T120000-bbbbb1",
             "2026-06-02T12:00:00+00:00", verdict_word="WEAKEN",
         )
 
@@ -246,11 +246,11 @@ class TestFilterVerdicts:
 
     def test_verdict_filter(self, tmp_path: Path):
         _seed_ledger(
-            tmp_path, "MU", "20260601T120000-mu0001",
+            tmp_path, "MU", "20260601T120000-aaaaa1",
             "2026-06-01T12:00:00+00:00", verdict_word="CHALLENGE",
         )
         _seed_ledger(
-            tmp_path, "MRVL", "20260602T120000-mrvl01",
+            tmp_path, "MRVL", "20260602T120000-bbbbb1",
             "2026-06-02T12:00:00+00:00", verdict_word="WEAKEN",
         )
 
@@ -260,11 +260,11 @@ class TestFilterVerdicts:
 
     def test_ticker_filter(self, tmp_path: Path):
         _seed_ledger(
-            tmp_path, "MU", "20260601T120000-mu0001",
+            tmp_path, "MU", "20260601T120000-aaaaa1",
             "2026-06-01T12:00:00+00:00",
         )
         _seed_ledger(
-            tmp_path, "MRVL", "20260602T120000-mrvl01",
+            tmp_path, "MRVL", "20260602T120000-bbbbb1",
             "2026-06-02T12:00:00+00:00",
         )
 
@@ -274,11 +274,11 @@ class TestFilterVerdicts:
 
     def test_sort_order_is_chronological(self, tmp_path: Path):
         _seed_ledger(
-            tmp_path, "MU", "20260603T120000-mu0001",
+            tmp_path, "MU", "20260603T120000-aaaaa1",
             "2026-06-03T12:00:00+00:00",
         )
         _seed_ledger(
-            tmp_path, "MRVL", "20260601T120000-mrvl01",
+            tmp_path, "MRVL", "20260601T120000-bbbbb1",
             "2026-06-01T12:00:00+00:00",
         )
 
@@ -300,7 +300,7 @@ class TestRenderers:
 
     def test_render_cohort_grid_includes_tickers_and_dates(self, tmp_path: Path):
         _seed_ledger(
-            tmp_path, "MU", "20260601T120000-mu0001",
+            tmp_path, "MU", "20260601T120000-aaaaa1",
             "2026-06-01T12:00:00+00:00", verdict_word="CHALLENGE",
         )
         grid = build_cohort_grid(["MU"], tmp_path)

@@ -849,19 +849,19 @@ class TestReadAllResearch:
                 LedgerEntry(
                     timestamp="2026-05-29T12:00:00+00:00",
                     kind="thesis", summary="MU thesis",
-                    evidence_anchor="20260529T120000-mu0001",
+                    evidence_anchor="20260529T120000-aaaaa1",
                 ),
                 LedgerEntry(
                     timestamp="2026-05-29T12:00:00+00:00",
                     kind="skeptic",
                     summary="Verdict: CHALLENGE. body",
-                    evidence_anchor="20260529T120000-mu0001",
+                    evidence_anchor="20260529T120000-aaaaa1",
                 ),
             ],
         )
         write_dossier_atomic(ledger, tmp_path)
         trace_path = _chain_id_to_trace_path(
-            "20260529T120000-mu0001", tmp_path / "traces",
+            "20260529T120000-aaaaa1", tmp_path / "traces",
         )
         assert trace_path is not None
         trace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -898,13 +898,13 @@ class TestReadAllResearch:
                 LedgerEntry(
                     timestamp="2026-05-29T12:00:00+00:00",
                     kind="thesis", summary="MU thesis",
-                    evidence_anchor="20260529T120000-notrace",
+                    evidence_anchor="20260529T120000-dddddd",
                 ),
                 LedgerEntry(
                     timestamp="2026-05-29T12:00:00+00:00",
                     kind="skeptic",
                     summary="Verdict: CHALLENGE. body",
-                    evidence_anchor="20260529T120000-notrace",
+                    evidence_anchor="20260529T120000-dddddd",
                 ),
             ],
         )
@@ -941,6 +941,22 @@ class TestDiscountAnalysis:
         ]
         assert scoreboard.discount_analysis(entries, "return_10d") == []
 
+    def test_skeptic_raised_bucket_captures_negative_discount(self):
+        # When the Skeptic RAISES conviction (post > pre by ≥0.005),
+        # the entry must land in the "Skeptic raised" bucket — not be
+        # silently dropped. This was the gap before the bucket table
+        # was widened with the negative-side bucket.
+        entries = [
+            _research_scored(pre=0.30, post=0.42, verdict="AGREE", r10=0.05),
+            _research_scored(pre=0.40, post=0.55, verdict="AGREE", r10=0.08),
+        ]
+        result = scoreboard.discount_analysis(entries, "return_10d")
+        labels = {r["bucket"] for r in result}
+        assert "Skeptic raised" in labels
+        raised = next(r for r in result if r["bucket"] == "Skeptic raised")
+        assert raised["count"] == 2
+        assert raised["median_return"] == pytest.approx(0.065)
+
 
 class TestResearchRender:
     def test_empty_renders_helpful_message(self):
@@ -970,3 +986,57 @@ class TestResearchRender:
         )
         assert "TEMPER" in out
         assert "CHALLENGE" in out
+
+
+class TestReturnCacheKeyDiscrimination:
+    """Brief and research write to the same per-ticker `stage2_returns/`
+    file. The cache key must include `source` so a research write
+    can't silently clobber a brief entry's cached returns (or vice
+    versa) when they happen to share a `recorded_at`.
+    """
+
+    def test_cache_key_includes_source(self, tmp_path: Path):
+        # Two cache entries with the same recorded_at but different
+        # source — they must coexist, not collide.
+        same_ts = "2026-05-29T12:00:00+00:00"
+        scoreboard.append_return_cache(tmp_path, "MU", {
+            "schema_version": 1,
+            "recorded_at": same_ts,
+            "ticker": "MU",
+            "asof": "2026-05-29",
+            "source": "brief",
+            "entry_price": 100.0,
+            "return_5d": 0.05,
+        })
+        scoreboard.append_return_cache(tmp_path, "MU", {
+            "schema_version": 1,
+            "recorded_at": same_ts,
+            "ticker": "MU",
+            "asof": "2026-05-29",
+            "source": "research",
+            "entry_price": 100.0,
+            "return_5d": -0.05,
+        })
+
+        cache = scoreboard.read_return_cache(tmp_path, "MU")
+        assert ("brief", same_ts) in cache
+        assert ("research", same_ts) in cache
+        assert cache[("brief", same_ts)]["return_5d"] == pytest.approx(0.05)
+        assert cache[("research", same_ts)]["return_5d"] == pytest.approx(-0.05)
+
+    def test_cache_row_without_source_defaults_to_brief(self, tmp_path: Path):
+        # Pre-existing cache rows (written before the schema-tagged
+        # writer landed) have no `source` field. The reader must
+        # default them to "brief" — the only source that wrote the
+        # cache before this commit.
+        scoreboard.append_return_cache(tmp_path, "MU", {
+            "schema_version": 1,
+            "recorded_at": "2026-05-29T12:00:00+00:00",
+            "ticker": "MU",
+            "asof": "2026-05-29",
+            "entry_price": 100.0,
+            "return_5d": 0.03,
+        })
+
+        cache = scoreboard.read_return_cache(tmp_path, "MU")
+        assert ("brief", "2026-05-29T12:00:00+00:00") in cache
