@@ -109,7 +109,16 @@ _MAX_LINE_BYTES = 16 * 1024
 
 @dataclass(frozen=True)
 class ScoredEntry:
-    """A Stage 2 journal row joined with its forward returns."""
+    """A Stage 2 journal row joined with its forward returns.
+
+    `pre_skeptic_conviction` carries the Stage 2 thesis's raw score
+    BEFORE the Skeptic applied its discount. Required for the
+    discount-magnitude calibration view (FOLLOWUPS #23). Optional
+    because the brief journal schema doesn't carry it today — it's
+    populated for research entries via the trace reader, and brief
+    entries leave it None until the journal schema is additively
+    extended.
+    """
     ticker: str
     asof: str
     recorded_at: str
@@ -120,6 +129,8 @@ class ScoredEntry:
     return_5d: Optional[float]
     return_10d: Optional[float]
     return_30d: Optional[float]
+    pre_skeptic_conviction: Optional[float] = None
+    source: str = "brief"           # "brief" | "research"
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +172,47 @@ def read_all_stage2(base: Path) -> list[dict]:
     rows: list[dict] = []
     for path in sorted(stage2_dir.glob("*.jsonl")):
         rows.extend(_read_jsonl(path))
+    return rows
+
+
+def read_all_research(base: Path) -> list[dict]:
+    """Read every research (Stage 3 Skeptic) entry across all tickers,
+    projected into the same row shape `enrich_stage2_rows` accepts.
+
+    Sourced from the unified history reader's research projection —
+    dossier ledger entries with trace-enrichment populating the numeric
+    fields. Entries whose trace file is missing (no `composite_conviction`
+    available) are skipped: forward-return calibration requires a
+    conviction number to be meaningful.
+
+    Tags each row with `source="research"` so the enrich path can
+    propagate that into `ScoredEntry.source` for downstream filtering.
+    """
+    from research_assistant.history import (
+        enumerate_tickers,
+        read_unified_history,
+    )
+
+    rows: list[dict] = []
+    for ticker in enumerate_tickers(base):
+        for entry in read_unified_history(ticker, base):
+            if entry.source != "research":
+                continue
+            if entry.composite_conviction is None:
+                # No trace file (pruned / pre-trace-era / different
+                # machine); without the numeric conviction the entry
+                # can't participate in return calibration.
+                continue
+            rows.append({
+                "ticker": entry.ticker,
+                "asof": entry.asof,
+                "recorded_at": entry.recorded_at,
+                "composite_conviction": entry.composite_conviction,
+                "pre_skeptic_conviction": entry.pre_skeptic_conviction,
+                "skeptic_verdict": entry.skeptic_verdict or "UNAVAILABLE",
+                "decision_tag": entry.decision_tag or "",
+                "source": "research",
+            })
     return rows
 
 
@@ -395,6 +447,8 @@ async def enrich_stage2_rows(
             ):
                 append_return_cache(base, ticker, enriched)
                 cache[recorded_at] = enriched
+            pre = row.get("pre_skeptic_conviction")
+            pre_float = float(pre) if isinstance(pre, (int, float)) else None
             return ScoredEntry(
                 ticker=ticker,
                 asof=row.get("asof", ""),
@@ -406,6 +460,8 @@ async def enrich_stage2_rows(
                 return_5d=enriched.get("return_5d"),
                 return_10d=enriched.get("return_10d"),
                 return_30d=enriched.get("return_30d"),
+                pre_skeptic_conviction=pre_float,
+                source=str(row.get("source") or "brief"),
             )
 
     results = await asyncio.gather(*[_one(r) for r in rows])
@@ -501,6 +557,64 @@ def decile_analysis(
 
 
 # ---------------------------------------------------------------------------
+# Discount-magnitude analysis (FOLLOWUPS #23)
+# ---------------------------------------------------------------------------
+
+# Discount-magnitude buckets in absolute conviction points.
+# `(lo, hi, label)` — hi is exclusive on the upper edge except the last
+# bucket which is open-ended. 0-point bucket isolates AGREE-shaped reads
+# where the Skeptic didn't move the score at all.
+_DISCOUNT_BUCKETS: tuple[tuple[float, float, str], ...] = (
+    (-0.001, 0.005, "0 pts"),       # essentially no discount
+    (0.005,  0.05,  "0–5 pts"),
+    (0.05,   0.10,  "5–10 pts"),
+    (0.10,   0.20,  "10–20 pts"),
+    (0.20,   float("inf"), "20+ pts"),
+)
+
+
+def discount_analysis(
+    entries: list[ScoredEntry], horizon_field: str
+) -> list[dict]:
+    """Bucket entries by Skeptic discount magnitude and report median
+    forward return per bucket.
+
+    Discount = pre_skeptic_conviction - composite_conviction. Entries
+    without a pre_skeptic value (today: all brief entries) are skipped.
+
+    Hypothesis the view tests: does the *magnitude* of the discount have
+    forward-return signal? If 0-pt buckets cluster around zero return
+    and 20+pt buckets cluster negative, the Skeptic's discount size is
+    informative. Flat across buckets → discount magnitude is noise.
+    """
+    out: list[dict] = []
+    eligible = [
+        e for e in entries
+        if e.pre_skeptic_conviction is not None
+        and getattr(e, horizon_field) is not None
+    ]
+    if not eligible:
+        return []
+    for lo, hi, label in _DISCOUNT_BUCKETS:
+        in_bucket = [
+            e for e in eligible
+            if lo <= (e.pre_skeptic_conviction - e.composite_conviction) < hi
+        ]
+        if not in_bucket:
+            continue
+        returns = [getattr(e, horizon_field) for e in in_bucket]
+        out.append({
+            "bucket": label,
+            "count": len(in_bucket),
+            "median_return": _median(returns),
+            "p25": _quantile(returns, 0.25),
+            "p75": _quantile(returns, 0.75),
+            "small_n": len(in_bucket) < _SMALL_N_WARN,
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Render
 # ---------------------------------------------------------------------------
 
@@ -510,6 +624,14 @@ def decile_analysis(
 # accepts the order as a parameter so it doesn't need to be re-architected
 # when that work lands.
 DEFAULT_VERDICT_ORDER = ("AGREE", "WEAKEN", "STRONG_OBJECTION", "UNAVAILABLE")
+
+# Stage 3 (research) Skeptic verdict vocabulary. Wider than the brief
+# inline Skeptic's 3-level enum — TEMPER and CHALLENGE are the
+# distinguishing additions, both representing partial vs. full bull-
+# pillar dismantling.
+RESEARCH_VERDICT_ORDER = (
+    "AGREE", "WEAKEN", "TEMPER", "CHALLENGE", "STRONG_OBJECTION", "UNAVAILABLE",
+)
 
 
 def render_scoreboard(
@@ -635,6 +757,135 @@ def render_scoreboard(
                 f"| {d['bucket']} | "
                 f"{d['conviction_lo']:.2f}–{d['conviction_hi']:.2f} | "
                 f"{d['count']}{warn} | {d['median_return']:+.2%} |"
+            )
+
+    return "\n".join(lines)
+
+
+def render_research_scoreboard(
+    entries: list[ScoredEntry], horizon_field: str = "return_10d"
+) -> str:
+    """Operator-facing text output for research-Skeptic entries.
+
+    Renders three sections specific to the `/research` Stage 3 Skeptic:
+    - Verdict → forward return (5-level vocabulary)
+    - Post-Skeptic conviction decile → forward return
+    - Discount magnitude → forward return (FOLLOWUPS #23 — measures
+      whether the Skeptic's discount size carries return signal)
+
+    Pure function over `entries`. Caller filters `entries` to
+    `source=="research"` before invoking; the function does not
+    re-filter.
+    """
+    lines: list[str] = []
+    horizon_label = horizon_field.replace("return_", "")
+    lines.append(
+        f"# Research-Skeptic scoreboard — verdict→{horizon_label} "
+        f"return calibration"
+    )
+    lines.append("")
+    lines.append(f"Total research entries: {len(entries)}")
+    if not entries:
+        lines.append("")
+        lines.append(
+            "(no research entries with trace-enriched conviction — "
+            "run `/research <TICKER>` to populate, or check that trace "
+            "files exist at `.research/traces/<date>/<chain>.jsonl`)"
+        )
+        return "\n".join(lines)
+
+    enriched_count = sum(
+        1 for e in entries if getattr(e, horizon_field) is not None
+    )
+    lines.append(
+        f"Enriched ({horizon_label} horizon): {enriched_count} / {len(entries)}"
+    )
+    if 0 < enriched_count < _SMALL_N_WARN:
+        lines.append(
+            f"⚠ SMALL N: only {enriched_count} entries have {horizon_label} "
+            "forward returns. Stats below are noise-bound."
+        )
+    elif enriched_count == 0:
+        lines.append(
+            f"⚠ Zero entries have {horizon_label} forward returns yet."
+        )
+    lines.append("")
+
+    # Section 1 — verdict stratification (5-level vocabulary)
+    lines.append(f"## Verdict → {horizon_label} return")
+    lines.append("")
+    by_verdict = stratify_by_verdict(entries, horizon_field)
+    rendered = False
+    for verdict in RESEARCH_VERDICT_ORDER:
+        if verdict not in by_verdict:
+            continue
+        b = by_verdict[verdict]
+        if b["enriched_count"] == 0:
+            lines.append(
+                f"- **{verdict}** — count={b['count']}, "
+                f"no enriched {horizon_label} returns yet"
+            )
+            rendered = True
+            continue
+        warn = "  ⚠ small-N" if b["small_n"] else ""
+        lines.append(
+            f"- **{verdict}** — count={b['count']} "
+            f"(enriched {b['enriched_count']})  "
+            f"median={b['median']:+.2%}  "
+            f"p25={b['p25']:+.2%}  p75={b['p75']:+.2%}{warn}"
+        )
+        rendered = True
+    if not rendered:
+        lines.append("(no verdicts captured)")
+    lines.append("")
+
+    # Section 2 — post-Skeptic conviction deciles
+    lines.append(f"## Post-Skeptic conviction decile → {horizon_label} return")
+    lines.append("")
+    deciles = decile_analysis(entries, horizon_field)
+    if not deciles:
+        lines.append("(no enriched entries for decile analysis)")
+    else:
+        lines.append(
+            "Monotonic increasing across deciles = post-Skeptic conviction "
+            "has predictive signal."
+        )
+        lines.append("")
+        lines.append("| Decile | Conv. range | N | Median return |")
+        lines.append("|---|---|---|---|")
+        for d in deciles:
+            warn = " ⚠" if d["small_n"] else ""
+            lines.append(
+                f"| {d['bucket']} | "
+                f"{d['conviction_lo']:.2f}–{d['conviction_hi']:.2f} | "
+                f"{d['count']}{warn} | {d['median_return']:+.2%} |"
+            )
+    lines.append("")
+
+    # Section 3 — discount magnitude (the novel #23 view)
+    lines.append(f"## Discount magnitude → {horizon_label} return")
+    lines.append("")
+    discounts = discount_analysis(entries, horizon_field)
+    if not discounts:
+        lines.append(
+            "(no entries have both pre- and post-Skeptic convictions yet)"
+        )
+    else:
+        lines.append(
+            "Discount = pre_skeptic_conviction − composite_conviction. "
+            "If large-discount buckets show worse forward returns than "
+            "0-point buckets, the Skeptic's discount magnitude is "
+            "informative. Flat across buckets = discount size is noise."
+        )
+        lines.append("")
+        lines.append("| Discount | N | Median return | p25 / p75 |")
+        lines.append("|---|---|---|---|")
+        for d in discounts:
+            warn = " ⚠" if d["small_n"] else ""
+            lines.append(
+                f"| {d['bucket']} | {d['count']}{warn} | "
+                f"{d['median_return']:+.2%} | "
+                f"{d['p25']:+.2%} / {d['p75']:+.2%} |"
             )
 
     return "\n".join(lines)

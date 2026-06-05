@@ -797,3 +797,176 @@ def test_render_hit_rate_top_half_label():
     }
     out = scoreboard.render_hit_rate(result)
     assert "top-half" in out
+
+
+# ===========================================================================
+# Research-Skeptic scoreboard (FOLLOWUPS #23)
+# ===========================================================================
+
+def _research_scored(
+    *,
+    ticker: str = "MU",
+    pre: float,
+    post: float,
+    verdict: str,
+    r5: float | None = None,
+    r10: float | None = None,
+    r30: float | None = None,
+) -> scoreboard.ScoredEntry:
+    """Build a ScoredEntry as it would land for a research-source entry."""
+    return scoreboard.ScoredEntry(
+        ticker=ticker,
+        asof="2026-05-29",
+        recorded_at="2026-05-29T12:00:00+00:00",
+        composite_conviction=post,
+        skeptic_verdict=verdict,
+        decision_tag="RESEARCH",
+        entry_price=100.0,
+        return_5d=r5,
+        return_10d=r10,
+        return_30d=r30,
+        pre_skeptic_conviction=pre,
+        source="research",
+    )
+
+
+class TestReadAllResearch:
+    def test_empty_base_returns_empty(self, tmp_path: Path):
+        assert scoreboard.read_all_research(tmp_path) == []
+
+    def test_walks_ledger_and_emits_research_rows(self, tmp_path: Path):
+        # Seed dossier ledger + matching trace for two chains on MU.
+        from research_assistant.dossier_io import (
+            Dossier, LedgerEntry, write_dossier_atomic,
+        )
+        from research_assistant.history.trace_reader import (
+            _chain_id_to_trace_path,
+        )
+
+        ledger = Dossier(
+            symbol="MU",
+            ledger=[
+                LedgerEntry(
+                    timestamp="2026-05-29T12:00:00+00:00",
+                    kind="thesis", summary="MU thesis",
+                    evidence_anchor="20260529T120000-mu0001",
+                ),
+                LedgerEntry(
+                    timestamp="2026-05-29T12:00:00+00:00",
+                    kind="skeptic",
+                    summary="Verdict: CHALLENGE. body",
+                    evidence_anchor="20260529T120000-mu0001",
+                ),
+            ],
+        )
+        write_dossier_atomic(ledger, tmp_path)
+        trace_path = _chain_id_to_trace_path(
+            "20260529T120000-mu0001", tmp_path / "traces",
+        )
+        assert trace_path is not None
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        trace_path.write_text(
+            json.dumps({
+                "stage_id": "stage_2_thesis",
+                "parsed": {"conviction_score": 0.42},
+            }) + "\n" +
+            json.dumps({
+                "stage_id": "stage_3_skeptic",
+                "parsed": {"adjusted_score": 0.22},
+            }) + "\n"
+        )
+
+        rows = scoreboard.read_all_research(tmp_path)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["ticker"] == "MU"
+        assert row["composite_conviction"] == pytest.approx(0.22)
+        assert row["pre_skeptic_conviction"] == pytest.approx(0.42)
+        assert row["skeptic_verdict"] == "CHALLENGE"
+        assert row["source"] == "research"
+
+    def test_skips_entries_without_trace_enrichment(self, tmp_path: Path):
+        # Ledger entry exists, but no matching trace file → composite
+        # is None → row is skipped (calibration needs a number).
+        from research_assistant.dossier_io import (
+            Dossier, LedgerEntry, write_dossier_atomic,
+        )
+
+        ledger = Dossier(
+            symbol="MU",
+            ledger=[
+                LedgerEntry(
+                    timestamp="2026-05-29T12:00:00+00:00",
+                    kind="thesis", summary="MU thesis",
+                    evidence_anchor="20260529T120000-notrace",
+                ),
+                LedgerEntry(
+                    timestamp="2026-05-29T12:00:00+00:00",
+                    kind="skeptic",
+                    summary="Verdict: CHALLENGE. body",
+                    evidence_anchor="20260529T120000-notrace",
+                ),
+            ],
+        )
+        write_dossier_atomic(ledger, tmp_path)
+        # No trace file written.
+        assert scoreboard.read_all_research(tmp_path) == []
+
+
+class TestDiscountAnalysis:
+    def test_no_pre_skeptic_returns_empty(self):
+        entries = [_scored(composite=0.5, verdict="AGREE", r10=0.10)]
+        assert scoreboard.discount_analysis(entries, "return_10d") == []
+
+    def test_buckets_by_discount_magnitude(self):
+        # 0pt bucket (AGREE-shaped), 5–10pt, 10–20pt, 20+pt
+        entries = [
+            _research_scored(pre=0.50, post=0.50, verdict="AGREE", r10=0.05),
+            _research_scored(pre=0.50, post=0.50, verdict="AGREE", r10=0.03),
+            _research_scored(pre=0.50, post=0.42, verdict="WEAKEN", r10=-0.02),
+            _research_scored(pre=0.50, post=0.35, verdict="TEMPER", r10=-0.05),
+            _research_scored(pre=0.50, post=0.20, verdict="CHALLENGE", r10=-0.10),
+        ]
+        result = scoreboard.discount_analysis(entries, "return_10d")
+        labels = {r["bucket"] for r in result}
+        # AGREE pair lands in 0-pt bucket; the rest scatter across higher buckets
+        assert "0 pts" in labels
+        assert any(label.startswith("5") for label in labels)
+        assert any(label.startswith("10") for label in labels)
+        assert any(label.startswith("20") for label in labels)
+
+    def test_skips_entries_without_forward_return(self):
+        entries = [
+            _research_scored(pre=0.50, post=0.20, verdict="CHALLENGE", r10=None),
+        ]
+        assert scoreboard.discount_analysis(entries, "return_10d") == []
+
+
+class TestResearchRender:
+    def test_empty_renders_helpful_message(self):
+        out = scoreboard.render_research_scoreboard([], horizon_field="return_5d")
+        assert "no research entries" in out
+
+    def test_renders_three_sections(self):
+        entries = [
+            _research_scored(pre=0.45, post=0.30, verdict="CHALLENGE", r5=-0.04),
+            _research_scored(pre=0.50, post=0.45, verdict="WEAKEN", r5=-0.01),
+            _research_scored(pre=0.50, post=0.50, verdict="AGREE", r5=0.02),
+        ]
+        out = scoreboard.render_research_scoreboard(entries, horizon_field="return_5d")
+        assert "Verdict → 5d return" in out
+        assert "Post-Skeptic conviction decile" in out
+        assert "Discount magnitude" in out
+        assert "CHALLENGE" in out
+
+    def test_verdict_vocabulary_includes_temper_and_challenge(self):
+        # 5-level vocabulary (vs brief 3-level).
+        entries = [
+            _research_scored(pre=0.50, post=0.30, verdict="TEMPER", r10=-0.02),
+            _research_scored(pre=0.50, post=0.15, verdict="CHALLENGE", r10=-0.10),
+        ]
+        out = scoreboard.render_research_scoreboard(
+            entries, horizon_field="return_10d",
+        )
+        assert "TEMPER" in out
+        assert "CHALLENGE" in out

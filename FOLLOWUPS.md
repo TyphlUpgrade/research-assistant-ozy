@@ -938,6 +938,262 @@ tokens increase ~2-3x; partially offset by smaller pre-loaded prompts.
 
 ---
 
+## 21. History read-path unification — single source of truth across ledger / journal / briefs
+
+Status: **PARTIAL — shipped 2026-06-05.**
+
+- Unified reader at `research_assistant/history/reader.py` unions the
+  brief journal and dossier ledger into a common `Stage2HistoryEntry`
+  shape, sorted chronologically.
+- Per-chain trace enrichment at
+  `research_assistant/history/trace_reader.py` recovers the structured
+  `conviction_score` (pre-Skeptic) and `adjusted_score` (post-Skeptic)
+  from `.research/traces/<date>/<chain_id>.jsonl` for research entries.
+  Missing trace files leave the fields None (operator sees `?`).
+- `trajectory` CLI repointed; MU now shows 7 entries (was 1), each
+  row showing the pre→post-Skeptic conviction delta:
+  `2026-05-29 [research] · conviction 0.28 → 0.13 (Skeptic CHALLENGE)`.
+- 549 tests passing (24 new in `tests/test_history_reader.py`).
+- Scoreboard left on its journal-only path — adding research Skeptic
+  there is #23 (planned next, builds on this reader).
+- Lossy-ledger-summary cleanup (160-char truncation in
+  `orchestrator.py:643,647`) still deferred — trace enrichment covers
+  the conviction-number gap; the prose preview being lossy doesn't
+  block downstream analytics.
+
+Originally caught 2026-06-05 during a real operator scoreboard
+query. Prerequisite for #22 (`/history` operator surface) and #23
+(scoreboard research-Skeptic + discount-magnitude calibration).
+
+**The two write paths.** Verified by grep in `brief.py` and
+`orchestrator.py`:
+
+- `/brief` writes brief-Stage 2 + inline Skeptic results to the
+  journal `.research/stage2/<TKR>.jsonl` only. Verdict vocabulary:
+  AGREE / WEAKEN / STRONG_OBJECTION.
+- `/research` writes Stage 2 thesis + Stage 3 Skeptic critique to
+  the dossier ledger `.research/tickers/<TKR>.md` only. Verdict
+  vocabulary: AGREE / WEAKEN / TEMPER / CHALLENGE /
+  STRONG_OBJECTION (Stage 3 vocabulary, richer).
+
+Neither path writes to both files. They record **different events**
+on the same ticker (a brief scan vs. a deep DD). `trajectory` reads
+the journal and so sees only the brief stream; the operator sees
+"no prior reads" for tickers that have only been `/research`'d. The
+scoreboard is already scoped to brief-Skeptic by design (docstring,
+Phase 3 deferred).
+
+**Empirical (2026-06-05 session).** Operator asked for prior verdicts
+on the semiconductor names ahead of today's brief. `trajectory MU
+--limit 5` reported "1 note (today only)" and `trajectory SNDK`
+reported "No Stage 2 history for SNDK." Grepping the dossier ledger
+directly:
+
+- `MU.md` ledger lines 66-83: **5 prior CHALLENGE verdicts** between
+  2026-05-26 and 2026-06-05 02:31, plus today's TEMPER. None of the
+  five prior reads are in `stage2/MU.jsonl` (which has 1 entry —
+  today's run).
+- `SNDK.md` ledger lines 44-51: thesis + skeptic on 2026-05-23 plus
+  an earlier 2026-06-05 02:33 TEMPER. `stage2/SNDK.jsonl` is empty.
+
+**Operator impact.** The session output told the operator MU had no
+prior coverage and today's TEMPER was a first-touch verdict. The
+actual record is "Skeptic CHALLENGED MU five times in 10 days." That
+would have materially changed swing-position sizing. The scoreboard's
+"trust the verdict ladder" narrative depends on the ladder being
+visible; today it shows only the tail.
+
+**The architectural framing.** The journal and ledger are
+**both first-class history streams** — they record different events
+(brief reads vs. research reads), not redundant copies of the same
+event. Building a unified history view means union-reading both
+sources, not picking a winner. Concretely:
+
+- Add `research_assistant/history/reader.py` exposing
+  `read_unified_history(ticker, base) -> list[Stage2HistoryEntry]`
+  that loads journal rows AND parses the dossier ledger, projects
+  both into a common entry shape (with a `source` discriminator),
+  and returns the chronological union.
+- Ledger parsing pairs `thesis:` + `skeptic:` ledger lines by
+  shared `evidence_anchor` (chain_id), regex-extracts the verdict
+  word from the skeptic summary's `Verdict: <WORD>` prefix, and
+  uses each line's `summary` as the bull/bear preview text.
+- Conviction numbers are degraded gracefully on ledger-only
+  entries (rendered as `?`) since the ledger summary is lossy
+  text; the structured `conviction` dict is journal-only.
+- Repoint `_cmd_trajectory` in `cli.py` at the unified reader.
+  Leave `scoreboard.py` on the journal-only path for now — the
+  scoreboard intentionally scopes to brief-inline Skeptic
+  verdicts (its docstring marks Stage 3 research Skeptic as the
+  Phase 3 follow-up).
+
+**Why this is now a foundation, not a leaf.** The user-facing pain
+isn't `trajectory` being wrong on one ticker — it's that every
+higher-level history view (per-ticker timeline, cross-ticker
+verdict-cluster scan, sector trajectory roll-up — see #22) inherits
+this blind-spot when built on top of either stream in isolation. Fix
+the read path first so #22 has a clean substrate.
+
+**Future cleanup (out of scope here).** The lossy ledger summary
+(160-char truncation in `orchestrator.py:643,647`) is a separate
+data-quality issue. Tracked as a future enhancement: extend ledger
+entries to carry an optional JSON payload alongside the human text,
+so structured conviction / verdict / decision-tag fields don't have
+to be regex-extracted from prose. Out of scope for this item — the
+unified reader works on what's on disk today.
+
+**Out of scope here.** Cross-ticker views, brief-history queries, and
+the operator-facing CLI — those are #22. This item is only "the four
+sources (ledger, stage2 journal, stage2_returns, briefs) collapse to
+one canonical reader."
+
+Anchor: dossier evidence at `MU.md:66-83` and `SNDK.md:44-51`,
+session 2026-06-05.
+
+Related: #19 (scoreboard) consumes whichever reader this lands.
+
+---
+
+## 22. `/history` — cross-ticker operator surface over the unified reader
+
+Status: **PARTIAL — shipped 2026-06-05.**
+
+- `python -m research_assistant history brief <T>` — per-ticker brief
+  history table, ISO-date or `Nd` `--since` filter.
+- `python -m research_assistant history cohort <T1,T2,...> [--since]`
+  — date × ticker grid of verdict + pre→post conviction. This is the
+  scoreboard-comparison table the operator wanted in the 2026-06-05
+  session.
+- `python -m research_assistant history verdicts [--since] [--verdict]
+  [--ticker]` — cross-ticker scan; surfaces verdict CLUSTERS rather
+  than single reads (the 2026-05-29 brief had nine CHALLENGE /
+  STRONG_OBJECTION entries across the AI/momentum complex — a
+  market-regime signal visible only at the cohort level).
+- All three accept `--json`, share the `Stage2HistoryEntry` projection,
+  and use the unified reader from #21 (so trace-enriched convictions
+  show up in the output without extra wiring).
+- 20 new tests in `tests/test_history_views.py`; 569 total passing.
+- Deferred from the original spec: `history sector <name>` — needs
+  sector-roster substrate (config file or `ticker_data.sector`
+  classification). Use `history cohort` with explicit ticker list
+  until then. Tracked as a v1.1 followon.
+
+Originally caught 2026-06-05 in the same
+session that surfaced #21: the operator asked for a scoreboard
+comparison across the seven prior-researched semis, and the assistant
+ended up writing ~50 lines of ad-hoc Python that walked four
+different data sources (`briefs/*.json`, `stage2/*.jsonl`,
+`stage2_returns/*.jsonl`, `tickers/*.md` ledger) plus a yfinance
+fetch for current prices. The work was correct but should not have
+required custom code per session.
+
+**The gap today.** Existing read-side tools each cover one slice:
+
+| Tool | Scope | What it can't do |
+|---|---|---|
+| `trajectory <T>` | per-ticker Stage 2 timeline | one ticker; broken until #21 |
+| `scoreboard` | global verdict→return calibration | no drill-down by ticker or cohort |
+| `dossier <T>` | full one-ticker dump | not queryable across tickers |
+| `trace <chain>` | one cascade | no cross-chain search |
+
+Three operator questions fall through every existing surface:
+
+1. *"What did we say about ticker X across every brief?"*
+   — today: walk `briefs/*.json` manually
+2. *"Show me every CHALLENGE / STRONG_OBJECTION in the last 7 days
+   across all tickers."*
+   — useful for spotting *clusters*, not individual reads (the
+   rolling semi de-rating across MU / MRVL / INTC / SNDK was a
+   pattern the operator only saw retrospectively because no view
+   surfaced it as a cohort)
+3. *"Trajectory but cross-ticker — e.g., timeline of every verdict
+   on every name in the semi watchlist over the last 30 days."*
+   — today: per-ticker `trajectory` loop + manual stitching
+
+**Proposed CLI shape.**
+
+```
+python -m research_assistant history brief <TICKER>
+    # every brief mention of TICKER: date, conviction, decision_tag,
+    # one-line thesis preview, link to chain
+
+python -m research_assistant history verdicts \
+    [--since 7d] [--verdict CHALLENGE,STRONG_OBJECTION] \
+    [--ticker MU,MRVL,INTC,...] [--sector semis]
+    # cross-ticker scan of Stage 2 + Skeptic outputs; spot clusters
+
+python -m research_assistant history cohort <ticker1>,<ticker2>,...
+    # cross-ticker timeline table: date × ticker grid of
+    # (conviction, skeptic_verdict, forward_return_5d)
+    # — the table the operator asked for in the 2026-06-05 session
+
+python -m research_assistant history sector <sector>
+    # convenience wrapper around history cohort, with the sector
+    # roster pulled from a config file (or eventually from
+    # ticker_data.sector classification)
+```
+
+All subcommands accept `--json` for chaining, match the existing CLI
+output style, and depend exclusively on the #21 unified reader. No
+new data sources, no LLM calls (the data is already on disk).
+
+**Schema sketch — one record shape across all subcommands.**
+
+```python
+@dataclass
+class HistoryEntry:
+    ticker: str
+    asof: date
+    source: Literal["brief", "research", "probe"]
+    chain_id: str
+    composite_conviction: float | None
+    skeptic_verdict: str | None      # AGREE / WEAKEN / TEMPER / CHALLENGE / STRONG_OBJECTION
+    decision_tag: str | None         # RESEARCH / PASS / ...
+    forward_return_5d: float | None  # joined from stage2_returns
+    forward_return_10d: float | None
+    forward_return_30d: float | None
+    thesis_preview: str              # first 120 chars
+    bull_anchor: str | None
+    bear_anchor: str | None
+```
+
+Every subcommand projects this shape; the only difference is the
+WHERE / GROUP BY.
+
+**Non-goals.** Not a replacement for `/research`, `/probe`, `/trace`,
+or `/dossier` — those are write-or-render surfaces. `/history` is
+read-only and projects existing on-disk data into operator-useful
+shapes. Doesn't issue LLM calls. Doesn't fetch live prices (joins on
+pre-enriched `stage2_returns/<TKR>.jsonl`; if a horizon hasn't matured
+yet, the field is `null` and rendered as `n/a`).
+
+**Why this matters for the mission.** Per
+`project_mission_swing_trading.md`, the north star is days-to-weeks
+swing trades. The verdict ladder is only useful if the operator can
+*see* it across the watchlist on the morning of a trade. Today the
+ladder is per-ticker, retrospective, and requires manual stitching.
+`/history` makes the ladder a first-class operator surface.
+
+**Implementation order.**
+
+1. Land #21 (unified ledger reader).
+2. `history brief <T>` — simplest projection, smallest blast radius.
+3. `history cohort` — the table the operator wanted in the 2026-06-05
+   session; lands the cross-ticker GROUP BY shape.
+4. `history verdicts` — the cluster-detection view.
+5. `history sector` — convenience wrapper once the sector roster
+   substrate (today's ad-hoc hard-coding) is decided.
+
+Anchor: session 2026-06-05 "scoreboard comparisons" exchange — the
+operator explicitly asked whether this should be a tool vs. ad-hoc
+grep, and the ad-hoc grep this session needed four data sources.
+
+Related: #6 (watchlist-vs-universe scope flag), #7 (`/watch` CLI),
+#19 (scoreboard verdict→outcome — its global view becomes one
+projection of `/history`).
+
+---
+
 ## Tracked TBDs (process / validation, not build queue)
 
 These belong to the spec's "Open Items" section (§243-249) but are not

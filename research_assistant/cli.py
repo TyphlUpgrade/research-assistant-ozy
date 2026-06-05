@@ -1183,68 +1183,71 @@ def _truncate(text: str, limit: int = 100) -> str:
     return flat[: limit - 1].rstrip() + "…"
 
 
-def _format_trajectory_entry(
-    entry: dict,
-    *,
-    prior_composite: Optional[float] = None,
-) -> str:
+def _format_trajectory_entry(entry) -> str:
     """One trajectory row, indented per the PR 2A.4 render contract.
 
-    Format:
-      2026-05-15 · conviction 0.42 (Skeptic AGREE) · WATCH
-        Bull: <truncated bull_anchor>
-        Bear: <truncated bear_anchor>
-
-    `prior_composite` is unused in the per-row render (kept for future
-    "→ delta" rendering); the trailing summary line owns the multi-day
-    drift narrative.
+    `entry` is a `Stage2HistoryEntry` (from `research_assistant.history`)
+    covering both brief journal rows and research ledger entries. The
+    `source` discriminator is rendered inline so the operator can tell
+    `/brief` reads (inline Skeptic vocabulary) apart from `/research`
+    reads (Stage 3 Skeptic vocabulary). When both pre- and post-Skeptic
+    convictions are present, the row shows `0.48 → 0.43` so the
+    operator can see the discount magnitude — the actual signal the
+    Skeptic moved on this read.
     """
-    asof = entry.get("asof", "?")
-    composite = entry.get("composite_conviction")
-    composite_str = (
-        f"{float(composite):.2f}" if isinstance(composite, (int, float)) else "?"
-    )
-    verdict = entry.get("skeptic_verdict", "UNAVAILABLE")
-    tag = entry.get("decision_tag", "?")
-    bull = _truncate(entry.get("bull_anchor", ""))
-    bear = _truncate(entry.get("bear_anchor", ""))
+    pre = entry.pre_skeptic_conviction
+    post = entry.composite_conviction
+    if pre is not None and post is not None and abs(pre - post) > 0.005:
+        conviction_str = f"{pre:.2f} → {post:.2f}"
+    elif post is not None:
+        conviction_str = f"{post:.2f}"
+    elif pre is not None:
+        conviction_str = f"{pre:.2f}"
+    else:
+        conviction_str = "?"
+    verdict = entry.skeptic_verdict or "UNAVAILABLE"
+    tag = entry.decision_tag or "?"
+    bull = _truncate(entry.bull_anchor or "")
+    bear = _truncate(entry.bear_anchor or "")
     return (
-        f"{asof} · conviction {composite_str} (Skeptic {verdict}) · {tag}\n"
+        f"{entry.asof} [{entry.source}] · conviction {conviction_str} "
+        f"(Skeptic {verdict}) · {tag}\n"
         f"  Bull: {bull}\n"
         f"  Bear: {bear}"
     )
 
 
-def _render_trajectory(ticker: str, history: list[dict]) -> str:
-    """Render the full Stage 2 trajectory in operator-readable markdown.
+def _render_trajectory(ticker: str, history: list) -> str:
+    """Render the unified Stage 2 + Stage 3 trajectory.
 
-    `history` is chronological (oldest-first) — `read_stage2_full_history`
-    returns that order. Trailing line summarises the composite drift across
-    the window when ≥2 entries exist.
+    `history` is a list of `Stage2HistoryEntry`, chronological oldest-first.
+    Trailing drift line summarises composite conviction movement across
+    entries that actually have a numeric composite (brief journal rows);
+    research-only entries are counted in the entry total but skipped in the
+    composite arithmetic since their ledger summary doesn't preserve the
+    structured number.
     """
     if not history:
         return f"# {ticker} — Stage 2 trajectory\n\n(no history)"
-    first_date = history[0].get("asof", "?")
-    last_date = history[-1].get("asof", "?")
+    first_date = history[0].asof or "?"
+    last_date = history[-1].asof or "?"
+    n_brief = sum(1 for e in history if e.source == "brief")
+    n_research = sum(1 for e in history if e.source == "research")
     header = (
-        f"# {ticker} — Stage 2 trajectory ({len(history)} notes, "
+        f"# {ticker} — Stage 2 trajectory ({len(history)} notes — "
+        f"{n_brief} brief / {n_research} research, "
         f"{first_date} to {last_date})"
     )
     rows = [header, ""]
     for entry in history:
         rows.append(_format_trajectory_entry(entry))
         rows.append("")
-    # Trailing drift summary across the rendered window.
-    composites = [
-        e.get("composite_conviction") for e in history
-        if isinstance(e.get("composite_conviction"), (int, float))
-    ]
+    composites = [e.composite_conviction for e in history if e.composite_conviction is not None]
     if len(composites) >= 2:
         start, end = composites[0], composites[-1]
-        days = len(history) - 1
         rows.append(
-            f"Trajectory: composite drifted from {start:.2f} → {end:.2f} "
-            f"over {days} entries"
+            f"Post-Skeptic conviction drifted from {start:.2f} → "
+            f"{end:.2f} over {len(composites)} entries"
         )
     return "\n".join(rows)
 
@@ -1283,34 +1286,45 @@ async def _cmd_scoreboard(args: argparse.Namespace) -> int:
     from research_assistant.journal import enrich_window, read_alerts_window
     from research_assistant.price import BarsBackedPriceAdapter
     from research_assistant.scoreboard import (
-        compute_hit_rate, enrich_stage2_rows, read_all_stage2, render_hit_rate,
-        render_scoreboard,
+        compute_hit_rate, enrich_stage2_rows, read_all_research, read_all_stage2,
+        render_hit_rate, render_research_scoreboard, render_scoreboard,
     )
 
     base = _resolve_base(args.base)
-    rows = read_all_stage2(base)
+    brief_rows = read_all_stage2(base)
+    research_rows = read_all_research(base)
 
     horizon_field = _HORIZON_FIELD_BY_ARG.get(args.horizon, "return_10d")
     hit_rate_horizon = _HIT_RATE_HORIZON_BY_ARG.get(
         args.hit_rate_horizon, "return_30d",
     )
 
-    if not rows:
+    if not brief_rows and not research_rows:
         # Skip the adapter construction (and the import-time yfinance side
         # effects) when there's nothing to enrich.
         entries = []
+        research_entries = []
         adapter = None
     else:
         # Wrap the raw yfinance adapter (which exposes fetch_bars) in the
         # bars-backed price shim that exposes the fetch_price_at protocol
         # scoreboard uses. One DataFrame fetch per ticker, reused across
-        # all horizon lookups.
+        # all horizon lookups (and across brief + research streams — they
+        # share the same `stage2_returns/` cache, keyed by recorded_at).
         adapter = BarsBackedPriceAdapter(YFinanceAdapter())
         try:
-            entries = await enrich_stage2_rows(rows, adapter, base)
+            entries = await enrich_stage2_rows(brief_rows, adapter, base) if brief_rows else []
         except Exception as exc:
-            logging.warning("scoreboard enrichment failed: %s", exc)
+            logging.warning("scoreboard brief enrichment failed: %s", exc)
             entries = []
+        try:
+            research_entries = (
+                await enrich_stage2_rows(research_rows, adapter, base)
+                if research_rows else []
+            )
+        except Exception as exc:
+            logging.warning("scoreboard research enrichment failed: %s", exc)
+            research_entries = []
 
     hit_rate: dict | None = None
     if not args.no_hit_rate:
@@ -1344,29 +1358,34 @@ async def _cmd_scoreboard(args: argparse.Namespace) -> int:
         )
 
     if args.json:
-        # JSON shape: full ScoredEntry list + hit-rate dict, easy for
-        # piping into other tools.
+        def _entry_payload(e) -> dict:
+            return {
+                "ticker": e.ticker,
+                "asof": e.asof,
+                "recorded_at": e.recorded_at,
+                "source": e.source,
+                "composite_conviction": e.composite_conviction,
+                "pre_skeptic_conviction": e.pre_skeptic_conviction,
+                "skeptic_verdict": e.skeptic_verdict,
+                "decision_tag": e.decision_tag,
+                "entry_price": e.entry_price,
+                "return_5d": e.return_5d,
+                "return_10d": e.return_10d,
+                "return_30d": e.return_30d,
+            }
         payload = {
-            "entries": [
-                {
-                    "ticker": e.ticker,
-                    "asof": e.asof,
-                    "recorded_at": e.recorded_at,
-                    "composite_conviction": e.composite_conviction,
-                    "skeptic_verdict": e.skeptic_verdict,
-                    "decision_tag": e.decision_tag,
-                    "entry_price": e.entry_price,
-                    "return_5d": e.return_5d,
-                    "return_10d": e.return_10d,
-                    "return_30d": e.return_30d,
-                }
-                for e in entries
-            ],
+            "brief_entries": [_entry_payload(e) for e in entries],
+            "research_entries": [_entry_payload(e) for e in research_entries],
             "hit_rate": hit_rate,
         }
         print(json.dumps(payload, indent=2, default=str))
     else:
         print(render_scoreboard(entries, horizon_field=horizon_field))
+        if research_entries:
+            print()
+            print(render_research_scoreboard(
+                research_entries, horizon_field=horizon_field,
+            ))
         if hit_rate is not None:
             print()
             print(render_hit_rate(hit_rate))
@@ -1374,22 +1393,97 @@ async def _cmd_scoreboard(args: argparse.Namespace) -> int:
 
 
 def _cmd_trajectory(args: argparse.Namespace) -> int:
-    from research_assistant.journal import read_stage2_full_history
+    from dataclasses import asdict
+
+    from research_assistant.history import read_unified_history
 
     base = _resolve_base(args.base)
     ticker = args.ticker.upper()
-    history = read_stage2_full_history(ticker, base)
+    history = read_unified_history(ticker, base)
     if not history:
         print(f"No Stage 2 history for {ticker}.", file=sys.stderr)
         return 0
-    # `--limit N` truncates to the LAST N entries (most-recent-first window).
     if args.limit is not None and args.limit >= 0:
         history = history[-args.limit:]
     if args.json:
-        print(json.dumps(history, indent=2, default=str))
+        print(json.dumps([asdict(e) for e in history], indent=2, default=str))
     else:
         print(_render_trajectory(ticker, history))
     return 0
+
+
+# ---------------------------------------------------------------------------
+# history brief / cohort / verdicts (FOLLOWUPS #22)
+# ---------------------------------------------------------------------------
+
+def _cmd_history(args: argparse.Namespace) -> int:
+    """Dispatch to the right history subcommand. argparse guarantees
+    `args.hist_cmd` is one of the registered names."""
+    from dataclasses import asdict
+
+    from research_assistant.history import (
+        build_cohort_grid,
+        filter_verdicts,
+        history_brief,
+        render_cohort_grid,
+        render_history_brief,
+        render_verdicts_table,
+    )
+
+    base = _resolve_base(args.base)
+
+    if args.hist_cmd == "brief":
+        ticker = args.ticker.upper()
+        entries = history_brief(ticker, base, since=args.since)
+        if args.json:
+            print(json.dumps([asdict(e) for e in entries], indent=2, default=str))
+        else:
+            print(render_history_brief(ticker, entries))
+        return 0
+
+    if args.hist_cmd == "cohort":
+        tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+        if not tickers:
+            print("cohort requires at least one ticker", file=sys.stderr)
+            return 2
+        grid = build_cohort_grid(tickers, base, since=args.since)
+        if args.json:
+            payload = {
+                "tickers": list(grid.tickers),
+                "dates": list(grid.dates),
+                "rows": {
+                    d: {
+                        t: (asdict(grid.rows[d][t]) if grid.rows[d][t] else None)
+                        for t in grid.tickers
+                    }
+                    for d in grid.dates
+                },
+            }
+            print(json.dumps(payload, indent=2, default=str))
+        else:
+            print(render_cohort_grid(grid))
+        return 0
+
+    if args.hist_cmd == "verdicts":
+        verdicts = (
+            {v.strip().upper() for v in args.verdict.split(",") if v.strip()}
+            if args.verdict else None
+        )
+        tickers = (
+            [t.strip().upper() for t in args.ticker.split(",") if t.strip()]
+            if args.ticker else None
+        )
+        entries = filter_verdicts(
+            base, since=args.since, verdicts=verdicts, tickers=tickers,
+        )
+        if args.json:
+            print(json.dumps([asdict(e) for e in entries], indent=2, default=str))
+        else:
+            print(render_verdicts_table(entries))
+        return 0
+
+    print(f"Unknown history subcommand: {args.hist_cmd}", file=sys.stderr)
+    return 2
 
 
 # ---------------------------------------------------------------------------
@@ -1556,6 +1650,63 @@ def _build_parser() -> argparse.ArgumentParser:
              "Use 0.5 = top half for sparser data.",
     )
 
+    # history brief|cohort|verdicts (FOLLOWUPS #22) — cross-ticker operator
+    # surface over the unified history reader. Read-only; no LLM, no live
+    # fetches. Each subcommand projects on-disk Stage 2 / Skeptic data.
+    phist = sub.add_parser(
+        "history",
+        help="Cross-ticker operator history surface — brief / cohort / verdicts",
+    )
+    hsub = phist.add_subparsers(dest="hist_cmd", required=True)
+
+    phbrief = hsub.add_parser(
+        "brief",
+        help="Every brief mention of a ticker, oldest first",
+    )
+    phbrief.add_argument("ticker", help="Ticker symbol, e.g. NVDA")
+    phbrief.add_argument(
+        "--since",
+        default=None,
+        help="Lower-bound date filter — ISO date (2026-05-29) or "
+             "Nd relative form (7d, 30d). Default: no lower bound.",
+    )
+
+    phcohort = hsub.add_parser(
+        "cohort",
+        help="Date × ticker grid of verdict + conviction across a cohort",
+    )
+    phcohort.add_argument(
+        "tickers",
+        help="Comma-separated ticker list, e.g. MU,MRVL,INTC",
+    )
+    phcohort.add_argument(
+        "--since",
+        default=None,
+        help="Lower-bound date filter — ISO date or Nd relative form.",
+    )
+
+    phverdicts = hsub.add_parser(
+        "verdicts",
+        help="Cross-ticker scan filtered by date, verdict word, and "
+             "optional ticker subset",
+    )
+    phverdicts.add_argument(
+        "--since",
+        default=None,
+        help="Lower-bound date filter — ISO date or Nd relative form.",
+    )
+    phverdicts.add_argument(
+        "--verdict",
+        default=None,
+        help="Comma-separated verdict filter (e.g. "
+             "CHALLENGE,STRONG_OBJECTION). Default: all.",
+    )
+    phverdicts.add_argument(
+        "--ticker",
+        default=None,
+        help="Comma-separated ticker subset. Default: all tickers on disk.",
+    )
+
     return p
 
 
@@ -1574,6 +1725,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "defender-check": _cmd_defender_check,
         "trajectory":     _cmd_trajectory,
         "scoreboard":     lambda a: asyncio.run(_cmd_scoreboard(a)),
+        "history":        _cmd_history,
     }
     handler = handlers.get(args.cmd)
     if handler is None:

@@ -11,3 +11,15 @@ GOOGL
 # Broad market reference
 SPY
 QQQ
+
+# Semiconductors — pinned 2026-06-05 after a swing loss on MU/SNDK that
+# fell through the dynamic-discovery universe (MU appeared in only 2 of
+# 12 prior briefs; SNDK never surfaced). Pinning here forces Stage 2 +
+# Skeptic on every brief so prior CHALLENGE/TEMPER verdicts can't be
+# hidden by a coverage gap.
+MU
+SNDK
+MRVL
+INTC
+CRDO
+NVTS
