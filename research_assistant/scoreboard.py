@@ -164,15 +164,64 @@ def _read_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def _dedup_latest_per_ticker_asof(rows: list[dict]) -> list[dict]:
+    """Collapse multiple cascade re-runs of the same `(ticker, asof)` to a
+    single row by keeping the latest by `recorded_at`.
+
+    Background (FOLLOWUPS #19 Phase 1.7, 2026-06-08): the same operator
+    can run /brief or /research multiple times against the same
+    ticker-date — each run writes a separate journal row carrying its
+    own `composite_conviction` and `recorded_at`. The forward-return
+    cache is keyed on `(ticker, asof)`, so all those rows JOIN against
+    the same return value. Without dedup, decile / verdict
+    stratification triple-counts the same outcome.
+
+    Observed empirical impact: pre-fix scoreboard reported decile-10
+    (≥0.44 post-Skeptic conviction) → +19.14% median 10d return on
+    N=6, where 3 of 6 entries were MRVL on 2026-05-29 (same +40.9%
+    return attributed to three distinct journal rows). Post-fix:
+    decile-10 collapses to N=5 unique trades, median = -2.62%, 17% of
+    bootstrap resamples positive. The "system works at the top" claim
+    was a hygiene artifact, not a signal.
+
+    Latest-by-`recorded_at` is the safe choice: it reflects what the
+    operator's most recent cascade run said, not an averaging fiction
+    across re-runs.
+    """
+    by_key: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        ticker = row.get("ticker")
+        asof = row.get("asof")
+        if not ticker or not asof:
+            continue
+        key = (str(ticker), str(asof))
+        existing = by_key.get(key)
+        if existing is None:
+            by_key[key] = row
+            continue
+        # Tie-breaker: later recorded_at wins. Missing recorded_at sorts
+        # as empty string (loses to anything non-empty).
+        cur_ts = row.get("recorded_at") or ""
+        prev_ts = existing.get("recorded_at") or ""
+        if cur_ts > prev_ts:
+            by_key[key] = row
+    return list(by_key.values())
+
+
 def read_all_stage2(base: Path) -> list[dict]:
-    """Read every Stage 2 journal row across all tickers under `base/stage2/`."""
+    """Read every Stage 2 journal row across all tickers under `base/stage2/`.
+
+    Same `(ticker, asof)` rows are deduplicated (latest `recorded_at`
+    wins) to prevent same-trade triple-counting in downstream decile /
+    verdict analysis. See `_dedup_latest_per_ticker_asof` for the
+    forward-return-cache rationale."""
     stage2_dir = base / "stage2"
     if not stage2_dir.exists():
         return []
     rows: list[dict] = []
     for path in sorted(stage2_dir.glob("*.jsonl")):
         rows.extend(_read_jsonl(path))
-    return rows
+    return _dedup_latest_per_ticker_asof(rows)
 
 
 def read_all_research(base: Path) -> list[dict]:
@@ -187,6 +236,10 @@ def read_all_research(base: Path) -> list[dict]:
 
     Tags each row with `source="research"` so the enrich path can
     propagate that into `ScoredEntry.source` for downstream filtering.
+
+    Same `(ticker, asof)` rows are deduplicated (latest `recorded_at`
+    wins) to prevent same-trade triple-counting in downstream decile /
+    verdict analysis. See `_dedup_latest_per_ticker_asof`.
     """
     from research_assistant.history import (
         enumerate_tickers,
@@ -213,7 +266,7 @@ def read_all_research(base: Path) -> list[dict]:
                 "decision_tag": entry.decision_tag or "",
                 "source": "research",
             })
-    return rows
+    return _dedup_latest_per_ticker_asof(rows)
 
 
 def _safe_ticker(ticker: object) -> Optional[str]:

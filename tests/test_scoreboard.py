@@ -113,6 +113,66 @@ def test_read_all_stage2_skips_malformed(tmp_path: Path):
     assert len(rows) == 2
 
 
+def test_read_all_stage2_dedup_same_ticker_asof_keeps_latest(tmp_path: Path):
+    """FOLLOWUPS #19 Phase 1.7 (2026-06-08): re-runs of the cascade on
+    the same `(ticker, asof)` write multiple journal rows, each carrying
+    its own conviction. The forward-return cache is keyed on
+    `(ticker, asof)`, so without dedup the decile/verdict analysis
+    triple-counts the same outcome. Latest `recorded_at` wins."""
+    _write_stage2(tmp_path, "MRVL", [
+        _stage2_row(ticker="MRVL", asof="2026-05-29",
+                    recorded_at="2026-05-29T10:00:00Z", composite=0.44),
+        _stage2_row(ticker="MRVL", asof="2026-05-29",
+                    recorded_at="2026-05-29T13:00:00Z", composite=0.47),
+        _stage2_row(ticker="MRVL", asof="2026-05-29",
+                    recorded_at="2026-05-29T16:00:00Z", composite=0.50),
+        # Different ticker-day: stays distinct.
+        _stage2_row(ticker="MRVL", asof="2026-05-30",
+                    recorded_at="2026-05-30T10:00:00Z", composite=0.35),
+    ])
+    rows = scoreboard.read_all_stage2(tmp_path)
+    assert len(rows) == 2
+    by_date = {r["asof"]: r for r in rows}
+    assert by_date["2026-05-29"]["composite_conviction"] == 0.50
+    assert by_date["2026-05-29"]["recorded_at"] == "2026-05-29T16:00:00Z"
+    assert by_date["2026-05-30"]["composite_conviction"] == 0.35
+
+
+def test_read_all_stage2_dedup_missing_recorded_at_does_not_crash(tmp_path: Path):
+    """Edge case: a row missing `recorded_at` (legacy schema) shouldn't
+    crash the dedup. Falls back to empty-string compare so any
+    timestamped row beats it."""
+    _write_stage2(tmp_path, "AAA", [
+        {"schema_version": 1, "ticker": "AAA", "asof": "2026-05-01",
+         "composite_conviction": 0.30, "bull_anchor": "b", "bear_anchor": "x",
+         "conviction": {"technical": 0.3}, "decision_tag": "WATCH",
+         "skeptic_verdict": "AGREE"},
+        _stage2_row(ticker="AAA", asof="2026-05-01",
+                    recorded_at="2026-05-01T10:00:00Z", composite=0.40),
+    ])
+    rows = scoreboard.read_all_stage2(tmp_path)
+    assert len(rows) == 1
+    assert rows[0]["composite_conviction"] == 0.40   # timestamped row wins
+
+
+def test_dedup_latest_per_ticker_asof_filters_invalid_keys():
+    """Rows missing ticker or asof are dropped (can't dedup what can't
+    be keyed). Direct test of the helper to catch regressions in the
+    key-extraction logic."""
+    rows = [
+        {"ticker": "AAA", "asof": "2026-05-01", "recorded_at": "a", "x": 1},
+        {"ticker": "AAA", "asof": "2026-05-01", "recorded_at": "b", "x": 2},
+        {"ticker": None, "asof": "2026-05-01", "recorded_at": "c", "x": 3},
+        {"ticker": "AAA", "asof": None, "recorded_at": "d", "x": 4},
+        {"ticker": "BBB", "asof": "2026-05-01", "recorded_at": "a", "x": 5},
+    ]
+    out = scoreboard._dedup_latest_per_ticker_asof(rows)
+    assert len(out) == 2
+    by_ticker = {r["ticker"]: r for r in out}
+    assert by_ticker["AAA"]["x"] == 2   # later recorded_at "b"
+    assert by_ticker["BBB"]["x"] == 5
+
+
 # ---------------------------------------------------------------------------
 # Stratification logic — pure functions, no I/O
 # ---------------------------------------------------------------------------
