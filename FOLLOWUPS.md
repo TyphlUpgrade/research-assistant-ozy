@@ -22,22 +22,36 @@ pin — operator decision, revisit later.
 
 In ship order:
 
-1. **#24 — 13F silently 404'ing** (NEW). Every dossier today shows "no
-   usable filings across 5 tracked funds." The institutional-flow side
-   of every thesis is empty. Highest impact because the bug is silent —
-   theses *claim* 13F coverage was checked.
-2. **#25 — VIX delisted in yfinance** (NEW). Stage 0 regime carries
-   `VIX: None (falling)` text without measured data. Brief regime
-   confidence has a hole.
-3. **#20 + #18 — Skeptic hybrid investigation, including the volume-
-   composition optional tool**. Direct fix for the brief-Skeptic
-   inversion the scoreboard exposed. Volume composition (up/down split,
-   close-position-in-range, accumulation/distribution) lands as one of
-   the #20 optional tools — unlocks SPY/QQQ/IONQ-class theses where
-   volume is the load-bearing pillar. Subsumes #18.
-4. **#11 — FRED macro time series**. Non-tech sector context that
+1. **#24 — 13F silently 404'ing** ✅ SHIPPED 2026-06-08 in commit
+   `bf445a6`. BlackRock CIK fix + index.json-based filename discovery.
+   Live NVDA query now returns BlackRock $336B, State Street $173B,
+   FMR $173B (previously: silent None).
+2. **#25 — VIX delisted in yfinance** ✅ SHIPPED 2026-06-08 in commit
+   `bf445a6`. `^VIX` → `^VIX9D` swap; Stage 0 now emits numeric VIX
+   level + measured trend.
+3. **#26 — Scoreboard 2.0 trajectory-mode** (NEW). Spec drafted
+   2026-06-08 at `.omc/specs/scoreboard-trajectory-mode-v1.md`.
+   Surfaced when bootstrap + paired-observation analysis revealed
+   the #20 empirical gate (decile-10 +19.14%) was N=6 with 3 of 6
+   entries being MRVL triple-counted. Trajectory framing credits
+   adaptive behaviour (the MRVL ideal: high conviction at the catalyst
+   → declining as risk surfaces → exhaustion-low at the post-pop
+   drawdown) that point-in-time decile analysis structurally cannot
+   see. **Now blocks #20** — re-opens once trajectory PEAK-AND-FADE
+   hit rate > 50% AND median P&L > 0 across N≥10 classified
+   trajectories.
+4. **#20 + #18 — Skeptic hybrid investigation** (BLOCKED on #26).
+   Spec drafted 2026-06-08 at
+   `.omc/specs/skeptic-hybrid-investigation-v1.md`; architect + critic
+   review surfaced (a) load-bearing "reuse Stage 2 tool-use pattern"
+   factual error (no such pattern exists in repo), (b) decile-10
+   empirical gate is duplicate-data noise. Spec now BLOCKED on #26
+   delivering a trajectory-aware empirical gate. Volume composition
+   tool stays as a #20 optional when #20 re-opens.
+5. **#11 — FRED macro time series**. Non-tech sector context that
    today's brief is missing (yield curves, employment, inflation).
-   Cheapest open Stage 0 enrichment after the silent-bug fixes.
+   Cheapest open Stage 0 enrichment now that the silent-bug fixes
+   shipped.
 
 ---
 
@@ -792,7 +806,28 @@ Cross-references:
 
 ## 20. Skeptic hybrid-investigation rewrite (supersedes #16b, subsumes #18)
 
-Status: **OPEN** (scoped 2026-06-02, hybrid framing landed after architecture
+Status: **BLOCKED on #26** (revised 2026-06-08). Spec drafted at
+`.omc/specs/skeptic-hybrid-investigation-v1.md`; architect + critic
+review surfaced two blockers: (a) load-bearing factual error in the
+spec — "reuse Stage 2's existing tool-use pattern" claim is false
+(`ClaudeClient.call` has no `tools=` kwarg, no tool-use loop;
+~150 LOC of new SDK plumbing needed); (b) the empirical gate
+(decile-10 +19.14% in scoreboard) was shown by bootstrap analysis
+to be N=6 with 3 of 6 entries being MRVL on 2026-05-29 triple-
+counted — median collapses to ≈ -4.9% on unique trades, bootstrap
+p50 = +0.64%, only 51% of resamples positive. Without a working
+empirical gate, the spec's "the research Skeptic works at the top,
+let's give the brief Skeptic the same data" premise is unsupported.
+
+#26 (trajectory-mode scoreboard) is the replacement gate. #20
+re-opens when trajectory analysis shows: (1) PEAK-AND-FADE
+hit rate > 50% AND median P&L > 0 across N≥10 classified
+trajectories; AND (2) brief-Skeptic-AGREE entries don't
+systematically underperform brief-WEAKEN entries on the
+trajectory metric. Either failing means cascade-level issues,
+not Skeptic-surface issues.
+
+Original status (pre-2026-06-08): **OPEN** (scoped 2026-06-02, hybrid framing landed after architecture
 discussion). Architectural rewrite of how the Skeptic stage operates.
 Supersedes the prompt-only half of #16. Likely subsumes #18 (10b5-1
 uncertainty regression) on landing.
@@ -1414,6 +1449,93 @@ Independent of #24 (different adapter, different failure mode), but
 both belong to the same "silent data degradation" class — Stage 0
 regime quality and Stage 2 institutional pillar are both partially
 blind in production right now.
+
+---
+
+## 26. Scoreboard 2.0 — trajectory-aware calibration
+
+Status: **OPEN — spec drafted 2026-06-08** at
+`.omc/specs/scoreboard-trajectory-mode-v1.md`. Blocks #20 (replaces its
+broken empirical gate). Awaiting architect + critic review.
+
+### Origin
+
+Surfaced 2026-06-08 during the same scoreboard-audit session that
+shipped #24 + #25. The architect+critic review of the #20 spec
+prompted a bootstrap analysis of the "decile-10 +19.14%" finding the
+spec was leaning on; the finding turned out to be **N=6 with 3 of 6
+entries being MRVL on 2026-05-29 triple-counted** — three /research
+re-runs on the same ticker-date, each writing a separate journal row,
+each keyed to the same +40.9% forward return. Without duplicates:
+4 unique trades, median ≈ -4.9%. Bootstrap p50 = +0.64%; 51% of
+resamples positive.
+
+But the operator review of *the same MRVL data* surfaced something
+the point-in-time scoreboard structurally can't see: the system
+correctly recommended MRVL into the catalyst at conviction ≥0.4 on
+5/29, then **adaptively downgraded** to TEMPER (6/02) and CHALLENGE
+(6/08) as the catalyst absorbed and risk surfaced — exactly the
+operator-ideal trajectory ("recommends MRVL right before the pop,
+adjusts conviction daily based on signals in the days following,
+until low ratings basically guarantee a divestment"). The decile
+view attributes the same +40.9% forward return to every high-
+conviction day independently and can't credit the adaptive arc as
+a single trade.
+
+### What it is
+
+A sibling read-side calibration surface to the existing
+`/scoreboard`. Treats per-ticker conviction series as **trajectories**
+classified into archetypes (PEAK-AND-FADE, FLAT-HIGH, FLAT-LOW,
+RISING-LATE, WHIPSAW), defines operational entry/exit signals
+mirroring how an operator uses daily updates, and reports
+entry-to-exit P&L per trajectory plus divestment-signal forward
+returns.
+
+### What ships
+
+- `research_assistant/trajectory.py` — archetype classifier + entry/
+  exit signal computation (pure Python, no LLM)
+- `scoreboard trajectory <TICKER>` — single-ticker time series view
+- `scoreboard trajectories --classify [--since 30d]` — cross-ticker
+  archetype counts
+- `scoreboard trajectories --pnl [--archetype X]` — entry-to-exit P&L
+  aggregate with hit rate + p25/p75
+- `scoreboard trajectories --divest-signal` — forward-return test on
+  low-rating signals ("do low ratings precede drawdowns?")
+- All read-only over the unified history reader (FOLLOWUPS #21).
+  No new data sources, no LLM calls, no cascade changes.
+
+### Why this matters for the mission
+
+`project_mission_swing_trading` north star is days-to-weeks swing
+trades. The operator updates daily, enters when conviction crosses
+up, exits when conviction crosses down. The current scoreboard
+evaluates the system as a batch-prediction model (hold blindly for
+exactly 10 days from each observation); trajectory mode evaluates it
+as the daily-decision tool it actually is. Trajectory framing is
+also the only framing that can *credit* the MRVL case correctly —
+under point-in-time framing, MRVL on 5/29 looks good and MRVL on
+6/08 looks bad, but they're the same trade.
+
+### Open empirical questions the spec must answer before #20 re-opens
+
+1. PEAK-AND-FADE hit rate > 50% AND median P&L > 0 across N≥10
+   classified trajectories on existing journal data.
+2. Brief-Skeptic-AGREE entries don't systematically underperform
+   brief-WEAKEN entries on the trajectory metric (if they do, the
+   anti-predictive pattern is confirmed and #20 is justified; if
+   they don't, the brief-AGREE → -8.89% finding was point-in-time
+   artifact and #20 should be retired).
+
+### Cross-references
+
+- Spec: `.omc/specs/scoreboard-trajectory-mode-v1.md`
+- Blocks: #20 (Skeptic hybrid)
+- Builds on: #21 (unified history reader), #22 (`/history` surface)
+- Augments: #19 (`/scoreboard` point-in-time view stays sibling)
+- Origin session: 2026-06-08 (commit `bf445a6` shipped #24/#25 in
+  the same session)
 
 ---
 
