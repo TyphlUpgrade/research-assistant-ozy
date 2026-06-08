@@ -9,6 +9,38 @@ Status legend: `OPEN` · `PARTIAL` · `CLOSED`
 Cross-checked against `.omc/specs/deep-interview-research-assistant.md`
 on 2026-05-22.
 
+## Pinned priority (2026-06-08)
+
+Operator-pinned during a watchlist-wide /brief + /research pass. The
+scoreboard surfaced that only the post-Skeptic ≥0.44 decile predicts
+positive forward returns (+19.14% median 10d); everything below is
+noise-to-negative, and the brief-inline anchor-only Skeptic is anti-
+predictive (AGREE → -8.89%). The blind spots below either silently
+degrade verdict quality today or close the data gap that's keeping the
+brief Skeptic broken. Polymarket (#4) intentionally excluded from this
+pin — operator decision, revisit later.
+
+In ship order:
+
+1. **#24 — 13F silently 404'ing** (NEW). Every dossier today shows "no
+   usable filings across 5 tracked funds." The institutional-flow side
+   of every thesis is empty. Highest impact because the bug is silent —
+   theses *claim* 13F coverage was checked.
+2. **#25 — VIX delisted in yfinance** (NEW). Stage 0 regime carries
+   `VIX: None (falling)` text without measured data. Brief regime
+   confidence has a hole.
+3. **#20 + #18 — Skeptic hybrid investigation, including the volume-
+   composition optional tool**. Direct fix for the brief-Skeptic
+   inversion the scoreboard exposed. Volume composition (up/down split,
+   close-position-in-range, accumulation/distribution) lands as one of
+   the #20 optional tools — unlocks SPY/QQQ/IONQ-class theses where
+   volume is the load-bearing pillar. Subsumes #18.
+4. **#11 — FRED macro time series**. Non-tech sector context that
+   today's brief is missing (yield curves, employment, inflation).
+   Cheapest open Stage 0 enrichment after the silent-bug fixes.
+
+---
+
 ## Ship-order revision (2026-05-22)
 
 Today's session ran three `/research` cycles on IONQ plus one `/probe`.
@@ -1191,6 +1223,197 @@ grep, and the ad-hoc grep this session needed four data sources.
 Related: #6 (watchlist-vs-universe scope flag), #7 (`/watch` CLI),
 #19 (scoreboard verdict→outcome — its global view becomes one
 projection of `/history`).
+
+---
+
+## 23. IPO-mode surgical patches (pre-listing DD lane)
+
+Status: **OPEN**
+
+Origin: SPCX session 2026-06-06 / 07. Drove the existing toolchain
+against an active S-1/A and a live roadshow without touching the
+orchestrator — the conviction / Skeptic / journal layer worked
+unchanged, but two specific gaps cost most of the manual time.
+Motivated by Anthropic and OpenAI both having credible 2026 H2 IPO
+windows; this is the **surgical** version, not a full `pre_ipo`
+orchestrator mode (deferred until pre-IPO becomes a sustained lane,
+not a 3-name campaign).
+
+What hurt in the SPCX walk:
+- `EdgarClient.resolve_cik` only handles ticker-indexed entities
+  (`company_tickers.json`). Pre-IPO names have no ticker, so the
+  operator had to hit `https://www.sec.gov/cgi-bin/browse-edgar` by
+  hand to find the CIK (SPCX → 0001181412).
+- `_extract_paragraphs` collapsed a 1.5M-char S-1/A to a single
+  paragraph — the prospectus HTML structure doesn't match the
+  div/p patterns the extractor expects. Workable for keyword
+  search but the `edgar:S-1/A:...:para_0` anchor loses all
+  citation granularity; every fact in the Stage 2 note pointed at
+  the same anchor.
+- Stage2Note has no `edgar_anchors` field; the cited filings
+  (S-1/A accession + FWP set) lived in the conversation, not the
+  journal row — so the row isn't re-runnable as evidence.
+
+Patches (small, additive, each lands independently):
+
+a. **CIK-by-company-name resolver on `EdgarClient`.** New method
+   `async def resolve_cik_by_name(query: str) -> list[tuple[str, str]]`
+   that hits `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&company=...`,
+   parses the result, returns `[(cik, display_name)]` pairs.
+   Operator disambiguates from a short list rather than guessing.
+   Keep `resolve_cik(ticker)` unchanged — fast path for tickered
+   names. Test against SpaceX / Anthropic / OpenAI / Stripe.
+
+b. **Prospectus-aware paragraph segmenter.** S-1 / S-1/A / 424B
+   forms have a canonical section vocabulary (PROSPECTUS SUMMARY,
+   RISK FACTORS, USE OF PROCEEDS, CAPITALIZATION, DILUTION,
+   MANAGEMENT'S DISCUSSION, BUSINESS, UNDERWRITING, SHARES
+   ELIGIBLE FOR FUTURE SALE, etc.). Detect heading-shaped lines
+   and split on them, then sub-split within sections on
+   sentence-boundary heuristics. Reuse the same `FilingText`
+   contract; just produce ~200-600 paragraphs instead of 1.
+   Anchor format unchanged. Smoke test: SPCX S-1/A AMD#2 must
+   yield ≥ 100 anchorable paragraphs.
+
+c. **Additive `edgar_anchors` field on Stage2Note + journal row.**
+   `edgar_anchors: tuple[str, ...] = ()` — list of
+   `edgar:{form}:{accession}:para_{n}` anchors backing the
+   bull/bear text. Per the schema contract (additive only,
+   `Optional` with sensible default), no migration needed. Update
+   `_note_to_row` to persist when non-empty. Sanitize each
+   anchor through `_sanitize_text` (the existing 240-char cap is
+   already over-budget for an anchor — actual anchors are ~50
+   chars).
+
+d. **Documented IPO-mode template.** A markdown crib (somewhere
+   under `docs/` or `.omc/specs/`) showing the SPCX walk as a
+   reusable recipe: CIK lookup → list filings (DRS, S-1, S-1/A,
+   FWP) → `fetch_filing` on the latest S-1/A → keyword probes
+   for offering size / price / lockup / use of proceeds /
+   selling stockholders / stock split / accumulated deficit
+   / underwriter syndicate → isolated Skeptic → Stage2Note
+   write. Includes the lockup-mechanics extraction template
+   (T+70 / T+90 / First Earnings Release Date / 30% trigger /
+   demand registration rights) because lockup is the dominant
+   short-horizon trade-killer on every IPO, not a SPCX quirk.
+
+Scope NOT in this item (deferred until sustained pre-IPO volume):
+- Full `pre_ipo` orchestrator mode that skips price-dependent
+  stages
+- Scoreboard / `stage2_returns` adaptation for pre-listing entries
+  (today they silently no-op for ~30 days post-listing, which is
+  fine)
+- New conviction pillars / dimension renames — the canonical
+  technical / fundamental / catalyst / regime quartet handled
+  SPCX unchanged; the bull/bear-anchor text does the reinterpretation
+- A "pre-IPO ticker" namespace (`PRE:NAME`) — the assigned IPO
+  ticker passes existing validation; SPCX worked unchanged
+
+Reference data already on disk: `.research/stage2/SPCX.jsonl`
+(row written 2026-06-06) — the first IPO-mode entry. Use as
+schema regression for patch (c).
+
+Trigger to escalate to a real `pre_ipo` mode: if Anthropic and
+OpenAI both file by Q4 2026 and operator is still hand-driving
+EDGAR from Python, build the full lane.
+
+Related: #1 (EDGAR foundation — patches a + b extend it), #20
+(Skeptic isolation — IPO-mode confirmed canonical Skeptic prompt
+already handles IPO anchors correctly with no template changes).
+
+---
+
+## 24. 13F adapter silently 404'ing across all tracked funds
+
+Status: **OPEN — bug, not a feature gap.** Surfaced 2026-06-08 during a
+12-ticker /research pass.
+
+Every single dossier ran today emitted:
+
+```
+WARNING research_assistant.edgar.form13f: EDGAR: 13F fetch failed for
+BlackRock (0001086364-24-008417): Client error '404 Not Found' for url
+'https://www.sec.gov/Archives/edgar/data/1364742/000108636424008417/infotable.xml'
+...
+INFO research_assistant.edgar.form13f: EDGAR 13F: no usable filings for
+<TICKER> across 5 tracked funds
+```
+
+Same pattern for all five `DEFAULT_TRACKED_FUNDS` (BlackRock, Vanguard,
+State Street, FMR, Berkshire) across all 12 tickers — *every* infotable
+URL 404s. The institutional-flow side of every thesis is silently
+empty, but the dossier line "No 13F coverage available" looks like
+*absence of activity* rather than *failure to fetch*.
+
+Why it matters: 13F is one of the four conviction pillars (per the
+Skeptic prompt: institutional-accumulation pillar). When it's silently
+missing, the Skeptic falls back on insider Form 4 as the entire
+fundamental-flow read, and the "institutional accumulation" sub-pillar
+in Stage 2 theses gets pattern-matched to "no coverage" instead of
+"checked and unsupportive."
+
+Candidate diagnoses:
+- URL pattern changed (SEC moved from `infotable.xml` to a different
+  filename, or accessions are now zero-padded differently).
+- CIK or accession resolution is stale — the fetch is computing the
+  wrong target.
+- The default fund list itself is stale (CIK 1364742 vs 1086364 for
+  BlackRock — the warning string shows a mismatch between the bracket
+  and the URL).
+
+Fix:
+- Reproduce against one filing manually (curl the URL) to confirm 404
+  is real, not a User-Agent / throttle issue.
+- Audit `form13f.py` URL construction vs the SEC archive layout.
+- Add an integration test that hits *one* real archive URL and asserts
+  the parser gets a non-empty position list — current tests likely mock
+  the HTTP layer.
+- On systemic 404 (not parser bug): widen the surface so
+  "fetch_failed" is distinct from "no_filings_in_window" in
+  `aggregate_institutional_ownership`, and surface fetch_failed in the
+  Stage 2 block as `(13F: fetch_failed)` instead of `(no 13F coverage)`
+  — at minimum the operator should see the bug, not silently lose the
+  pillar.
+
+Cross-ref: closes-broken-#5. The original #5 ship was correct in
+shape; the URL/CIK layer is what regressed.
+
+---
+
+## 25. VIX delisted in yfinance — Stage 0 regime confidence has a hole
+
+Status: **OPEN — data adapter fix.** Surfaced 2026-06-08 across all
+12 /research runs and the morning /brief.
+
+Every dossier and the brief emit:
+
+```
+ERROR yfinance: $^VIX: possibly delisted; no price data found  (period=3mo)
+WARNING ozymandias.data.adapters.yfinance_adapter: fetch_bars failed for ^VIX
+WARNING research_assistant.data_loader: instrument snapshot failed for ^VIX
+```
+
+The brief still renders `VIX: None (falling)` in Stage 0 — but "falling"
+is inferred from headline text, not a measured value. Regime confidence
+of 0.62 reported today was therefore computed with VIX = null and a
+narrative-extracted direction. The brief's choppy/euphoria classifier
+weights VIX trend non-trivially, so this silently downgrades regime
+quality on every run.
+
+Fix candidates:
+- Switch `^VIX` → `^VIX9D` or `^VVIX` in the data adapter (both
+  currently active in yfinance).
+- Front-month VIX futures (`VX=F` via Yahoo, or a direct CBOE pull).
+- Reconstruct from SPX options chain — heavier, but removes the
+  upstream-data-vendor dependency entirely.
+
+Smoke test after swap: brief Stage 0 should emit a numeric VIX value
++ measured trend tag (rising/falling/flat from EMA20 vs spot).
+
+Independent of #24 (different adapter, different failure mode), but
+both belong to the same "silent data degradation" class — Stage 0
+regime quality and Stage 2 institutional pillar are both partially
+blind in production right now.
 
 ---
 

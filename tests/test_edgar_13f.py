@@ -31,11 +31,14 @@ from research_assistant.edgar import (
     parse_13f,
 )
 from research_assistant.edgar.form13f import (
+    _discover_infotable_url,
     _load_fund_last_two_quarters,
+    _pick_infotable_filename,
     _quarter_end_for_filing_date,
     _resolve_issuer_match,
     _value_multiplier,
 )
+from research_assistant.edgar.client import Filing
 
 
 # ---------------------------------------------------------------------------
@@ -753,3 +756,150 @@ def test_default_tracked_funds_has_entries() -> None:
         assert len(fund.cik) == 10
         assert fund.cik.isdigit()
         assert fund.name
+
+
+def test_default_tracked_funds_blackrock_uses_active_cik() -> None:
+    """FOLLOWUPS #24 regression: BlackRock's prior CIK 1364742 ("BlackRock
+    Finance, Inc.") has no recent 13F-HR after a corporate restructure.
+    The active 13F filer is CIK 2012383 ("BlackRock, Inc. (BLK)"). If this
+    regresses, every dossier silently loses BlackRock institutional flow."""
+    by_name = {f.name: f.cik for f in DEFAULT_TRACKED_FUNDS}
+    assert by_name.get("BlackRock") == "0002012383", (
+        "BlackRock must point at the active 13F-HR filer CIK "
+        "(0002012383). The legacy CIK 0001364742 silently 404s on infotable.xml."
+    )
+    # Vanguard (CIK 0000102909) currently only files 13F-NT notices; pending
+    # a Vanguard-specific resolver, it's intentionally NOT in the default
+    # list. If it returns without that resolver, dossiers will see silent
+    # fetch failures again.
+    assert "Vanguard" not in by_name, (
+        "Vanguard's umbrella 13F-NT delegation isn't yet supported — must "
+        "stay out of the default list until a child-CIK resolver lands."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Infotable URL discovery (FOLLOWUPS #24)
+# ---------------------------------------------------------------------------
+
+def test_pick_infotable_filename_picks_largest_non_primary_xml() -> None:
+    """Modern 13F-HR accessions name the holdings XML differently per
+    filer ('infotable.xml', 'form13fInfoTable.xml', or a bare numeric
+    like '53405.xml'). The discovery picks any non-primary .xml; when
+    several match, the largest by size wins — the holdings file is
+    materially bigger than any cover-form sibling."""
+    items = [
+        {"name": "0001234567-26-000005-index-headers.html", "size": "0"},
+        {"name": "0001234567-26-000005.txt", "size": "0"},
+        {"name": "primary_doc.xml", "size": "5555"},
+        {"name": "53405.xml", "size": "45259"},
+    ]
+    assert _pick_infotable_filename(items) == "53405.xml"
+
+
+def test_pick_infotable_filename_handles_blackrock_naming() -> None:
+    """BlackRock Inc. (CIK 2012383) names its holdings file
+    'form13fInfoTable.xml' — observed 2026-06-08."""
+    items = [
+        {"name": "primary_doc.xml", "size": "13828"},
+        {"name": "form13fInfoTable.xml", "size": "23314133"},
+    ]
+    assert _pick_infotable_filename(items) == "form13fInfoTable.xml"
+
+
+def test_pick_infotable_filename_returns_none_when_only_primary_doc() -> None:
+    """A 13F-NT (Notice) accession has only primary_doc.xml — no
+    holdings file. Discovery must return None so the caller can degrade."""
+    items = [
+        {"name": "primary_doc.xml", "size": "5555"},
+        {"name": "0001234567-26-000005-index.html", "size": "0"},
+    ]
+    assert _pick_infotable_filename(items) is None
+
+
+def test_pick_infotable_filename_handles_missing_size_field() -> None:
+    """index.json items occasionally lack a size value (or have empty
+    string). Treat as zero; don't crash."""
+    items = [
+        {"name": "primary_doc.xml"},
+        {"name": "infotable.xml", "size": ""},
+    ]
+    assert _pick_infotable_filename(items) == "infotable.xml"
+
+
+@pytest.mark.asyncio
+async def test_discover_infotable_url_via_index_json() -> None:
+    """End-to-end: index.json returns the random-filename variant; the
+    discovery returns the correct URL against the (numeric) filename."""
+    index_payload = {
+        "directory": {
+            "item": [
+                {"name": "primary_doc.xml", "size": "5555"},
+                {"name": "53405.xml", "size": "45259"},
+                {"name": "0001067983-26-226661-index.html", "size": "0"},
+            ],
+            "name": "/Archives/edgar/data/1067983/000119312526226661",
+        }
+    }
+    routes = {
+        "https://www.sec.gov/Archives/edgar/data/1067983/000119312526226661/index.json":
+            (200, index_payload),
+    }
+    handler = _make_handler(routes)
+    filing = Filing(
+        accession_number="0001193125-26-226661",
+        form_type="13F-HR",
+        filing_date="2026-05-15",
+        cik="0001067983",
+        primary_document="primary_doc.xml",
+    )
+    async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+        url = await _discover_infotable_url(client, filing)
+    assert url == (
+        "https://www.sec.gov/Archives/edgar/data/1067983/"
+        "000119312526226661/53405.xml"
+    )
+
+
+@pytest.mark.asyncio
+async def test_discover_infotable_url_falls_back_on_index_404() -> None:
+    """Very old (pre-index.json) filings need the legacy path. When
+    index.json itself 404s, the discovery falls back to the historical
+    `infotable.xml` URL rather than raising."""
+    handler = _make_handler({})   # all URLs return 404
+    filing = Filing(
+        accession_number="0001364742-15-000001",
+        form_type="13F-HR",
+        filing_date="2015-05-15",
+        cik="0001364742",
+        primary_document="primary_doc.xml",
+    )
+    async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+        url = await _discover_infotable_url(client, filing)
+    assert url.endswith("/infotable.xml")
+
+
+@pytest.mark.asyncio
+async def test_discover_infotable_url_falls_back_when_no_xml_in_index() -> None:
+    """If index.json loads but contains no non-primary XML (malformed
+    accession), discovery falls back rather than returning None."""
+    index_payload = {
+        "directory": {
+            "item": [{"name": "primary_doc.xml", "size": "5555"}]
+        }
+    }
+    routes = {
+        "https://www.sec.gov/Archives/edgar/data/1067983/000119312526226661/index.json":
+            (200, index_payload),
+    }
+    handler = _make_handler(routes)
+    filing = Filing(
+        accession_number="0001193125-26-226661",
+        form_type="13F-HR",
+        filing_date="2026-05-15",
+        cik="0001067983",
+        primary_document="primary_doc.xml",
+    )
+    async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+        url = await _discover_infotable_url(client, filing)
+    assert url.endswith("/infotable.xml")

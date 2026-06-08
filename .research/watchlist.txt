@@ -23,3 +23,13 @@ MRVL
 INTC
 CRDO
 NVTS
+
+# Non-tech diversification pins (added 2026-06-08 after a tech-only
+# brief surfaced XLV +3.25% and XLF +1.05% leading the 5d while XLK
+# led the loss. Watchlist had zero per-ticker coverage outside tech;
+# Iran-era consumer-goods loss is the cautionary tale this hedge
+# is supposed to prevent.
+UNH
+JPM
+XOM
+COST

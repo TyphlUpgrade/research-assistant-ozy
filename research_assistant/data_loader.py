@@ -46,8 +46,17 @@ log = logging.getLogger(__name__)
 # Default sector ETFs surveyed for world-state (subset of Ozy's full sector map)
 DEFAULT_SECTOR_ETFS = ("XLK", "XLF", "XLE", "XLV", "XLY", "XLP", "XLI", "XLU", "XLB", "XLRE", "XLC")
 
-# Macro reference instruments for Stage 0 world-state
-DEFAULT_MACRO_INSTRUMENTS = ("SPY", "QQQ", "^VIX")
+# Macro reference instruments for Stage 0 world-state.
+#
+# 2026-06-08 (FOLLOWUPS #25): swapped `^VIX` → `^VIX9D`. Yahoo's `^VIX`
+# endpoint intermittently returns "possibly delisted; no price data
+# found" under concurrent load — observed across all 12 /research runs
+# on 2026-06-08. `^VIX9D` (9-day VIX) is the closest liquid sibling
+# (tracks `^VIX` within ~1 vol point in calm regimes, prints 1-3 points
+# higher in stress), reads consistently from yfinance, and serves the
+# same Stage-0 regime function. Display label in brief.py remains "VIX"
+# — operators are reading the level/trend, not the precise tenor.
+DEFAULT_MACRO_INSTRUMENTS = ("SPY", "QQQ", "^VIX9D")
 
 # Concurrency cap (Critic iter1 #17)
 DEFAULT_PARALLEL_FETCH = 5

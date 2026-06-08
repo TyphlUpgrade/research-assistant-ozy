@@ -66,8 +66,20 @@ class TrackedFund:
 # Pass a custom `tracked_funds=` argument to load_institutional_ownership
 # to extend / replace this list per session.
 DEFAULT_TRACKED_FUNDS: tuple[TrackedFund, ...] = (
-    TrackedFund(cik="0001364742", name="BlackRock"),
-    TrackedFund(cik="0000102909", name="Vanguard"),
+    # 2026-06-08 audit (FOLLOWUPS #24): CIKs verified against
+    # data.sec.gov/submissions for active 13F-HR filings.
+    #
+    # - BlackRock CIK switched from 1364742 ("BlackRock Finance, Inc.",
+    #   no recent 13F-HR after a corporate restructure) to 2012383
+    #   ("BlackRock, Inc. (BLK)", currently filing 13F-HR with
+    #   `form13fInfoTable.xml`).
+    # - Vanguard (CIK 102909) now files 13F-NT (Notice) only — its
+    #   actual holdings file via an umbrella across multiple subsidiary
+    #   file numbers (028-06408 etc.) which the curated-CIK model
+    #   doesn't yet support. Dropped from the default list pending a
+    #   Vanguard-specific resolver. Operators can still pass it via
+    #   tracked_funds= if they have the right child CIK.
+    TrackedFund(cik="0002012383", name="BlackRock"),
     TrackedFund(cik="0000093751", name="State Street"),
     TrackedFund(cik="0001067983", name="Berkshire Hathaway"),
     TrackedFund(cik="0000315066", name="FMR (Fidelity)"),
@@ -416,22 +428,89 @@ def aggregate_institutional_ownership(
 # High-level loader
 # ---------------------------------------------------------------------------
 
-INFOTABLE_URL = (
-    "https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dashes}/infotable.xml"
+ACCESSION_DIR_URL = (
+    "https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dashes}"
 )
+INDEX_JSON_URL = ACCESSION_DIR_URL + "/index.json"
+LEGACY_INFOTABLE_URL = ACCESSION_DIR_URL + "/infotable.xml"
 
 
-def _infotable_url(filing: Filing) -> str:
-    """The deterministic infotable.xml URL for a 13F filing.
-
-    Modern (2014+) 13F-HR filings standardize on `infotable.xml` as the
-    holdings document. Pre-2014 filings used varying names — out of scope
-    for v1 (operator-curated funds are all modern filers)."""
+def _accession_dir_url(filing: Filing) -> str:
     accession_no_dashes = filing.accession_number.replace("-", "")
     cik_no_zeros = filing.cik.lstrip("0") or "0"
-    return INFOTABLE_URL.format(
+    return ACCESSION_DIR_URL.format(
         cik=cik_no_zeros, accession_no_dashes=accession_no_dashes,
     )
+
+
+def _pick_infotable_filename(index_items: list[dict]) -> Optional[str]:
+    """Given the parsed `directory.item[]` array from a SEC accession
+    index.json, return the holdings XML filename.
+
+    Filtering: any `.xml` file that isn't `primary_doc.xml` (the cover
+    form) and isn't an `*-index*.html` redirect. If several match, pick
+    the largest by reported size — the holdings file is materially
+    larger than any sibling.
+
+    Known filenames in the wild as of 2026-06: `infotable.xml`
+    (pre-2025 standard), `form13fInfoTable.xml` (BlackRock parent),
+    bare-numeric names like `53405.xml` (Donnelley-bureau-filed)."""
+    candidates: list[tuple[int, str]] = []
+    for item in index_items:
+        name = item.get("name") or ""
+        if not name.lower().endswith(".xml"):
+            continue
+        if name.lower() == "primary_doc.xml":
+            continue
+        try:
+            size = int(item.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        candidates.append((size, name))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+async def _discover_infotable_url(
+    client: EdgarClient,
+    filing: Filing,
+) -> str:
+    """Resolve the accession's holdings XML URL by reading its
+    index.json. Falls back to the pre-2025 `infotable.xml` path on
+    index lookup failure so very old filings still parse.
+
+    One extra HTTP call per filing (the index.json itself); the
+    response is small (≤2KB) and the EdgarClient throttle absorbs it."""
+    accession_no_dashes = filing.accession_number.replace("-", "")
+    cik_no_zeros = filing.cik.lstrip("0") or "0"
+    index_url = INDEX_JSON_URL.format(
+        cik=cik_no_zeros, accession_no_dashes=accession_no_dashes,
+    )
+    try:
+        response = await client.get(index_url)
+        items = response.json().get("directory", {}).get("item", []) or []
+    except Exception as exc:
+        log.info(
+            "EDGAR 13F: index.json fetch failed for %s (%s); falling back "
+            "to legacy infotable.xml path: %s",
+            filing.cik, filing.accession_number, exc,
+        )
+        return LEGACY_INFOTABLE_URL.format(
+            cik=cik_no_zeros, accession_no_dashes=accession_no_dashes,
+        )
+    name = _pick_infotable_filename(items)
+    if name is None:
+        log.info(
+            "EDGAR 13F: no infotable XML in index for %s/%s; falling back "
+            "to legacy infotable.xml",
+            filing.cik, filing.accession_number,
+        )
+        return LEGACY_INFOTABLE_URL.format(
+            cik=cik_no_zeros, accession_no_dashes=accession_no_dashes,
+        )
+    return f"{_accession_dir_url(filing)}/{name}"
 
 
 async def fetch_13f(
@@ -449,7 +528,7 @@ async def fetch_13f(
             f"fetch_13f requires form_type='13F-HR' or '13F-NT', got "
             f"{filing.form_type!r}"
         )
-    url = _infotable_url(filing)
+    url = await _discover_infotable_url(client, filing)
     response = await client.get(url)
     return parse_13f(
         response.text,
