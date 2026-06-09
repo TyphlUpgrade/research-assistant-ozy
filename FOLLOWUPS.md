@@ -29,7 +29,18 @@ In ship order:
 2. **#25 — VIX delisted in yfinance** ✅ SHIPPED 2026-06-08 in commit
    `bf445a6`. `^VIX` → `^VIX9D` swap; Stage 0 now emits numeric VIX
    level + measured trend.
-3. **#26 — Scoreboard 2.0 trajectory-mode** (NEW). Spec drafted
+3. **#28 — Research-surface deep substrate (panopticon)** ✅ SPEC
+   READY 2026-06-09 at `.omc/specs/research-deep-substrate-v1.md`.
+   v3 spec passed architect + 2 critic rounds + 3 empirical
+   experiments (M4 + EXP1 + EXP2, $0.74 total). Empirical premise
+   validated from three angles: Phase D substrate (filing forensic
+   detail) catches losers; Phase A substrate (KPIs + financials)
+   catches losers via different mechanism; Phase D doesn't false-
+   positive on winners. Phase A and Phase D are complementary, not
+   redundant — both ship. Ready for implementation. Empirical gate
+   for SHIPPING resolved; #28 supersedes the "depth-of-synthesis
+   gap" hypothesis #20 and #26 were rationalizing around.
+4. **#26 — Scoreboard 2.0 trajectory-mode** (NEW). Spec drafted
    2026-06-08 at `.omc/specs/scoreboard-trajectory-mode-v1.md`.
    Surfaced when bootstrap + paired-observation analysis revealed
    the #20 empirical gate (decile-10 +19.14%) was N=6 with 3 of 6
@@ -1536,6 +1547,113 @@ under point-in-time framing, MRVL on 5/29 looks good and MRVL on
 - Augments: #19 (`/scoreboard` point-in-time view stays sibling)
 - Origin session: 2026-06-08 (commit `bf445a6` shipped #24/#25 in
   the same session)
+
+---
+
+## 28. Research-surface deep substrate (the panopticon)
+
+Status: **SPEC READY 2026-06-09** at
+`.omc/specs/research-deep-substrate-v1.md`. Architect + critic-v1 +
+critic-v2 + M4 experiment + EXP1 + EXP2 all incorporated. Empirical
+premise validated. Ready for Phase A implementation.
+
+### Origin
+
+Operator review on 2026-06-08 surfaced the architectural weakness:
+the cascade today is data-rich on technical / insider / news /
+world_state, and **data-poor on depth-of-synthesis**. The Coinbase
+puts case was the canonical "would have caught it" example —
+operator lost money on a bearish thesis where the 10-Q decomposition
+showed the headline loss was unrealized crypto fair-value markdown,
+not operational. A human institutional analyst with 90 minutes of
+attention catches that; the cascade as architected does not.
+
+The prior `fundamentals-substrate-v1.md` (archived same day) tried to
+rearrange reactive substrate — KPIs + industry context from filings.
+Operator pushback identified the load-bearing architectural error:
+*industry context filtered through management's self-presentation
+embeds the company's voice as ground truth, AND the substrate
+rearrangement doesn't address the depth-of-synthesis gap*.
+
+### What ships (5 deep readers + synthesizer on /research only)
+
+- **Phase A** — Deterministic substrate (KPIs + earnings calendar +
+  options positioning + analyst revisions + insider behavior detail).
+  No LLM calls. Single PR, ~4-5 days.
+- **Phase B** — Stage 1.7 Synthesizer reading ONLY Phase A substrate.
+  Emits structured flags with two-anchor citations. Ships before
+  Agent A to front-load measurement. ~1 week.
+- **Phase C** — Replay harness + falsifiability gate (hand-grading
+  with decoy-ticker arm). Gates Phase D. ~1 week.
+- **Phase D** — Agent A deep filing reader + XBRL-stripped extractor.
+  Lift revised to 2-3 weeks after EXP2 showed XBRL extraction failure
+  on 3/7 candidate filings (existing `_extract_paragraphs` returns
+  XBRL context tags only on iXBRL-heavy 10-Qs).
+- **Phase E** — Agent E 8-K event classifier (Haiku). ~3-5 days.
+- **Phase F** — `/probe-cohort` with 13F-overlap peer auto-suggestion.
+  ~3-5 days.
+
+### Empirical gate — three sub-experiments, all PASSED (2026-06-09)
+
+- **Sub-gate 1a (M4)**: Phase D deep-read on losing trades.
+  3/3 evaluable HITs (PLUG mechanical accounting reversal, RGTI
+  liquidity-vs-cash divergence, QUBT going-concern contradiction).
+  $0.33.
+- **Sub-gate 1b (EXP1)**: Phase A-only synthesizer on the same
+  losing trades. 3/3 HIT (PLUG multi-year negative gross profit,
+  RGTI revenue declined 3 consecutive years + P/S 653x, QUBT P/S
+  495x). $0.05.
+- **Sub-gate 1c (EXP2)**: Phase D deep-read on winning trades
+  (precision arm). 3/3 NO false-positive contrarian flags. MRVL
+  deep-read found bullish-supportive detail (non-cash fair value
+  marks depressing P&L while business news was good). $0.36.
+- **Total experimental cost: $0.74.**
+
+### Cost shape (real numbers anchored on today's traces)
+
+- Modal week (25 /research/wk × $0.18 avg, 5 briefs, 20-30 probes):
+  ~$7-8/wk
+- P90 week (30 /research/day spike day + 4 normal days): ~$12-15
+- `PANOPTICON_DAILY_CAP_USD=$10` circuit breaker with graceful
+  per-agent degrade
+
+### Key architectural decisions ratified
+
+- Per-ticker synthesizer by default; per-cohort exposed as
+  `/probe-cohort` option (architect rec #5: 13F-overlap auto-suggest)
+- Stage 1.7 as own cascade stage (not sub-step in Stage 2)
+- Two-anchor citation via role-bound re-extraction (Haiku, ~$0.005
+  per anchor) — closes the paraphrase-gameable failure mode
+- Synthesizer output is EVIDENCE, not directives — schema dropped
+  `thesis_implication`; renamed `*_claim` → `*_observation`;
+  Stage 2 prompt framing explicitly tells writer "do not let any
+  single flag drive your conviction"
+- `axes_agreed: true|false` telemetry replaces architect's killed
+  `consensus_unchecked` flag (per critic M1 — surfaced only in
+  /scoreboard, not per-ticker dossier)
+- Arm assignment by `hash(ticker, iso_week) mod 3` (per critic M3 —
+  prevents cache-leakage + probe-cascade confounds)
+- Phase order: A → B (synthesizer-on-A) → C (gate) → D (Agent A) →
+  E → F. Front-loads measurement.
+
+### Supersedes
+
+- This spec is the empirical landing zone for the "depth-of-synthesis
+  gap" hypothesis that #20 and #26 were architecturally rationalizing
+  toward without measurement. #20 stays blocked; #26 stays
+  downgraded. #28 doesn't compete with them — it solves a different
+  failure mode with grounded evidence.
+
+### Cross-references
+
+- Spec: `.omc/specs/research-deep-substrate-v1.md` (v3)
+- Archived predecessor: `.omc/specs/fundamentals-substrate-v1.md`
+  (wrong-direction lessons preserved as archaeology)
+- Built on: #1 (EDGAR), #17 (discretionary_net_dollars, Agent D
+  extends), #21 (history reader), #24 (13F now loading), #25 (VIX)
+- Orthogonal to: #19 (/scoreboard), #20 (Skeptic), #26 (trajectory)
+- Origin session: 2026-06-08/09 (commit shipping #24/#25 + scoreboard
+  dedup #19 Phase 1.7 + this spec)
 
 ---
 
