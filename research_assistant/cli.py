@@ -141,23 +141,71 @@ async def _cmd_research(args: argparse.Namespace) -> int:
     symbol = args.ticker.upper()
     adapter = YFinanceAdapter()
 
+    # Phase A (FOLLOWUPS #28): deterministic-substrate feature flag. When
+    # on, four additional yfinance-backed loads (KPIs, earnings calendar,
+    # options positioning, analyst revisions) run in parallel with the
+    # existing gather; Agent D (insider behavior detail) is derived from
+    # the existing Form 4 fetch (no extra HTTP). Default off until
+    # smoke-tested on the live watchlist.
+    deterministic_substrate_on = (
+        os.environ.get("STAGE_2_DETERMINISTIC_SUBSTRATE", "off").lower() == "on"
+    )
+
     # Load market data + insider activity + institutional ownership in
     # parallel. One shared EdgarClient per command keeps the 5 req/sec
     # rate budget honest (independent clients would let each loader
     # have its own bucket, exceeding SEC's declared ceiling) AND
     # amortizes the 1MB company_tickers.json fetch across all loaders.
     if not args.quiet:
-        print(
-            f"Loading {symbol} data (yfinance + EDGAR Form 4 + 13F)…",
-            file=sys.stderr,
-        )
+        sources = "yfinance + EDGAR Form 4 + 13F"
+        if deterministic_substrate_on:
+            sources += " + KPIs/calendar/options/revisions [Phase A]"
+        print(f"Loading {symbol} data ({sources})…", file=sys.stderr)
     async with EdgarClient() as edgar:
-        ticker_data, headlines, insider_activity, institutional_ownership = await asyncio.gather(
-            load_ticker_data(symbol, adapter),
-            load_headlines(symbol, adapter, max_items=5),
-            load_insider_activity(symbol, client=edgar),
-            load_institutional_ownership(symbol, client=edgar),
-        )
+        if deterministic_substrate_on:
+            from research_assistant.edgar.form4 import (
+                load_insider_activity_with_detail,
+            )
+            from research_assistant.fundamentals import (
+                load_earnings_calendar,
+                load_kpi_summary,
+            )
+            from research_assistant.positioning import (
+                load_analyst_revisions,
+                load_options_positioning,
+            )
+            # `load_insider_activity_with_detail` fetches Form 4 filings
+            # once and produces both the aggregate summary AND the per-
+            # insider behavior detail (Agent D). Replaces the separate
+            # `load_insider_activity` call when Phase A is on — avoids
+            # double-billing the EDGAR rate budget for the same filings.
+            (
+                ticker_data, headlines, insider_pair,
+                institutional_ownership, kpi_summary, earnings_calendar,
+                options_positioning, analyst_revisions,
+            ) = await asyncio.gather(
+                load_ticker_data(symbol, adapter),
+                load_headlines(symbol, adapter, max_items=5),
+                load_insider_activity_with_detail(symbol, client=edgar),
+                load_institutional_ownership(symbol, client=edgar),
+                load_kpi_summary(symbol),
+                load_earnings_calendar(symbol),
+                load_options_positioning(symbol),
+                load_analyst_revisions(symbol),
+            )
+            insider_activity, insider_detail = insider_pair
+        else:
+            ticker_data, headlines, insider_activity, institutional_ownership = await asyncio.gather(
+                load_ticker_data(symbol, adapter),
+                load_headlines(symbol, adapter, max_items=5),
+                load_insider_activity(symbol, client=edgar),
+                load_institutional_ownership(symbol, client=edgar),
+            )
+            kpi_summary = None
+            earnings_calendar = None
+            options_positioning = None
+            analyst_revisions = None
+            insider_detail = None
     if ticker_data.get("_data_quality") != "ok":
         print(
             f"ERROR: insufficient yfinance data for {symbol} "
@@ -191,6 +239,11 @@ async def _cmd_research(args: argparse.Namespace) -> int:
             base=base,
             insider_activity=insider_activity,
             institutional_ownership=institutional_ownership,
+            insider_detail=insider_detail,
+            kpi_summary=kpi_summary,
+            earnings_calendar=earnings_calendar,
+            options_positioning=options_positioning,
+            analyst_revisions=analyst_revisions,
         )
     except RuntimeError as exc:
         # research_ticker embeds the chain_id in stage-parse failure messages

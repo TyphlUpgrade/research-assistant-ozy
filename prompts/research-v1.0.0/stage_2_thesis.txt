@@ -69,8 +69,23 @@ RECENT_HEADLINES (annotated by absorption stage):
 INSIDER_ACTIVITY (Form 4 filings, compressed; per FOLLOWUPS #3):
 {insider_activity_block}
 
+INSIDER_BEHAVIOR_DETAIL (per-insider 10b5-1 split + functional-area lean; per FOLLOWUPS #28 Phase A):
+{insider_detail_block}
+
 INSTITUTIONAL_OWNERSHIP (Form 13F across curated tracked funds; per FOLLOWUPS #5):
 {institutional_ownership_block}
+
+FUNDAMENTALS (multi-year KPI series + balance + multiples; per FOLLOWUPS #28 Phase A):
+{fundamentals_block}
+
+EARNINGS_CALENDAR (next/last earnings; per FOLLOWUPS #28 Phase A):
+{earnings_calendar_block}
+
+OPTIONS_POSITIONING (IV term structure + skew + P/C ratios; per FOLLOWUPS #28 Phase A):
+{options_positioning_block}
+
+ANALYST_REVISIONS (rating mix + revision velocity + PT distribution; per FOLLOWUPS #28 Phase A):
+{analyst_revisions_block}
 
 NEWS REACTIVITY DISCIPLINE:
 - "fresh_likely_priced_in" headlines (<2h old) indicate the market HAS ALREADY MOVED on this news.
@@ -128,6 +143,22 @@ Use:
     INSTITUTIONAL_OWNERSHIP block above (fund counts, total $/shares,
     new/exited positions, per-fund breakdown). Note the 45-day reporting
     lag — 13F flow is fundamental signal, not catalyst-timing.
+  - "yfinance:financials:annual" / "yfinance:financials:balance" for any
+    claim drawn from the FUNDAMENTALS block (multi-year revenue / gross
+    profit / operating income / net income / cash / debt). Multiples
+    (P/E, P/S, P/B, market cap) use "yfinance:financials:multiples".
+  - "yfinance:calendar:next" / "yfinance:calendar:last" for any claim
+    drawn from the EARNINGS_CALENDAR block.
+  - "yfinance:options:<expiry>" for any claim drawn from the
+    OPTIONS_POSITIONING block (IV term structure, skew, P/C OI/volume,
+    unusual single-strike OI). Substitute the actual ISO date — e.g.
+    "yfinance:options:2026-06-26" — not the literal "<expiry>" token.
+  - "yfinance:recommendations:aggregate" for any claim drawn from the
+    ANALYST_REVISIONS block (rating mix, revision counts, price targets,
+    revision velocity tag).
+  - "edgar:form4:behavior_detail" for any claim drawn from the
+    INSIDER_BEHAVIOR_DETAIL block (per-insider 10b5-1 split,
+    discretionary vs scheduled distribution, functional-area lean).
   - "world_state" for regime-derived inferences (sector tailwind, dispersion, etc.)
   - "no_fetch" ONLY as a last resort for inferences without ANY data source —
     if you use this, drop conviction_score by at least 0.1 and consider whether

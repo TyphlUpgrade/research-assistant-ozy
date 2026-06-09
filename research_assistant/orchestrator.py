@@ -33,13 +33,17 @@ from research_assistant.dossier_io import (
     Dossier,
     LedgerEntry,
     read_dossier,
+    update_dossier_under_lock,
     write_dossier_atomic,
 )
+from research_assistant.deep_reads import InsiderBehaviorDetail
 from research_assistant.edgar import (
     FilingExcerpts,
     InsiderActivitySummary,
     InstitutionalOwnership,
 )
+from research_assistant.fundamentals import EarningsCalendar, KPISummary
+from research_assistant.positioning import AnalystRevisions, OptionsPositioning
 from research_assistant.observations import Observation, append_observation
 from research_assistant.prompts import chain_id as _chain_id
 from research_assistant.prompts import load_prompt as _load_prompt
@@ -362,11 +366,23 @@ async def _stage_2_thesis(
     headlines: list[dict],
     insider_activity: Optional[InsiderActivitySummary] = None,
     institutional_ownership: Optional[InstitutionalOwnership] = None,
+    insider_detail: Optional[InsiderBehaviorDetail] = None,
+    kpi_summary: Optional[KPISummary] = None,
+    earnings_calendar: Optional[EarningsCalendar] = None,
+    options_positioning: Optional[OptionsPositioning] = None,
+    analyst_revisions: Optional[AnalystRevisions] = None,
 ) -> tuple[Optional[dict], Optional[CallResult]]:
     """
     Invoke Stage 2 (Sonnet thesis). Returns (parsed_json, call_metadata).
     parsed_json is None on parse failure; call_metadata is always returned
     (so trace events can record even when JSON parse fails).
+
+    Phase A (FOLLOWUPS #28) deterministic-substrate kwargs — insider_detail,
+    kpi_summary, earnings_calendar, options_positioning, analyst_revisions —
+    are wired by the CLI when `STAGE_2_DETERMINISTIC_SUBSTRATE=on`. When the
+    flag is off the kwargs are None and each render_for_prompt emits the
+    unavailable sentinel — the prompt slot is still filled (never leaked
+    as `{slot}`), and the Sonnet call sees the block labeled as such.
     """
     template = _load_prompt("stage_2_thesis")
     prompt = _render(
@@ -376,6 +392,11 @@ async def _stage_2_thesis(
         headlines_json=json.dumps(headlines, indent=2),
         insider_activity_block=InsiderActivitySummary.render_for_prompt(insider_activity),
         institutional_ownership_block=InstitutionalOwnership.render_for_prompt(institutional_ownership),
+        insider_detail_block=InsiderBehaviorDetail.render_for_prompt(insider_detail),
+        fundamentals_block=KPISummary.render_for_prompt(kpi_summary),
+        earnings_calendar_block=EarningsCalendar.render_for_prompt(earnings_calendar),
+        options_positioning_block=OptionsPositioning.render_for_prompt(options_positioning),
+        analyst_revisions_block=AnalystRevisions.render_for_prompt(analyst_revisions),
     )
     system = f"WORLD_STATE for this session:\n{json.dumps(world_state, indent=2)}"
     result = await client.call(prompt, model="claude-sonnet-4-6", system=system)
@@ -554,6 +575,11 @@ async def research_ticker(
     client: Optional[ClaudeClient] = None,
     insider_activity: Optional[InsiderActivitySummary] = None,
     institutional_ownership: Optional[InstitutionalOwnership] = None,
+    insider_detail: Optional[InsiderBehaviorDetail] = None,
+    kpi_summary: Optional[KPISummary] = None,
+    earnings_calendar: Optional[EarningsCalendar] = None,
+    options_positioning: Optional[OptionsPositioning] = None,
+    analyst_revisions: Optional[AnalystRevisions] = None,
 ) -> ResearchResult:
     """
     Run the mini-cascade for one ticker. Stage 2 thesis + Stage 3 Skeptic,
@@ -593,6 +619,11 @@ async def research_ticker(
         client, world_state, ticker_data, stage_1_placeholder, headlines,
         insider_activity=insider_activity,
         institutional_ownership=institutional_ownership,
+        insider_detail=insider_detail,
+        kpi_summary=kpi_summary,
+        earnings_calendar=earnings_calendar,
+        options_positioning=options_positioning,
+        analyst_revisions=analyst_revisions,
     )
     traces_base = base / "traces"
     append_stage_event(
@@ -633,38 +664,40 @@ async def research_ticker(
     if stage_3 is None:
         raise RuntimeError(f"Stage 3 JSON parse failed for {symbol} (chain={chain})")
 
-    # Merge into dossier
-    dossier = read_dossier(symbol, base) or Dossier(symbol=symbol)
-    dossier.conviction = stage_3.get("adjusted_score", stage_2["conviction_score"])
-
-    # Append ledger entries citing evidence anchors
+    # Merge into dossier under per-symbol lock so a concurrent probe on
+    # this ticker can't lose its ledger entry. Re-reading inside the lock
+    # rebases this research output onto whatever the latest disk state is.
     ts = datetime.now(timezone.utc).isoformat()
-    dossier.ledger.append(LedgerEntry(
+    conviction = stage_3.get("adjusted_score", stage_2["conviction_score"])
+    thesis_entry = LedgerEntry(
         timestamp=ts, kind="thesis", summary=stage_2["thesis_text"][:160],
         evidence_anchor=chain,
-    ))
-    dossier.ledger.append(LedgerEntry(
+    )
+    skeptic_entry = LedgerEntry(
         timestamp=ts, kind="skeptic", summary=stage_3.get("critique_text", "")[:160],
         evidence_anchor=chain,
-    ))
-
-    # Open Questions = union of Stage 2 + Stage 3 additions
+    )
     new_questions = list(stage_2.get("open_questions", [])) + list(
         stage_3.get("open_questions_added", [])
     )
-    dossier.open_questions = list(dict.fromkeys(dossier.open_questions + new_questions))
-
-    # Rebuild State narrative
-    dossier.state_md = (
+    state_md = (
         f"**Thesis:** {stage_2['thesis_text']}\n\n"
-        f"**Conviction (post-Skeptic):** {dossier.conviction:.2f}\n\n"
+        f"**Conviction (post-Skeptic):** {conviction:.2f}\n\n"
         f"**Key drivers:** " + "; ".join(stage_2.get("key_drivers", [])) + "\n\n"
         f"**Risks (named):** " + "; ".join(stage_2.get("risks", [])) + "\n\n"
         f"**Skeptic critique:** {stage_3.get('critique_text', '')}\n\n"
         f"**Flagged additional risks:** " + "; ".join(stage_3.get("flagged_risks", []))
     )
 
-    write_dossier_atomic(dossier, base)
+    def _apply_research_update(d: Dossier) -> Dossier:
+        d.conviction = conviction
+        d.ledger.append(thesis_entry)
+        d.ledger.append(skeptic_entry)
+        d.open_questions = list(dict.fromkeys(d.open_questions + new_questions))
+        d.state_md = state_md
+        return d
+
+    dossier = update_dossier_under_lock(symbol, base, _apply_research_update)
 
     append_observation(
         Observation(
@@ -850,15 +883,24 @@ async def probe_ticker(
     new_qs = list(stage_2.get("new_open_questions", []))
     anchors = list(stage_2.get("evidence_anchors", []))
 
-    # Update dossier: drop closed questions, append new ones, append probe ledger entry.
+    # Update dossier under per-symbol lock so parallel probes on the same
+    # ticker can't lose each other's ledger entries. The LLM call above
+    # already happened outside the lock; only the cheap read-modify-write
+    # phase is serialized, and the re-read inside the lock rebases this
+    # probe's append onto whatever entries arrived during our LLM window.
     ts = datetime.now(timezone.utc).isoformat()
-    dossier.open_questions = [q for q in dossier.open_questions if q not in closes]
-    dossier.open_questions = list(dict.fromkeys(dossier.open_questions + new_qs))
     ledger_summary = f"Probed: {question[:120]} → {answer[:120]}"
-    dossier.ledger.append(LedgerEntry(
+    ledger_entry = LedgerEntry(
         timestamp=ts, kind="probe", summary=ledger_summary, evidence_anchor=chain,
-    ))
-    write_dossier_atomic(dossier, base)
+    )
+
+    def _apply_probe_update(d: Dossier) -> Dossier:
+        d.open_questions = [q for q in d.open_questions if q not in closes]
+        d.open_questions = list(dict.fromkeys(d.open_questions + new_qs))
+        d.ledger.append(ledger_entry)
+        return d
+
+    dossier = update_dossier_under_lock(symbol, base, _apply_probe_update)
 
     append_observation(
         Observation(

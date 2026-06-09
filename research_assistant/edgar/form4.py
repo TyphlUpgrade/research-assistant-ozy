@@ -18,12 +18,25 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Optional
 
 from research_assistant.edgar.client import EdgarClient, Filing
+
+
+# Pattern matching 10b5-1 plan mentions in raw Form 4 XML. Form 4 schema
+# has no structured 10b5-1 boolean; the indicator lives in free-text
+# footnotes ("pursuant to a Rule 10b5-1 trading plan adopted on..."). The
+# pattern catches "10b5-1", "10b5 1", "Rule 10b5-1", and the loose
+# "trading plan" phrasing. False positives are rare in practice — Form 4
+# footnotes are short and "trading plan" is otherwise specific.
+_10B5_1_PATTERN = re.compile(
+    r"\b(10b5[-\s]?1|rule\s*10b5[-\s]?1|trading\s+plan)\b",
+    re.IGNORECASE,
+)
 
 log = logging.getLogger(__name__)
 
@@ -87,7 +100,14 @@ class Form4Transaction:
 
 @dataclass
 class Form4Filing:
-    """Parsed Form 4 with structured non-derivative and derivative tables."""
+    """Parsed Form 4 with structured non-derivative and derivative tables.
+
+    `mentions_10b5_1` is a filing-level heuristic flag set at parse time
+    by scanning the raw XML for "10b5-1" / "Rule 10b5-1" / "trading plan"
+    in any element text (typically the free-text footnote section). The
+    Form 4 schema has no structured encoding of 10b5-1 status; this flag
+    is the substrate Agent D (InsiderBehaviorDetail) uses to split
+    sales into discretionary vs scheduled (FOLLOWUPS #28 Phase A)."""
     accession_number: str
     filing_date: str
     period_of_report: str           # date the transaction(s) actually occurred
@@ -96,6 +116,7 @@ class Form4Filing:
     owners: list[Form4Owner]
     non_derivative: list[Form4Transaction] = field(default_factory=list)
     derivative: list[Form4Transaction] = field(default_factory=list)
+    mentions_10b5_1: bool = False
 
     @property
     def primary_owner(self) -> Optional[Form4Owner]:
@@ -312,6 +333,13 @@ def parse_form4(
         for t in root.findall("derivativeTable/derivativeTransaction")
     ]
 
+    # 10b5-1 detection: pattern-match the raw XML (footnote/free-text
+    # elements are the only place this string lives in Form 4). Cheap,
+    # deterministic, and captures the major encoding variants. Used by
+    # Agent D (InsiderBehaviorDetail) to split sales discretionary vs
+    # scheduled.
+    mentions_10b5_1 = bool(_10B5_1_PATTERN.search(xml_text))
+
     return Form4Filing(
         accession_number=accession_number,
         filing_date=filing_date,
@@ -321,6 +349,7 @@ def parse_form4(
         owners=owners,
         non_derivative=non_derivative,
         derivative=derivative,
+        mentions_10b5_1=mentions_10b5_1,
     )
 
 
@@ -652,6 +681,70 @@ async def load_insider_activity(
             otherwise a one-shot client is created and closed.
         as_of: reference date for the window (defaults to today).
     """
+    summary, _ = await _load_insider_filings(
+        symbol,
+        window_days=window_days,
+        max_filings=max_filings,
+        client=client,
+        as_of=as_of,
+    )
+    return summary
+
+
+async def load_insider_activity_with_detail(
+    symbol: str,
+    *,
+    window_days: int = INSIDER_DEFAULT_WINDOW_DAYS,
+    max_filings: int = INSIDER_DEFAULT_MAX_FILINGS,
+    client: Optional[EdgarClient] = None,
+    as_of: Optional[date] = None,
+) -> tuple[Optional[InsiderActivitySummary], Optional["InsiderBehaviorDetail"]]:
+    """Fetch Form 4 activity ONCE; return (aggregate summary, per-insider detail).
+
+    Used by `/research` when STAGE_2_DETERMINISTIC_SUBSTRATE=on so Agent D
+    (InsiderBehaviorDetail) reuses the same EDGAR fetch the aggregate
+    `load_insider_activity` would have performed — avoids doubling the
+    5 req/sec rate budget per ticker.
+
+    Returns (None, None) on hard fetch failure; ((empty summary), (empty
+    detail)) when fetch succeeded but no Form 4 in window. Otherwise both
+    populated.
+    """
+    from research_assistant.deep_reads.agent_d import (
+        build_insider_behavior_detail,
+    )
+    summary, filings = await _load_insider_filings(
+        symbol,
+        window_days=window_days,
+        max_filings=max_filings,
+        client=client,
+        as_of=as_of,
+    )
+    if summary is None:
+        return None, None
+    detail = build_insider_behavior_detail(
+        filings or [],
+        symbol=symbol,
+        window_days=window_days,
+        as_of=as_of,
+    )
+    return summary, detail
+
+
+async def _load_insider_filings(
+    symbol: str,
+    *,
+    window_days: int,
+    max_filings: int,
+    client: Optional[EdgarClient],
+    as_of: Optional[date],
+) -> tuple[Optional[InsiderActivitySummary], Optional[list[Form4Filing]]]:
+    """Shared fetch+parse path. Returns (summary, raw_filings).
+
+    The single source of truth that both `load_insider_activity` and
+    `load_insider_activity_with_detail` consume. Returns (None, None)
+    on hard failure (no CIK, network error). On no-Form-4 in window
+    returns (empty_summary, empty_list)."""
     owns_client = client is None
     if client is None:
         client = EdgarClient()
@@ -659,14 +752,14 @@ async def load_insider_activity(
         cik = await client.resolve_cik(symbol)
         if cik is None:
             log.info("EDGAR: no CIK for %s (foreign issuer / OTC / delisted)", symbol)
-            return None
+            return None, None
         as_of = as_of or date.today()
         since = (as_of - timedelta(days=window_days)).isoformat()
         filings = await client.list_filings(cik, "4", since=since, limit=max_filings)
         if not filings:
             return aggregate_insider_activity(
                 [], window_days=window_days, as_of=as_of,
-            )
+            ), []
         parsed = await asyncio.gather(
             *[fetch_form4(client, f) for f in filings],
             return_exceptions=True,
@@ -682,10 +775,10 @@ async def load_insider_activity(
             good.append(result)
         return aggregate_insider_activity(
             good, window_days=window_days, as_of=as_of,
-        )
+        ), good
     except Exception as exc:
         log.warning("EDGAR: load_insider_activity failed for %s: %s", symbol, exc)
-        return None
+        return None, None
     finally:
         if owns_client:
             await client.close()

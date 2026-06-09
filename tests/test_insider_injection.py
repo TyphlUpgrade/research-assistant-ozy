@@ -114,7 +114,7 @@ async def test_research_ticker_forwards_insider_activity(tmp_path: Path) -> None
     _stage_2_thesis without dropping or transforming it."""
     captured: dict = {}
 
-    async def fake_stage_2(client, ws, td, s1, h, insider_activity=None, institutional_ownership=None):
+    async def fake_stage_2(client, ws, td, s1, h, insider_activity=None, institutional_ownership=None, **_kwargs):
         captured["insider_activity"] = insider_activity
         return {
             "ticker": "NVDA",
@@ -159,7 +159,7 @@ async def test_research_ticker_default_insider_activity_is_none(
     callers) get None forwarded — preserving the graceful-degrade signal."""
     captured: dict = {}
 
-    async def fake_stage_2(client, ws, td, s1, h, insider_activity=None, institutional_ownership=None):
+    async def fake_stage_2(client, ws, td, s1, h, insider_activity=None, institutional_ownership=None, **_kwargs):
         captured["insider_activity"] = insider_activity
         return {
             "ticker": "NVDA",
@@ -274,7 +274,7 @@ async def test_probe_ticker_forwards_insider_activity(tmp_path: Path) -> None:
     write_dossier_atomic(Dossier(symbol="NVDA", state_md="prior thesis"), tmp_path)
     captured: dict = {}
 
-    async def fake_probe(client, ws, td, h, dc, q, insider_activity=None, institutional_ownership=None, filing_excerpts=None):
+    async def fake_probe(client, ws, td, h, dc, q, insider_activity=None, institutional_ownership=None, filing_excerpts=None, **_kwargs):
         captured["insider_activity"] = insider_activity
         return {
             "ticker": "NVDA", "answer": "ans",
@@ -515,7 +515,7 @@ def test_format_ownership_block_populated_uses_stage_2_line() -> None:
 async def test_research_ticker_forwards_institutional_ownership(tmp_path: Path) -> None:
     captured: dict = {}
 
-    async def fake_stage_2(client, ws, td, s1, h, insider_activity=None, institutional_ownership=None):
+    async def fake_stage_2(client, ws, td, s1, h, insider_activity=None, institutional_ownership=None, **_kwargs):
         captured["institutional_ownership"] = institutional_ownership
         return {
             "ticker": "NVDA", "thesis_text": "t", "conviction_score": 0.5,
@@ -549,7 +549,7 @@ async def test_probe_ticker_forwards_institutional_ownership(tmp_path: Path) -> 
     write_dossier_atomic(Dossier(symbol="NVDA", state_md="prior thesis"), tmp_path)
     captured: dict = {}
 
-    async def fake_probe(client, ws, td, h, dc, q, insider_activity=None, institutional_ownership=None, filing_excerpts=None):
+    async def fake_probe(client, ws, td, h, dc, q, insider_activity=None, institutional_ownership=None, filing_excerpts=None, **_kwargs):
         captured["institutional_ownership"] = institutional_ownership
         return {
             "ticker": "NVDA", "answer": "ans",
