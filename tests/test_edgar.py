@@ -16,6 +16,8 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 from typing import Any, Callable, Optional
 
 import httpx
@@ -42,7 +44,13 @@ from research_assistant.edgar import (
 # Underscore-prefixed internals are imported from impl modules directly
 # rather than re-exported from the package — keeps the public surface
 # honest about what's public.
-from research_assistant.edgar.client import _extract_paragraphs, _RateLimiter
+from research_assistant.edgar.client import (
+    CIK_DISK_CACHE_TTL_SEC,
+    TICKER_INDEX_URL,
+    _default_cik_cache_path,
+    _extract_paragraphs,
+    _RateLimiter,
+)
 from research_assistant.edgar.form4 import _form4_primary_xml_url
 from research_assistant.edgar.form4 import _fmt_dollars, _relationship_label
 
@@ -346,6 +354,152 @@ async def test_rate_limiter_throttles_over_capacity() -> None:
         await rl.acquire()
     elapsed = asyncio.get_event_loop().time() - start
     assert elapsed >= 0.95
+
+
+# ---------------------------------------------------------------------------
+# CIK cache: concurrency (no stampede) + disk persistence
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cik_cache_no_stampede_under_concurrency() -> None:
+    """Concurrent first-callers (the brief gathers Form 4 for ~30 tickers
+    on one shared client) must trigger exactly ONE index download, not one
+    per coroutine — the bug the cache lock fixes."""
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200, json=_TICKER_INDEX_BODY, request=request)
+
+    async with EdgarClient(transport=httpx.MockTransport(handler)) as client:
+        results = await asyncio.gather(
+            *[client.resolve_cik("NVDA") for _ in range(30)]
+        )
+    assert calls == [TICKER_INDEX_URL]
+    assert all(r == "0001045810" for r in results)
+
+
+@pytest.mark.asyncio
+async def test_disk_cache_round_trip_avoids_refetch(tmp_path) -> None:
+    """A second client with a warm, in-TTL disk cache resolves with zero
+    network fetches."""
+    cache_file = tmp_path / "cik.json"
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200, json=_TICKER_INDEX_BODY, request=request)
+
+    transport = httpx.MockTransport(handler)
+    async with EdgarClient(
+        transport=transport, use_disk_cache=True, cik_cache_path=cache_file
+    ) as c1:
+        assert await c1.resolve_cik("NVDA") == "0001045810"
+    assert len(calls) == 1
+    assert cache_file.exists()
+
+    async with EdgarClient(
+        transport=transport, use_disk_cache=True, cik_cache_path=cache_file
+    ) as c2:
+        assert await c2.resolve_cik("AAPL") == "0000320193"
+    assert len(calls) == 1  # served from disk, no second download
+
+
+@pytest.mark.asyncio
+async def test_disk_cache_expired_refetches(tmp_path) -> None:
+    cache_file = tmp_path / "cik.json"
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200, json=_TICKER_INDEX_BODY, request=request)
+
+    transport = httpx.MockTransport(handler)
+    async with EdgarClient(
+        transport=transport, use_disk_cache=True, cik_cache_path=cache_file
+    ) as c1:
+        await c1.resolve_cik("NVDA")
+    assert len(calls) == 1
+
+    old = time.time() - (CIK_DISK_CACHE_TTL_SEC + 10)
+    os.utime(cache_file, (old, old))
+
+    async with EdgarClient(
+        transport=transport, use_disk_cache=True, cik_cache_path=cache_file
+    ) as c2:
+        await c2.resolve_cik("NVDA")
+    assert len(calls) == 2  # stale cache → refetched
+
+
+@pytest.mark.asyncio
+async def test_disk_cache_disabled_by_default_with_transport() -> None:
+    """Injected transport (tests) auto-disables the disk cache so suites
+    stay hermetic and don't leak state through the shared temp file."""
+    async with EdgarClient(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json=_TICKER_INDEX_BODY, request=r)
+        )
+    ) as client:
+        assert client._use_disk_cache is False
+        assert client._cik_cache_path == _default_cik_cache_path()
+
+
+# ---------------------------------------------------------------------------
+# get(): retry on transient throttling (429/503)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_retries_on_429_then_succeeds() -> None:
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        if len(attempts) < 3:
+            return httpx.Response(429, text="slow down", request=request)
+        return httpx.Response(200, json=_TICKER_INDEX_BODY, request=request)
+
+    async with EdgarClient(
+        transport=httpx.MockTransport(handler), retry_backoff_base=0.0
+    ) as client:
+        resp = await client.get(TICKER_INDEX_URL)
+    assert resp.status_code == 200
+    assert len(attempts) == 3  # two 429s retried, third succeeded
+
+
+@pytest.mark.asyncio
+async def test_get_exhausts_retries_and_raises() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, text="slow down", request=request)
+
+    async with EdgarClient(
+        transport=httpx.MockTransport(handler), max_retries=2, retry_backoff_base=0.0
+    ) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.get(TICKER_INDEX_URL)
+
+
+@pytest.mark.asyncio
+async def test_get_honors_numeric_retry_after_header() -> None:
+    """A numeric Retry-After is used in preference to the backoff schedule."""
+    attempts: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        if len(attempts) == 1:
+            return httpx.Response(
+                429, headers={"Retry-After": "0.01"}, text="x", request=request
+            )
+        return httpx.Response(200, json={}, request=request)
+
+    # Huge backoff base: if Retry-After were ignored, this would hang ~100s.
+    async with EdgarClient(
+        transport=httpx.MockTransport(handler), retry_backoff_base=100.0
+    ) as client:
+        start = asyncio.get_event_loop().time()
+        await client.get(TICKER_INDEX_URL)
+        elapsed = asyncio.get_event_loop().time() - start
+    assert len(attempts) == 2
+    assert elapsed < 1.0
 
 
 # ---------------------------------------------------------------------------

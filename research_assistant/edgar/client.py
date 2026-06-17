@@ -20,12 +20,15 @@ EDGAR_USER_AGENT.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
+import tempfile
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -37,11 +40,30 @@ log = logging.getLogger(__name__)
 DEFAULT_USER_AGENT = "research-assistant william.a.sit@gmail.com"
 DEFAULT_RATE_LIMIT_PER_SEC = 5.0
 
+# SEC throttling is transient; retry 429/503 a few times with exponential
+# backoff (honoring Retry-After when present) instead of dropping the data.
+DEFAULT_MAX_RETRIES = 3
+RETRYABLE_STATUS = frozenset({429, 503})
+
+# The ticker→CIK index changes rarely; persist it to disk so the ~1MB file
+# is fetched at most once per TTL window across all CLI invocations, not
+# once per process. Override the directory via EDGAR_CACHE_DIR.
+CIK_DISK_CACHE_FILENAME = "research_assistant_cik_index.json"
+CIK_DISK_CACHE_TTL_SEC = 24 * 60 * 60
+
 TICKER_INDEX_URL = "https://www.sec.gov/files/company_tickers.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 FILING_ARCHIVE_URL = (
     "https://www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dashes}/{primary_doc}"
 )
+
+
+def _default_cik_cache_path() -> Path:
+    """Disk-cache location for the ticker→CIK index. Honors EDGAR_CACHE_DIR,
+    else falls back to a stable file in the system temp dir."""
+    base = os.environ.get("EDGAR_CACHE_DIR")
+    root = Path(base) if base else Path(tempfile.gettempdir())
+    return root / CIK_DISK_CACHE_FILENAME
 
 
 # ---------------------------------------------------------------------------
@@ -161,10 +183,16 @@ class EdgarClient:
         rate_limit_per_sec: float = DEFAULT_RATE_LIMIT_PER_SEC,
         timeout: float = 30.0,
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        retry_backoff_base: float = 0.5,
+        use_disk_cache: Optional[bool] = None,
+        cik_cache_path: Optional[Path] = None,
     ):
         ua = user_agent or os.environ.get("EDGAR_USER_AGENT") or DEFAULT_USER_AGENT
         self._user_agent = ua
         self._rate_limiter = _RateLimiter(rate_limit_per_sec)
+        self._max_retries = max_retries
+        self._retry_backoff_base = retry_backoff_base
         self._http = httpx.AsyncClient(
             headers={
                 "User-Agent": ua,
@@ -174,6 +202,15 @@ class EdgarClient:
             transport=transport,
         )
         self._cik_cache: Optional[dict[str, str]] = None
+        # Guards the check-and-set in _ensure_cik_cache: without it, N
+        # coroutines launched concurrently (e.g. the brief's 30-ticker
+        # gather) each see an empty cache and stampede the index download.
+        self._cik_lock = asyncio.Lock()
+        # Disk cache defaults on in production, off when a transport is
+        # injected (tests) so suites stay hermetic and don't share state
+        # through a temp file. Explicit use_disk_cache overrides.
+        self._use_disk_cache = (transport is None) if use_disk_cache is None else use_disk_cache
+        self._cik_cache_path = cik_cache_path or _default_cik_cache_path()
 
     async def __aenter__(self) -> "EdgarClient":
         return self
@@ -185,21 +222,65 @@ class EdgarClient:
         await self._http.aclose()
 
     async def get(self, url: str) -> httpx.Response:
-        """Rate-limited GET. Public primitive — form-specific loaders
-        (form4, form13f, excerpts) call this directly rather than going
-        through form-aware client methods, which keeps `EdgarClient`
-        free of form-type knowledge."""
-        await self._rate_limiter.acquire()
-        response = await self._http.get(url)
-        response.raise_for_status()
-        return response
+        """Rate-limited GET with retry on transient SEC throttling. Public
+        primitive — form-specific loaders (form4, form13f, excerpts) call
+        this directly rather than going through form-aware client methods,
+        which keeps `EdgarClient` free of form-type knowledge.
+
+        On 429/503, retries up to `max_retries` times with exponential
+        backoff (honoring a numeric Retry-After header when present). This
+        prevents a transient throttle from silently dropping 13F/Form-4
+        data — the caller's degrade path then only triggers on genuine,
+        persistent failures."""
+        for attempt in range(self._max_retries + 1):
+            await self._rate_limiter.acquire()
+            response = await self._http.get(url)
+            if response.status_code in RETRYABLE_STATUS and attempt < self._max_retries:
+                delay = self._retry_delay(response, attempt)
+                log.warning(
+                    "EDGAR %s on %s — retry %d/%d after %.2fs",
+                    response.status_code, url, attempt + 1, self._max_retries, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            response.raise_for_status()
+            return response
+        # Unreachable: the loop either returns or raises on the final attempt.
+        raise RuntimeError("get() retry loop exited without returning")
+
+    def _retry_delay(self, response: httpx.Response, attempt: int) -> float:
+        """Seconds to wait before the next retry. Prefer a numeric
+        Retry-After header; otherwise exponential backoff."""
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return max(0.0, float(retry_after))
+            except ValueError:
+                pass  # HTTP-date form not supported; fall back to backoff
+        return self._retry_backoff_base * (2 ** attempt)
 
     async def _ensure_cik_cache(self) -> dict[str, str]:
         if self._cik_cache is not None:
             return self._cik_cache
-        log.info("Loading SEC ticker → CIK index from %s", TICKER_INDEX_URL)
-        response = await self.get(TICKER_INDEX_URL)
-        raw = response.json()
+        async with self._cik_lock:
+            # Re-check: a coroutine that was waiting on the lock while
+            # another populated the cache must not refetch.
+            if self._cik_cache is not None:
+                return self._cik_cache
+            disk = self._read_cik_disk_cache()
+            if disk is not None:
+                self._cik_cache = disk
+                return disk
+            log.info("Loading SEC ticker → CIK index from %s", TICKER_INDEX_URL)
+            response = await self.get(TICKER_INDEX_URL)
+            raw = response.json()
+            cache = self._parse_cik_index(raw)
+            self._cik_cache = cache
+            self._write_cik_disk_cache(cache)
+            return cache
+
+    @staticmethod
+    def _parse_cik_index(raw: dict) -> dict[str, str]:
         # company_tickers.json is keyed by integer-string indices; each value
         # is {"cik_str": int, "ticker": "AAPL", "title": "Apple Inc."}.
         cache: dict[str, str] = {}
@@ -209,8 +290,41 @@ class EdgarClient:
             if not ticker or cik_int is None:
                 continue
             cache[ticker.upper()] = str(cik_int).zfill(10)
-        self._cik_cache = cache
         return cache
+
+    def _read_cik_disk_cache(self) -> Optional[dict[str, str]]:
+        """Return the cached index if present and within TTL, else None.
+        Fail-open: any read/parse error returns None so we refetch."""
+        if not self._use_disk_cache:
+            return None
+        try:
+            age = time.time() - self._cik_cache_path.stat().st_mtime
+            if age >= CIK_DISK_CACHE_TTL_SEC:
+                return None
+            data = json.loads(self._cik_cache_path.read_text())
+            index = data.get("index")
+            if isinstance(index, dict) and index:
+                log.info("Loaded ticker → CIK index from disk cache %s", self._cik_cache_path)
+                return {str(k): str(v) for k, v in index.items()}
+        except (OSError, ValueError):
+            return None
+        return None
+
+    def _write_cik_disk_cache(self, cache: dict[str, str]) -> None:
+        """Persist the index atomically. Fail-open: cache-write errors are
+        logged and swallowed — a missing disk cache only costs a refetch."""
+        if not self._use_disk_cache:
+            return
+        try:
+            self._cik_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.dumps({"fetched_at": time.time(), "index": cache})
+            tmp = self._cik_cache_path.with_suffix(
+                self._cik_cache_path.suffix + f".{os.getpid()}.tmp"
+            )
+            tmp.write_text(payload)
+            os.replace(tmp, self._cik_cache_path)
+        except OSError as exc:
+            log.warning("Could not write CIK disk cache %s: %s", self._cik_cache_path, exc)
 
     async def resolve_cik(self, ticker: str) -> Optional[str]:
         """Return 10-digit zero-padded CIK for `ticker`, or None when the
