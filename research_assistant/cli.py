@@ -150,6 +150,17 @@ async def _cmd_research(args: argparse.Namespace) -> int:
     deterministic_substrate_on = (
         os.environ.get("STAGE_2_DETERMINISTIC_SUBSTRATE", "off").lower() == "on"
     )
+    # Phase B (FOLLOWUPS #28): Stage 1.7 synthesizer feature flag. When on,
+    # a Sonnet synthesizer call fires between data loading and Stage 2
+    # thesis to surface cross-source divergences as verified flags, then
+    # a Haiku-class role-bound verifier (extract + judge per anchor)
+    # filters them. Default off; requires deterministic_substrate_on for
+    # full panopticon (the synthesizer can operate without Phase A
+    # substrate but its findings degrade — Phase A blocks ARE the
+    # synthesizer's primary input).
+    synthesizer_on = (
+        os.environ.get("STAGE_1_7_SYNTHESIZER", "off").lower() == "on"
+    )
 
     # Load market data + insider activity + institutional ownership in
     # parallel. One shared EdgarClient per command keeps the 5 req/sec
@@ -160,6 +171,8 @@ async def _cmd_research(args: argparse.Namespace) -> int:
         sources = "yfinance + EDGAR Form 4 + 13F"
         if deterministic_substrate_on:
             sources += " + KPIs/calendar/options/revisions [Phase A]"
+        if synthesizer_on:
+            sources += " + Stage 1.7 synthesizer [Phase B]"
         print(f"Loading {symbol} data ({sources})…", file=sys.stderr)
     async with EdgarClient() as edgar:
         if deterministic_substrate_on:
@@ -244,6 +257,7 @@ async def _cmd_research(args: argparse.Namespace) -> int:
             earnings_calendar=earnings_calendar,
             options_positioning=options_positioning,
             analyst_revisions=analyst_revisions,
+            enable_synthesizer=synthesizer_on,
         )
     except RuntimeError as exc:
         # research_ticker embeds the chain_id in stage-parse failure messages

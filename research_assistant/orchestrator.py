@@ -44,6 +44,7 @@ from research_assistant.edgar import (
 )
 from research_assistant.fundamentals import EarningsCalendar, KPISummary
 from research_assistant.positioning import AnalystRevisions, OptionsPositioning
+from research_assistant.synthesizer import SynthesisOutput, synthesize_research
 from research_assistant.observations import Observation, append_observation
 from research_assistant.prompts import chain_id as _chain_id
 from research_assistant.prompts import load_prompt as _load_prompt
@@ -371,6 +372,7 @@ async def _stage_2_thesis(
     earnings_calendar: Optional[EarningsCalendar] = None,
     options_positioning: Optional[OptionsPositioning] = None,
     analyst_revisions: Optional[AnalystRevisions] = None,
+    synthesis_output: Optional[SynthesisOutput] = None,
 ) -> tuple[Optional[dict], Optional[CallResult]]:
     """
     Invoke Stage 2 (Sonnet thesis). Returns (parsed_json, call_metadata).
@@ -397,6 +399,7 @@ async def _stage_2_thesis(
         earnings_calendar_block=EarningsCalendar.render_for_prompt(earnings_calendar),
         options_positioning_block=OptionsPositioning.render_for_prompt(options_positioning),
         analyst_revisions_block=AnalystRevisions.render_for_prompt(analyst_revisions),
+        synthesis_flags_block=SynthesisOutput.render_for_prompt(synthesis_output),
     )
     system = f"WORLD_STATE for this session:\n{json.dumps(world_state, indent=2)}"
     result = await client.call(prompt, model="claude-sonnet-4-6", system=system)
@@ -580,6 +583,7 @@ async def research_ticker(
     earnings_calendar: Optional[EarningsCalendar] = None,
     options_positioning: Optional[OptionsPositioning] = None,
     analyst_revisions: Optional[AnalystRevisions] = None,
+    enable_synthesizer: bool = False,
 ) -> ResearchResult:
     """
     Run the mini-cascade for one ticker. Stage 2 thesis + Stage 3 Skeptic,
@@ -608,6 +612,60 @@ async def research_ticker(
     if client is None:
         client = ClaudeClient()
     chain = _chain_id()
+    traces_base = base / "traces"
+
+    # Stage 1.7 (panopticon synthesizer) — fires BETWEEN data loading
+    # and Stage 2 thesis when `enable_synthesizer=True`. Reads all the
+    # loaded substrate (existing + Phase A), surfaces cross-source
+    # divergences as verified flags, and feeds them to Stage 2 via the
+    # {synthesis_flags_block} slot. When disabled, synthesis_output stays
+    # None and the slot renders the unavailable sentinel.
+    synthesis_output: Optional[SynthesisOutput] = None
+    if enable_synthesizer:
+        try:
+            synthesis_output = await synthesize_research(
+                client,
+                ticker=symbol,
+                world_state=world_state,
+                ticker_data=ticker_data,
+                headlines=headlines,
+                insider_activity=insider_activity,
+                insider_detail=insider_detail,
+                institutional_ownership=institutional_ownership,
+                kpi_summary=kpi_summary,
+                earnings_calendar=earnings_calendar,
+                options_positioning=options_positioning,
+                analyst_revisions=analyst_revisions,
+            )
+        except Exception as exc:
+            log.warning("synthesizer call failed for %s: %s", symbol, exc)
+            synthesis_output = None
+        append_stage_event(
+            chain_id=chain,
+            stage_id="stage_1_7_synthesizer",
+            model="claude-sonnet-4-6+haiku-4-5",
+            tokens_in=0, tokens_out=0,
+            cost_usd=(
+                synthesis_output.total_cost_usd if synthesis_output else 0.0
+            ),
+            latency_ms=0,
+            parsed=(
+                {
+                    "axes_agreed": synthesis_output.axes_agreed,
+                    "flags_kept": len(synthesis_output.flags),
+                    "flags_pre_verification": synthesis_output.flags_pre_verification,
+                    "flags_dropped_verification": synthesis_output.flags_dropped_verification,
+                    "synthesizer_cost_usd": synthesis_output.synthesizer_cost_usd,
+                    "verifier_cost_usd": synthesis_output.verifier_cost_usd,
+                }
+                if synthesis_output is not None
+                else None
+            ),
+            raw_response=None,
+            traces_base=traces_base,
+            error=None if synthesis_output is not None else "synthesizer call failed",
+            symbol=symbol,
+        )
 
     # Stage 2
     stage_1_placeholder = {
@@ -624,8 +682,8 @@ async def research_ticker(
         earnings_calendar=earnings_calendar,
         options_positioning=options_positioning,
         analyst_revisions=analyst_revisions,
+        synthesis_output=synthesis_output,
     )
-    traces_base = base / "traces"
     append_stage_event(
         chain_id=chain,
         stage_id="stage_2_thesis",

@@ -31,7 +31,26 @@ _DERIVED_FROM_RE = re.compile(
     re.MULTILINE,
 )
 
+# Clean-room prompts that don't fork from Ozy declare themselves via this
+# sentinel. Format: `DERIVED_FROM: clean_room (<in-repo spec or rationale>)`.
+# The hygiene tests skip SHA reachability + source-path checks for these
+# entries — they ARE the new code path, no upstream to track. The header
+# presence + DELTAS-equivalent still apply (we keep a record of why the
+# prompt exists).
+_CLEAN_ROOM_PREFIX = "DERIVED_FROM: clean_room"
+
 REQUIRED_HEADER_FIELDS = ("PROMPT_VERSION", "STAGE", "MODEL_TIER", "DERIVED_FROM", "DELTAS")
+CLEAN_ROOM_REQUIRED_HEADER_FIELDS = (
+    "PROMPT_VERSION", "STAGE", "MODEL_TIER", "DERIVED_FROM",
+)
+
+
+def _is_clean_room(content: str) -> bool:
+    """True when the prompt declares itself as clean-room (no Ozy fork)."""
+    for line in content.splitlines():
+        if line.strip().startswith(_CLEAN_ROOM_PREFIX):
+            return True
+    return False
 
 
 def _prompt_files() -> list[Path]:
@@ -42,14 +61,24 @@ def _prompt_files() -> list[Path]:
 @pytest.mark.parametrize("prompt_path", _prompt_files(), ids=lambda p: p.name)
 def test_required_headers_present(prompt_path: Path) -> None:
     content = prompt_path.read_text()
-    missing = [field for field in REQUIRED_HEADER_FIELDS if f"{field}:" not in content]
+    required = (
+        CLEAN_ROOM_REQUIRED_HEADER_FIELDS
+        if _is_clean_room(content)
+        else REQUIRED_HEADER_FIELDS
+    )
+    missing = [field for field in required if f"{field}:" not in content]
     assert not missing, f"{prompt_path.name} missing headers: {missing}"
 
 
 @pytest.mark.parametrize("prompt_path", _prompt_files(), ids=lambda p: p.name)
 def test_derivation_sha_reachable(prompt_path: Path) -> None:
-    """Critic iter1 #11: cited SHA must exist in Ozy git history."""
+    """Critic iter1 #11: cited SHA must exist in Ozy git history.
+
+    Clean-room prompts (DERIVED_FROM: clean_room ...) are exempt — there
+    is no upstream SHA to verify."""
     content = prompt_path.read_text()
+    if _is_clean_room(content):
+        pytest.skip("clean-room prompt — no upstream SHA")
     m = _DERIVED_FROM_RE.search(content)
     assert m is not None, f"{prompt_path.name}: DERIVED_FROM line not parseable"
 
@@ -66,8 +95,13 @@ def test_derivation_sha_reachable(prompt_path: Path) -> None:
 
 @pytest.mark.parametrize("prompt_path", _prompt_files(), ids=lambda p: p.name)
 def test_derivation_source_existed_at_sha(prompt_path: Path) -> None:
-    """The cited source path must have existed in Ozy at the cited SHA."""
+    """The cited source path must have existed in Ozy at the cited SHA.
+
+    Clean-room prompts (DERIVED_FROM: clean_room ...) are exempt — there
+    is no upstream path to verify."""
     content = prompt_path.read_text()
+    if _is_clean_room(content):
+        pytest.skip("clean-room prompt — no upstream source path")
     m = _DERIVED_FROM_RE.search(content)
     assert m is not None
 

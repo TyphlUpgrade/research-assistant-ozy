@@ -87,6 +87,27 @@ OPTIONS_POSITIONING (IV term structure + skew + P/C ratios; per FOLLOWUPS #28 Ph
 ANALYST_REVISIONS (rating mix + revision velocity + PT distribution; per FOLLOWUPS #28 Phase A):
 {analyst_revisions_block}
 
+SYNTHESIS_FLAGS (cross-source observations from the Stage 1.7 synthesizer;
+per FOLLOWUPS #28 Phase B):
+{synthesis_flags_block}
+
+The synthesis flags above are EVIDENCE, not directives. The synthesizer
+surfaced specific cross-source divergences for you to consider; it did NOT
+recommend a verdict direction. Integrate each flag alongside the macro
+context, fundamentals, technical indicators, insider activity, options
+positioning, analyst revisions, and news headlines already in your
+substrate. Do NOT let any single flag drive your conviction direction.
+
+When a HIGH-severity flag contradicts the news-flow framing, evaluate
+whether the deeper evidence is decisive or merely complicating. Sometimes
+a contradiction is real and load-bearing; sometimes it's a known nuance the
+market has already priced in. Severity in the synthesis block = evidence
+strength, NOT verdict-shift weight — the thesis writer (you) integrates.
+
+Every flag has been independently verified by a role-bound re-extractor;
+the cited anchor text supports the observation. You may treat each flag's
+cited anchor as the actual source for your evidence_anchors.
+
 NEWS REACTIVITY DISCIPLINE:
 - "fresh_likely_priced_in" headlines (<2h old) indicate the market HAS ALREADY MOVED on this news.
   Treat them as RISK signals (chase risk), NOT entry signals. Discount conviction_score by >= 0.10
