@@ -17,6 +17,7 @@ from research_assistant.data_loader import (
     _classify_absorption,
     _pct_return,
     _volume_5d_trend,
+    _volume_ratio_intraday,
     _volume_ratio_vs_20d,
     _weekly_rsi_14,
     load_headlines,
@@ -104,6 +105,78 @@ def test_volume_ratio_keeps_complete_bar_when_last_not_today() -> None:
     assert _volume_ratio_vs_20d(v, asof_date=date(2026, 6, 1)) == 1.5
 
 
+# ---------------------------------------------------------------------------
+# _volume_ratio_intraday — time-of-day-aware participation
+# ---------------------------------------------------------------------------
+
+def _intraday_bars(
+    *,
+    prior_days: list[date],
+    prior_bar_vol: float,
+    today: date,
+    today_bar_vol: float,
+    today_n_bars: int,
+) -> pd.Series:
+    """Build a 15m-ish intraday volume Series (UTC tz-aware index).
+
+    Prior sessions each get 4 ET bars (09:30/10:30/11:30/12:30); today gets
+    `today_n_bars` bars starting at 09:30 ET. June 2026 is EDT (UTC-4), so
+    09:30 ET == 13:30 UTC. Volume is constant per bar so cumulative-to-T is
+    exactly bar_count * bar_vol — keeps the asserted ratio arithmetic clean.
+    """
+    et_hours_utc = [13, 14, 15, 16]  # 09:30/10:30/11:30/12:30 ET → +4 = UTC
+    stamps: list[pd.Timestamp] = []
+    vols: list[float] = []
+    for d in prior_days:
+        for h in et_hours_utc:
+            stamps.append(pd.Timestamp(f"{d.isoformat()}T{h:02d}:30:00", tz="UTC"))
+            vols.append(prior_bar_vol)
+    for h in et_hours_utc[:today_n_bars]:
+        stamps.append(pd.Timestamp(f"{today.isoformat()}T{h:02d}:30:00", tz="UTC"))
+        vols.append(today_bar_vol)
+    return pd.Series(vols, index=pd.DatetimeIndex(stamps))
+
+
+def test_volume_ratio_intraday_observes_today() -> None:
+    """Today's participation through 11:30 ET (3 bars × 200 = 600) vs the
+    prior-session median through the same clock time (3 bars × 100 = 300) →
+    2.0. The partial day is COMPARED, not dropped — the whole point."""
+    prior = [date(2026, 6, 1), date(2026, 6, 2), date(2026, 6, 3),
+             date(2026, 6, 4), date(2026, 6, 5)]
+    v = _intraday_bars(
+        prior_days=prior, prior_bar_vol=100.0,
+        today=date(2026, 6, 8), today_bar_vol=200.0, today_n_bars=3,
+    )
+    assert _volume_ratio_intraday(v, asof_date=date(2026, 6, 8)) == 2.0
+
+
+def test_volume_ratio_intraday_none_when_no_today_bars() -> None:
+    """No bars dated as-of today (weekend / pre-open / stale fetch) → None,
+    so the caller falls back to the prior-close ratio."""
+    prior = [date(2026, 6, 1), date(2026, 6, 2), date(2026, 6, 3),
+             date(2026, 6, 4), date(2026, 6, 5)]
+    v = _intraday_bars(
+        prior_days=prior, prior_bar_vol=100.0,
+        today=date(2026, 6, 8), today_bar_vol=200.0, today_n_bars=3,
+    )
+    # As-of a date with no bars in the series.
+    assert _volume_ratio_intraday(v, asof_date=date(2026, 6, 9)) is None
+
+
+def test_volume_ratio_intraday_none_when_too_few_prior_sessions() -> None:
+    """Fewer than min_prior_days (5) prior sessions → None (unstable baseline)."""
+    prior = [date(2026, 6, 1), date(2026, 6, 2), date(2026, 6, 3)]
+    v = _intraday_bars(
+        prior_days=prior, prior_bar_vol=100.0,
+        today=date(2026, 6, 8), today_bar_vol=200.0, today_n_bars=3,
+    )
+    assert _volume_ratio_intraday(v, asof_date=date(2026, 6, 8)) is None
+
+
+def test_volume_ratio_intraday_empty_returns_none() -> None:
+    assert _volume_ratio_intraday(pd.Series([], dtype=float)) is None
+
+
 def test_weekly_rsi_14_needs_min_history() -> None:
     """< 75 daily bars → returns None."""
     s = pd.Series([100.0] * 30, index=pd.date_range("2026-01-01", periods=30))
@@ -139,8 +212,9 @@ async def test_load_ticker_data_shape_matches_prompt_contract() -> None:
     # Schema contract per research-v1.0.0/stage_2_thesis.txt + stage_3_skeptic.txt
     required_fields = {
         "symbol", "price", "recent_return_5d", "return_30d", "return_90d",
-        "volume_ratio", "weekly_rsi_14", "volume_5d_trend",
-        "sector", "earnings_within_days", "daily_signals", "_data_quality",
+        "volume_ratio", "volume_ratio_intraday", "weekly_rsi_14",
+        "volume_5d_trend", "sector", "earnings_within_days",
+        "daily_signals", "_data_quality",
     }
     assert required_fields.issubset(td.keys()), (
         f"Missing fields: {required_fields - td.keys()}"

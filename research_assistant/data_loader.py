@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -155,11 +155,99 @@ def _volume_ratio_vs_20d(
         return None
 
 
+# US regular session boundaries (ET). yfinance intraday defaults exclude
+# pre/post, but we filter defensively so a stray extended-hours bar can't
+# contaminate the time-of-day profile.
+_ET = ZoneInfo("America/New_York")
+_SESSION_OPEN = time(9, 30)
+_SESSION_CLOSE = time(16, 0)
+
+
+def _volume_ratio_intraday(
+    volume: pd.Series,
+    *,
+    asof_date: Optional[date] = None,
+    min_prior_days: int = 5,
+) -> Optional[float]:
+    """Time-of-day-aware intraday participation ratio.
+
+    Compares today's cumulative volume *through the latest bar's clock time*
+    against the typical (median) cumulative volume through that same clock
+    time across the prior sessions in the window:
+
+        ratio = sum(today vol through T)  /  median_d( sum(day d vol through T) )
+
+    Unlike `_volume_ratio_vs_20d` — which drops today's partial bar and
+    compares the prior completed session to the prior-20d average, leaving it
+    structurally BLIND to today — this is an apples-to-apples partial-day-vs-
+    partial-day measure that actually observes today's session. It's the
+    number that matters on a catalyst day, when volume front-loads into the
+    open and a same-clock-time comparison (rather than a forward projection)
+    avoids the U-curve extrapolation error.
+
+    Expects an intraday `volume` Series with a tz-aware (UTC) DatetimeIndex
+    (e.g. 15m bars over ~1mo). Uses the MEDIAN of prior sessions so a single
+    prior catalyst day doesn't inflate the baseline. Comparing by clock time
+    (not bar count) makes it robust to half-days and DST.
+
+    Returns None when: no intraday bars, today has no bars (weekend / pre-open
+    / stale fetch), or fewer than `min_prior_days` prior sessions exist for a
+    stable baseline — callers degrade gracefully to `volume_ratio`.
+    """
+    if volume is None or len(volume) == 0:
+        return None
+    try:
+        idx = volume.index
+        if getattr(idx, "tz", None) is None:
+            idx = idx.tz_localize("UTC")
+        et_idx = idx.tz_convert(_ET)
+        ser = pd.Series(
+            pd.to_numeric(volume.values, errors="coerce"), index=et_idx
+        ).dropna()
+        if ser.empty:
+            return None
+        # Regular hours only.
+        times = [ts.time() for ts in ser.index]
+        ser = ser[[_SESSION_OPEN <= t <= _SESSION_CLOSE for t in times]]
+        if ser.empty:
+            return None
+        et_dates = pd.Index([ts.date() for ts in ser.index])
+        today = asof_date or datetime.now(_ET).date()
+        # Object-Index equality yields a numpy bool array directly.
+        today_mask = et_dates == today
+        if not today_mask.any():
+            return None
+        # Cutoff = the latest clock time observed today; today's cumulative is
+        # simply the sum of all of today's in-session bars.
+        cutoff = max(ts.time() for ts in ser.index[today_mask])
+        today_cum = float(ser[today_mask].sum())
+        if today_cum <= 0:
+            return None
+        prior: list[float] = []
+        for d in sorted({dd for dd in et_dates[~today_mask]}):
+            day_mask = et_dates == d
+            day_ser = ser[day_mask]
+            cum = float(
+                day_ser[[ts.time() <= cutoff for ts in day_ser.index]].sum()
+            )
+            if cum > 0:
+                prior.append(cum)
+        if len(prior) < min_prior_days:
+            return None
+        typical = float(pd.Series(prior).median())
+        if typical <= 0:
+            return None
+        return round(today_cum / typical, 3)
+    except (IndexError, ValueError, TypeError, AttributeError):
+        return None
+
+
 async def load_ticker_data(
     symbol: str,
     adapter: YFinanceAdapter,
     *,
     sector: Optional[str] = None,
+    include_intraday: bool = False,
 ) -> dict[str, Any]:
     """
     Fetch + assemble the per-ticker data dict consumed by Stage 1/2/3 prompts.
@@ -169,12 +257,27 @@ async def load_ticker_data(
       - recent_return_5d      : 5-bar pct change
       - return_30d            : 30-bar pct change
       - return_90d            : 90-bar pct change
-      - volume_ratio          : today's vol / 20d-avg vol
+      - volume_ratio          : prior COMPLETED session's vol / prior-20d avg.
+                                Intraday-stale BY DESIGN — drops today's partial
+                                bar, so it does not observe the current session.
+                                Scoring (composite.py) + scoreboard calibration
+                                key on this; keep its semantics stable.
+      - volume_ratio_intraday : time-of-day-aware participation (today through
+                                now vs typical-through-now). None unless
+                                `include_intraday=True` AND intraday bars +
+                                today's session are available. The catalyst-day-
+                                accurate companion to volume_ratio. Narrative-
+                                only for now (not wired into scoring).
       - weekly_rsi_14         : RSI(14) on weekly resample
       - volume_5d_trend       : "rising" | "flat" | "declining"
       - sector                : optional sector label (caller-supplied or None)
       - earnings_within_days  : None for v1 (yfinance calendar wiring is v1.x)
       - daily_signals         : full generate_daily_signal_summary output
+
+    `include_intraday` triggers one extra `fetch_bars(15m, 1mo)` call to build
+    the time-of-day profile — bounded cost suited to single-ticker /research &
+    /probe. The brief's universe scan leaves it off (default) to avoid an
+    intraday fetch per watchlist name.
     """
     bars = await adapter.fetch_bars(symbol, interval="1d", period="3mo")
     quote = await adapter.fetch_quote(symbol)
@@ -192,6 +295,22 @@ async def load_ticker_data(
     volume = bars["volume"]
     daily_signals = generate_daily_signal_summary(symbol, bars)
 
+    # Time-of-day-aware intraday participation (single-ticker DD only). One
+    # extra intraday fetch; degrades to None on any failure so the deep read
+    # falls back to the prior-close `volume_ratio` rather than erroring.
+    volume_ratio_intraday: Optional[float] = None
+    if include_intraday:
+        try:
+            intraday_bars = await adapter.fetch_bars(
+                symbol, interval="15m", period="1mo"
+            )
+            if intraday_bars is not None and "volume" in intraday_bars:
+                volume_ratio_intraday = _volume_ratio_intraday(
+                    intraday_bars["volume"]
+                )
+        except Exception as exc:
+            log.warning("intraday volume fetch failed for %s: %s", symbol, exc)
+
     return {
         "symbol": symbol,
         "price": getattr(quote, "last", None) or float(close.iloc[-1]),
@@ -199,6 +318,7 @@ async def load_ticker_data(
         "return_30d": _pct_return(close, 30),
         "return_90d": _pct_return(close, 90),
         "volume_ratio": _volume_ratio_vs_20d(volume),
+        "volume_ratio_intraday": volume_ratio_intraday,
         "weekly_rsi_14": _weekly_rsi_14(close),
         "volume_5d_trend": _volume_5d_trend(volume),
         "sector": sector,

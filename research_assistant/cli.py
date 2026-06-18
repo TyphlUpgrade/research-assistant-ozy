@@ -197,7 +197,7 @@ async def _cmd_research(args: argparse.Namespace) -> int:
                 institutional_ownership, kpi_summary, earnings_calendar,
                 options_positioning, analyst_revisions,
             ) = await asyncio.gather(
-                load_ticker_data(symbol, adapter),
+                load_ticker_data(symbol, adapter, include_intraday=True),
                 load_headlines(symbol, adapter, max_items=5),
                 load_insider_activity_with_detail(symbol, client=edgar),
                 load_institutional_ownership(symbol, client=edgar),
@@ -209,7 +209,7 @@ async def _cmd_research(args: argparse.Namespace) -> int:
             insider_activity, insider_detail = insider_pair
         else:
             ticker_data, headlines, insider_activity, institutional_ownership = await asyncio.gather(
-                load_ticker_data(symbol, adapter),
+                load_ticker_data(symbol, adapter, include_intraday=True),
                 load_headlines(symbol, adapter, max_items=5),
                 load_insider_activity(symbol, client=edgar),
                 load_institutional_ownership(symbol, client=edgar),
@@ -378,7 +378,7 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
             ticker_data, headlines, insider_activity,
             institutional_ownership, filing_excerpts,
         ) = await asyncio.gather(
-            load_ticker_data(symbol, adapter),
+            load_ticker_data(symbol, adapter, include_intraday=True),
             load_headlines(symbol, adapter, max_items=5),
             load_insider_activity(symbol, client=edgar),
             load_institutional_ownership(symbol, client=edgar),
