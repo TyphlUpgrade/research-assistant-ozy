@@ -28,6 +28,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
+from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -38,6 +39,14 @@ from ozymandias.intelligence.technical_analysis import (
     compute_ema,
     compute_rsi,
     generate_daily_signal_summary,
+)
+
+from research_assistant.volume_profile import (
+    PROFILE_REFRESH_CAP,
+    intraday_ratio_from_profile,
+    is_stale,
+    load_profile,
+    refresh_profile,
 )
 
 log = logging.getLogger(__name__)
@@ -248,6 +257,8 @@ async def load_ticker_data(
     *,
     sector: Optional[str] = None,
     include_intraday: bool = False,
+    volume_profile_base: Optional[Path] = None,
+    now_et: Optional[datetime] = None,
 ) -> dict[str, Any]:
     """
     Fetch + assemble the per-ticker data dict consumed by Stage 1/2/3 prompts.
@@ -263,21 +274,28 @@ async def load_ticker_data(
                                 Scoring (composite.py) + scoreboard calibration
                                 key on this; keep its semantics stable.
       - volume_ratio_intraday : time-of-day-aware participation (today through
-                                now vs typical-through-now). None unless
-                                `include_intraday=True` AND intraday bars +
-                                today's session are available. The catalyst-day-
+                                now vs typical-through-now). Two source paths,
+                                None if neither available. The catalyst-day-
                                 accurate companion to volume_ratio. Narrative-
                                 only for now (not wired into scoring).
+      - volume_ratio_intraday_source : "live" | "profile" | None — which path
+                                produced the figure (transparency / dossier
+                                color / debugging).
       - weekly_rsi_14         : RSI(14) on weekly resample
       - volume_5d_trend       : "rising" | "flat" | "declining"
       - sector                : optional sector label (caller-supplied or None)
       - earnings_within_days  : None for v1 (yfinance calendar wiring is v1.x)
       - daily_signals         : full generate_daily_signal_summary output
 
-    `include_intraday` triggers one extra `fetch_bars(15m, 1mo)` call to build
-    the time-of-day profile — bounded cost suited to single-ticker /research &
-    /probe. The brief's universe scan leaves it off (default) to avoid an
-    intraday fetch per watchlist name.
+    Two ways to populate volume_ratio_intraday:
+      - `include_intraday=True` (single-ticker /research & /probe): one extra
+        `fetch_bars(15m, 1mo)` measures today's real intraday shape vs prior
+        sessions (source "live"). Bounded cost.
+      - `volume_profile_base` set (brief universe): today's accumulated volume
+        from the already-fetched quote ÷ cached time-of-day profile (source
+        "profile"). Zero extra fetch — `now_et` overrides the wall clock for
+        deterministic testing.
+    `include_intraday` takes precedence when both are set.
     """
     bars = await adapter.fetch_bars(symbol, interval="1d", period="3mo")
     quote = await adapter.fetch_quote(symbol)
@@ -295,21 +313,40 @@ async def load_ticker_data(
     volume = bars["volume"]
     daily_signals = generate_daily_signal_summary(symbol, bars)
 
-    # Time-of-day-aware intraday participation (single-ticker DD only). One
-    # extra intraday fetch; degrades to None on any failure so the deep read
-    # falls back to the prior-close `volume_ratio` rather than erroring.
+    # Time-of-day-aware intraday participation. Both paths degrade to None on
+    # any failure so callers fall back to the prior-close `volume_ratio`.
     volume_ratio_intraday: Optional[float] = None
+    volume_ratio_intraday_source: Optional[str] = None
     if include_intraday:
+        # Live path (single-ticker DD): measure today's real intraday shape.
         try:
             intraday_bars = await adapter.fetch_bars(
                 symbol, interval="15m", period="1mo"
             )
             if intraday_bars is not None and "volume" in intraday_bars:
                 volume_ratio_intraday = _volume_ratio_intraday(
-                    intraday_bars["volume"]
+                    intraday_bars["volume"],
+                    asof_date=(now_et or datetime.now(_ET)).date(),
                 )
+                if volume_ratio_intraday is not None:
+                    volume_ratio_intraday_source = "live"
         except Exception as exc:
             log.warning("intraday volume fetch failed for %s: %s", symbol, exc)
+    elif volume_profile_base is not None:
+        # Profile path (brief universe): today's accumulated volume from the
+        # already-fetched quote ÷ cached typical-through-now. No extra fetch.
+        try:
+            today_vol = getattr(quote, "volume", None)
+            ratio = intraday_ratio_from_profile(
+                load_profile(volume_profile_base, symbol),
+                float(today_vol) if today_vol is not None else None,
+                now_et or datetime.now(_ET),
+            )
+            if ratio is not None:
+                volume_ratio_intraday = ratio
+                volume_ratio_intraday_source = "profile"
+        except Exception as exc:
+            log.warning("profile intraday ratio failed for %s: %s", symbol, exc)
 
     return {
         "symbol": symbol,
@@ -319,6 +356,7 @@ async def load_ticker_data(
         "return_90d": _pct_return(close, 90),
         "volume_ratio": _volume_ratio_vs_20d(volume),
         "volume_ratio_intraday": volume_ratio_intraday,
+        "volume_ratio_intraday_source": volume_ratio_intraday_source,
         "weekly_rsi_14": _weekly_rsi_14(close),
         "volume_5d_trend": _volume_5d_trend(volume),
         "sector": sector,
@@ -453,24 +491,74 @@ async def build_world_state_input(
 # Batch watchlist loader (for /brief)
 # ---------------------------------------------------------------------------
 
+async def _refresh_volume_profiles(
+    symbols: list[str],
+    adapter: YFinanceAdapter,
+    *,
+    base: Path,
+    force: bool = False,
+    cap: int = PROFILE_REFRESH_CAP,
+) -> None:
+    """Warm the intraday volume-profile cache for the brief path.
+
+    Lazy: only missing/stale profiles are refreshed, and at most `cap` per run
+    (one intraday fetch each) so a cold universe warms over a few runs instead
+    of one latency cliff. `force=True` (operator `--refresh-profiles`) refreshes
+    the whole universe, ignoring the cap — intended for an after-close cron.
+    Skips are logged (no silent caps)."""
+    refreshed = 0
+    skipped = 0
+    for sym in symbols:
+        prof = load_profile(base, sym)
+        if not (force or prof is None or is_stale(prof)):
+            continue
+        if not force and refreshed >= cap:
+            skipped += 1
+            continue
+        if await refresh_profile(sym, adapter, base=base) is not None:
+            refreshed += 1
+    if refreshed or skipped:
+        log.info(
+            "volume profiles: refreshed %d, skipped %d stale (cap %d, force=%s)",
+            refreshed, skipped, cap, force,
+        )
+
+
 async def load_watchlist_data(
     symbols: list[str],
     adapter: YFinanceAdapter,
     *,
     parallel: int = DEFAULT_PARALLEL_FETCH,
+    volume_profile_base: Optional[Path] = None,
+    refresh_profiles: bool = False,
+    now_et: Optional[datetime] = None,
 ) -> tuple[dict[str, dict], dict[str, list[dict]]]:
     """
     Batch-fetch per-ticker data + headlines for a watchlist.
+
+    When `volume_profile_base` is set, each ticker gets a profile-based
+    `volume_ratio_intraday` (today's accumulated volume ÷ cached profile, zero
+    extra fetch) and the profile cache is warmed first (lazy, capped — see
+    `_refresh_volume_profiles`). `refresh_profiles=True` forces a full refresh.
 
     Returns:
         (tickers_with_data, headlines_per_ticker)
         Both keyed by uppercase symbol; matches the shape build_brief() expects.
     """
+    if volume_profile_base is not None:
+        await _refresh_volume_profiles(
+            symbols, adapter, base=volume_profile_base, force=refresh_profiles,
+        )
+
     sem = asyncio.Semaphore(parallel)
 
     async def _one(sym: str):
         async with sem:
-            td = await load_ticker_data(sym, adapter)
+            td = await load_ticker_data(
+                sym, adapter,
+                volume_profile_base=volume_profile_base,
+                now_et=now_et,
+            )
             hl = await load_headlines(sym, adapter)
             return sym.upper(), td, hl
 

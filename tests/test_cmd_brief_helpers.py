@@ -83,7 +83,7 @@ def _stub_loaders(monkeypatch, *, sector_perf: dict | None = None,
     async def _fake_world(adapter, watchlist_news_for=None):
         return ws_input
 
-    async def _fake_watchlist_data(universe, adapter):
+    async def _fake_watchlist_data(universe, adapter, **kwargs):
         return (td, hl)
 
     async def _fake_insider(*a, **kw):

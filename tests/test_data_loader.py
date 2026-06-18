@@ -212,8 +212,8 @@ async def test_load_ticker_data_shape_matches_prompt_contract() -> None:
     # Schema contract per research-v1.0.0/stage_2_thesis.txt + stage_3_skeptic.txt
     required_fields = {
         "symbol", "price", "recent_return_5d", "return_30d", "return_90d",
-        "volume_ratio", "volume_ratio_intraday", "weekly_rsi_14",
-        "volume_5d_trend", "sector", "earnings_within_days",
+        "volume_ratio", "volume_ratio_intraday", "volume_ratio_intraday_source",
+        "weekly_rsi_14", "volume_5d_trend", "sector", "earnings_within_days",
         "daily_signals", "_data_quality",
     }
     assert required_fields.issubset(td.keys()), (
@@ -224,6 +224,67 @@ async def test_load_ticker_data_shape_matches_prompt_contract() -> None:
     assert td["_data_quality"] == "ok"
     assert td["recent_return_5d"] is not None  # synthetic data has 5+ bars
     assert td["volume_5d_trend"] in ("rising", "flat", "declining")
+
+
+@pytest.mark.asyncio
+async def test_load_ticker_data_profile_path(tmp_path) -> None:
+    """Brief path: volume_ratio_intraday comes from the cached profile +
+    quote.volume with NO extra fetch (only the daily bars call)."""
+    from zoneinfo import ZoneInfo
+
+    from research_assistant.volume_profile import VolumeProfile, write_profile
+
+    adapter = MagicMock()
+    adapter.fetch_bars = AsyncMock(return_value=_synthetic_bars(120))
+    adapter.fetch_quote = AsyncMock(return_value=MagicMock(last=158.5, volume=400.0))
+
+    write_profile(tmp_path, VolumeProfile(
+        ticker="NVDA", fetched_at=1_750_000_000.0, interval="15m",
+        n_sessions=20, bucket_minutes=15,
+        typical_cumulative={"09:45": 100.0, "10:00": 200.0},
+        typical_full_day=2600.0,
+    ))
+
+    td = await load_ticker_data(
+        "NVDA", adapter, volume_profile_base=tmp_path,
+        now_et=datetime(2026, 6, 16, 10, 5, tzinfo=ZoneInfo("America/New_York")),
+    )
+    # 400 today vs typical-through-10:00 (200) → 2.0.
+    assert td["volume_ratio_intraday"] == 2.0
+    assert td["volume_ratio_intraday_source"] == "profile"
+    adapter.fetch_bars.assert_called_once()  # daily only — no intraday fetch
+
+
+@pytest.mark.asyncio
+async def test_load_ticker_data_live_path_sets_source(tmp_path) -> None:
+    """/research path: include_intraday measures live and tags source 'live'."""
+    from zoneinfo import ZoneInfo
+
+    stamps: list[pd.Timestamp] = []
+    vols: list[float] = []
+    for d in ["2026-06-08", "2026-06-09", "2026-06-10", "2026-06-11", "2026-06-12"]:
+        for h in (13, 14, 15):  # 09:30/10:30/11:30 ET (EDT = UTC-4)
+            stamps.append(pd.Timestamp(f"{d}T{h:02d}:30:00", tz="UTC"))
+            vols.append(100.0)
+    for h in (13, 14, 15):
+        stamps.append(pd.Timestamp(f"2026-06-15T{h:02d}:30:00", tz="UTC"))
+        vols.append(200.0)
+    intraday = pd.DataFrame({"volume": vols}, index=pd.DatetimeIndex(stamps))
+
+    def _bars(symbol, interval, period):
+        return intraday if interval == "15m" else _synthetic_bars(120)
+
+    adapter = MagicMock()
+    adapter.fetch_bars = AsyncMock(side_effect=_bars)
+    adapter.fetch_quote = AsyncMock(return_value=MagicMock(last=10.0))
+
+    td = await load_ticker_data(
+        "X", adapter, include_intraday=True,
+        now_et=datetime(2026, 6, 15, 11, 30, tzinfo=ZoneInfo("America/New_York")),
+    )
+    # today 3 bars × 200 = 600 through 11:30 vs prior median 300 → 2.0.
+    assert td["volume_ratio_intraday"] == 2.0
+    assert td["volume_ratio_intraday_source"] == "live"
 
 
 @pytest.mark.asyncio

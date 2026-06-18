@@ -500,6 +500,8 @@ async def _pipeline_inputs_for_universe(
     base_world_state: Optional[dict] = None,
     *,
     fetch_insider: bool = False,
+    research_base: Optional[Path] = None,
+    refresh_profiles: bool = False,
 ) -> _PipelineInputs:
     """Build pipeline inputs (world_state + ticker_data [+ insider]) for the
     given universe. The compute_sector_performance OR-fallback for
@@ -533,14 +535,22 @@ async def _pipeline_inputs_for_universe(
                 insider_activities,
                 world_state_input,
             ) = await asyncio.gather(
-                load_watchlist_data(universe, adapter),
+                load_watchlist_data(
+                    universe, adapter,
+                    volume_profile_base=research_base,
+                    refresh_profiles=refresh_profiles,
+                ),
                 load_insider_activities_batch(universe, client=edgar),
                 build_world_state_input(adapter, watchlist_news_for=news_seed),
             )
     else:
         world_state_input, (ticker_data, headlines_per_ticker) = await asyncio.gather(
             build_world_state_input(adapter, watchlist_news_for=news_seed),
-            load_watchlist_data(universe, adapter),
+            load_watchlist_data(
+                universe, adapter,
+                volume_profile_base=research_base,
+                refresh_profiles=refresh_profiles,
+            ),
         )
 
     world_state = dict(base_world_state) if base_world_state else dict(world_state_input)
@@ -759,6 +769,8 @@ async def _load_or_build_brief(
                 universe,
                 news_seed=universe[:5],
                 base_world_state=brief.world_state,
+                research_base=base,
+                refresh_profiles=args.refresh_profiles,
             )
         # PR 2A.1: run screeners against today's inputs, attach hits onto
         # cached items so the unified opportunity surface shows current
@@ -821,6 +833,8 @@ async def _load_or_build_brief(
         universe,
         news_seed=news_seed,
         fetch_insider=True,
+        research_base=base,
+        refresh_profiles=args.refresh_profiles,
     )
 
     # PR 2A.1: run screeners BEFORE build_brief so the deterministic
@@ -1610,6 +1624,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--skip-screeners",
         action="store_true",
         help="Skip the setup-finder pipeline on this invocation",
+    )
+    pb.add_argument(
+        "--refresh-profiles",
+        action="store_true",
+        help="Force a full refresh of the intraday volume-profile cache "
+             "(.research/volume_profiles/). Intended for an after-close cron; "
+             "otherwise stale profiles refresh lazily (capped per run).",
     )
 
     # alerts review — setup-finder operator surface (PR 1.3)
