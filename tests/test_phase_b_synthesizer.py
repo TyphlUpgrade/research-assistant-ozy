@@ -441,6 +441,39 @@ async def test_synthesize_research_drops_failed_flag_without_retry():
     assert result.flags == []
     assert result.flags_pre_verification == 1
     assert result.flags_dropped_verification == 1
+    # Dropped flag is retained (not surfaced to Stage 2) for trace + Phase C.
+    assert len(result.dropped_flags) == 1
+    assert result.dropped_flags[0] is flag
+
+
+def test_trace_flags_payload_splits_kept_and_dropped_with_verdicts():
+    """The stage_1_7 trace payload carries kept+dropped flags, each with
+    the per-anchor verdicts + reasoning Phase C needs to hand-grade."""
+    kept = SynthesisFlag(
+        severity="HIGH", observation_type="k",
+        shallow_source="TICKER_DATA:daily_signals", shallow_observation="a",
+        deep_source="yfinance:financials:multiples", deep_observation="b",
+        verifier_shallow_verdict="SUPPORTS", verifier_deep_verdict="SUPPORTS",
+        verifier_reasoning="both supported",
+    )
+    drop = SynthesisFlag(
+        severity="LOW", observation_type="d",
+        shallow_source="yfinance:fetch_news:X:item_1", shallow_observation="c",
+        deep_source="edgar:form4:aggregate", deep_observation="e",
+        verifier_shallow_verdict="CONTRADICTS", verifier_deep_verdict="SUPPORTS",
+        verifier_reasoning="news narrative not supported by metadata",
+    )
+    out = SynthesisOutput(
+        ticker="X", schema_version=2, axes_agreed=False,
+        flags=[kept], dropped_flags=[drop],
+    )
+    payload = out.trace_flags_payload()
+    assert [f["observation_type"] for f in payload["kept"]] == ["k"]
+    assert [f["observation_type"] for f in payload["dropped"]] == ["d"]
+    # Verdicts + reasoning survive into the payload.
+    assert payload["dropped"][0]["verifier_shallow_verdict"] == "CONTRADICTS"
+    assert payload["dropped"][0]["verifier_reasoning"].startswith("news narrative")
+    assert payload["kept"][0]["verifier_deep_verdict"] == "SUPPORTS"
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +642,10 @@ async def test_research_ticker_synthesizer_on_invokes_synthesize_and_emits_trace
                 assert parsed.get("axes_agreed") is True
                 assert parsed.get("flags_kept") == 0
                 assert parsed.get("flags_pre_verification") == 0
+                # Per-event degrade flag is always present (Phase C Gate 3).
+                assert parsed.get("panopticon_degraded") is False
+                # Structured flag detail present for Phase C hand-grading.
+                assert "flags" in parsed and "kept" in parsed["flags"]
                 break
     assert found_synth_event, "stage_1_7_synthesizer trace event missing"
 

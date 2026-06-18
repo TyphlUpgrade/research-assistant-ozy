@@ -43,6 +43,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from pathlib import Path
+
+from research_assistant import cost_breaker
 from research_assistant.claude_sdk import CallResult, ClaudeClient
 from research_assistant.deep_reads import InsiderBehaviorDetail
 from research_assistant.edgar import (
@@ -85,6 +88,13 @@ SUGGESTED_OBSERVATION_TYPES: tuple[str, ...] = (
 
 # Verifier verdict enum (from the judge call).
 VERIFIER_VERDICTS: tuple[str, ...] = ("SUPPORTS", "CONTRADICTS", "UNCLEAR")
+
+# Sentinel verdict set ONLY by the cost-cap degrade path — a flag kept via
+# anchor-existence-only fallback (role-bound verification skipped because
+# the daily cap was reached). Deliberately distinct from VERIFIER_VERDICTS
+# so the judge can never emit it and Phase C hand-grading sees a capped
+# flag as visibly unverified rather than silently laundered as SUPPORTS.
+VERDICT_UNVERIFIED_CAPPED: str = "UNVERIFIED_CAPPED"
 
 # Forbidden output keys — these are directive-shape leaks the v2 schema
 # explicitly excludes. If the model emits any of these, parse_flag()
@@ -132,6 +142,19 @@ class SynthesisFlag:
             "deep_observation": self.deep_observation,
         }
 
+    def to_verification_dict(self) -> dict[str, Any]:
+        """Full record for trace persistence + Phase C hand-grading.
+
+        Extends to_dict() with the per-anchor judge verdicts and the
+        verifier's reasoning, so a graded replay can see exactly WHY a
+        flag was kept or dropped without re-running the verifier."""
+        return {
+            **self.to_dict(),
+            "verifier_shallow_verdict": self.verifier_shallow_verdict,
+            "verifier_deep_verdict": self.verifier_deep_verdict,
+            "verifier_reasoning": self.verifier_reasoning,
+        }
+
 
 @dataclass
 class SynthesisOutput:
@@ -146,6 +169,16 @@ class SynthesisOutput:
     schema_version: int
     axes_agreed: bool
     flags: list[SynthesisFlag] = field(default_factory=list)
+    # Flags that failed verification and were dropped. Retained (NOT
+    # surfaced to Stage 2) purely for trace persistence + Phase C
+    # hand-grading — each carries its per-anchor verdicts + reasoning.
+    dropped_flags: list[SynthesisFlag] = field(default_factory=list)
+    # True when the daily cost cap forced a degrade on this event: either
+    # the synthesizer was skipped entirely (then flags == []) or some
+    # flags were kept via anchor-existence-only fallback. Drives the 4th
+    # render state and the per-event `panopticon_degraded` telemetry that
+    # Phase C Gate 3 excludes from forward-return analysis.
+    cap_reached: bool = False
     # Telemetry — populated during synthesize_research()
     synthesizer_cost_usd: float = 0.0
     verifier_cost_usd: float = 0.0
@@ -156,6 +189,16 @@ class SynthesisOutput:
     @property
     def total_cost_usd(self) -> float:
         return self.synthesizer_cost_usd + self.verifier_cost_usd
+
+    def trace_flags_payload(self) -> dict[str, list[dict[str, Any]]]:
+        """Structured kept+dropped flag detail for the stage_1_7 trace
+        event. Phase C replay reads this to hand-grade flags (kept = the
+        verifier passed both anchors; dropped = it didn't, with the
+        verdicts that explain why)."""
+        return {
+            "kept": [f.to_verification_dict() for f in self.flags],
+            "dropped": [f.to_verification_dict() for f in self.dropped_flags],
+        }
 
     def stage_2_block(self) -> str:
         """Render for the {synthesis_flags_block} Stage 2 prompt slot.
@@ -168,6 +211,12 @@ class SynthesisOutput:
         Empty case emits a clear "no divergences" sentinel so the Stage 2
         writer never confuses "we ran the synthesizer and it found
         nothing" with "we didn't run the synthesizer at all"."""
+        # 4th state: the daily cost cap forced the synthesizer to be
+        # skipped (no flags produced). When the cap was hit mid-loop but
+        # real flags survived, those still render below — only the
+        # synthesizer-skipped case shows the cap sentinel.
+        if self.cap_reached and not self.flags:
+            return "(panopticon disabled — daily cost cap reached)"
         if self.axes_agreed and not self.flags:
             return (
                 "(no cross-source divergences surfaced — substrate "
@@ -639,6 +688,27 @@ async def verify_flag(
 # Top-level orchestration
 # ---------------------------------------------------------------------------
 
+def _degrade_flag_anchor_existence_only(
+    flag: SynthesisFlag, corpus: dict[str, str]
+) -> bool:
+    """Cost-cap fallback verification: keep the flag iff BOTH anchors
+    resolve in the corpus (the cheap existence gate), skipping the Haiku
+    extract+judge. Tags both verdicts UNVERIFIED_CAPPED so a capped flag
+    is never mistaken for a role-bound SUPPORTS in the audit trail.
+    Returns True (keep) / False (drop)."""
+    both_resolve = (
+        corpus.get(flag.shallow_source) is not None
+        and corpus.get(flag.deep_source) is not None
+    )
+    flag.verifier_shallow_verdict = VERDICT_UNVERIFIED_CAPPED
+    flag.verifier_deep_verdict = VERDICT_UNVERIFIED_CAPPED
+    flag.verifier_reasoning = (
+        "anchor-existence-only fallback (daily cost cap reached); "
+        "role-bound verification skipped"
+    )
+    return both_resolve
+
+
 async def synthesize_research(
     client: ClaudeClient,
     *,
@@ -653,6 +723,7 @@ async def synthesize_research(
     earnings_calendar: Optional[EarningsCalendar] = None,
     options_positioning: Optional[OptionsPositioning] = None,
     analyst_revisions: Optional[AnalystRevisions] = None,
+    base: Optional[Path] = None,
 ) -> Optional[SynthesisOutput]:
     """End-to-end Stage 1.7: synthesizer → role-bound verify → output.
 
@@ -669,8 +740,18 @@ async def synthesize_research(
 
     Returns None on hard parse/call failure (Stage 2 prompt block then
     renders "synthesis flags unavailable").
+
+    When `base` is provided, the daily cost circuit breaker is enforced:
+    if today's cumulative panopticon spend has reached
+    PANOPTICON_DAILY_CAP_USD, the synthesizer is skipped (cap_reached
+    output) and any per-flag verification that would push over the cap
+    falls back to anchor-existence-only. Pass base=None to disable the
+    breaker (e.g. unit tests that don't exercise cost control).
     """
     refresh_ts = datetime.now(timezone.utc).isoformat()
+    breaker_on = base is not None
+    date_et = cost_breaker.current_et_date() if breaker_on else None
+
     corpus = build_anchor_corpus(
         ticker=ticker,
         world_state=world_state,
@@ -684,6 +765,20 @@ async def synthesize_research(
         options_positioning=options_positioning,
         analyst_revisions=analyst_revisions,
     )
+
+    # Level-1 cap check — skip the synthesizer entirely (its ~$0.045 is
+    # the dominant upfront cost) when the day's cap is already reached.
+    if breaker_on and cost_breaker.is_capped(base, date_et=date_et):
+        capped = SynthesisOutput(
+            ticker=ticker, schema_version=SCHEMA_VERSION,
+            axes_agreed=False, cap_reached=True, refresh_ts=refresh_ts,
+        )
+        cost_breaker.add_spend(
+            base, 0.0, date_et=date_et,
+            was_degraded=True, count_research=True,
+        )
+        log.info("panopticon: synthesizer skipped for %s — daily cost cap reached", ticker)
+        return capped
 
     output, syn_meta = await _stage_1_7_synthesizer(
         client,
@@ -699,28 +794,59 @@ async def synthesize_research(
         options_positioning=options_positioning,
         analyst_revisions=analyst_revisions,
     )
+    # Record the synthesizer spend immediately — BEFORE the None-return —
+    # so the Level-2 cap math (and a concurrent /research) sees this
+    # call's cost. The synthesizer call incurs real cost even when it
+    # returns no usable output (JSON-parse / schema-validate failure both
+    # return a non-None meta with cost_usd > 0); that is the breaker's
+    # single most likely runaway path, so the spend MUST be recorded even
+    # though we then return None.
+    syn_cost = syn_meta.cost_usd if syn_meta else 0.0
+    if breaker_on:
+        cost_breaker.add_spend(base, syn_cost, date_et=date_et)
+
     if output is None:
+        if breaker_on:
+            # Count the research event so the operator surface doesn't
+            # undercount on hard-failure days.
+            cost_breaker.add_spend(base, 0.0, date_et=date_et, count_research=True)
         return None
     output.refresh_ts = refresh_ts
-    output.synthesizer_cost_usd = syn_meta.cost_usd if syn_meta else 0.0
+    output.synthesizer_cost_usd = syn_cost
     output.flags_pre_verification = len(output.flags)
 
     if output.axes_agreed:
         # Synthesizer voluntarily reported no divergences. Nothing to
         # verify. Empty flags array carries through.
+        if breaker_on:
+            cost_breaker.add_spend(base, 0.0, date_et=date_et, count_research=True)
         return output
 
     verified: list[SynthesisFlag] = []
+    dropped: list[SynthesisFlag] = []
     verifier_cost = 0.0
     for flag in output.flags:
+        # Level-2 cap check — once the cap is hit mid-loop, remaining
+        # flags are verified by anchor existence only (no Haiku calls).
+        if breaker_on and cost_breaker.is_capped(base, date_et=date_et):
+            output.cap_reached = True
+            if _degrade_flag_anchor_existence_only(flag, corpus):
+                verified.append(flag)
+            else:
+                dropped.append(flag)
+            continue
         passed, cost = await verify_flag(client, flag, corpus, ticker=ticker)
         verifier_cost += cost
+        if breaker_on:
+            cost_breaker.add_spend(base, cost, date_et=date_et)
         if passed:
             verified.append(flag)
             continue
         # Failed verification → drop. The per-anchor verdicts + reasoning
-        # are already mutated onto `flag` by verify_flag; we log them so
-        # the drop is diagnosable (and Phase C replay can hand-grade it).
+        # are already mutated onto `flag` by verify_flag; we retain it on
+        # output.dropped_flags (for trace persistence + Phase C
+        # hand-grading) and log it so the drop is diagnosable.
+        dropped.append(flag)
         log.info(
             "synthesizer: flag dropped (severity=%s, shallow=%s[%s], "
             "deep=%s[%s]): %s",
@@ -731,10 +857,24 @@ async def synthesize_research(
         )
 
     output.verifier_cost_usd = verifier_cost
+    # NOTE: on a cap-degraded event this counter also includes flags
+    # dropped at the anchor-existence gate (verdict UNVERIFIED_CAPPED),
+    # not only role-bound verification rejections. A consumer that needs
+    # to distinguish them should read dropped_flags[].verifier_*_verdict
+    # (and the event's panopticon_degraded flag), which carry the truth.
     output.flags_dropped_verification = (
         output.flags_pre_verification - len(verified)
     )
     output.flags = verified
+    output.dropped_flags = dropped
+    # Terminal counter bump — increments research_count once per call (and
+    # degraded_count if a Level-2 degrade flipped cap_reached). Per-flag
+    # verifier spend was already added incrementally above.
+    if breaker_on:
+        cost_breaker.add_spend(
+            base, 0.0, date_et=date_et,
+            was_degraded=output.cap_reached, count_research=True,
+        )
     # axes_agreed REMAINS the synthesizer's original report — it is a
     # statement about substrate alignment at synthesis time, not about
     # what survived verification. If verification dropped everything,

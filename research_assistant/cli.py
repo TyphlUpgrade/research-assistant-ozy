@@ -1350,6 +1350,7 @@ async def _cmd_scoreboard(args: argparse.Namespace) -> int:
 
     from ozymandias.data.adapters.yfinance_adapter import YFinanceAdapter
 
+    from research_assistant import cost_breaker
     from research_assistant.journal import enrich_window, read_alerts_window
     from research_assistant.price import BarsBackedPriceAdapter
     from research_assistant.scoreboard import (
@@ -1456,6 +1457,13 @@ async def _cmd_scoreboard(args: argparse.Namespace) -> int:
         if hit_rate is not None:
             print()
             print(render_hit_rate(hit_rate))
+        cap_days, cap_events = cost_breaker.degrade_summary(base)
+        if cap_events:
+            print()
+            print(
+                f"Panopticon cost-cap: {cap_events} degraded /research "
+                f"event(s) across {cap_days} day(s)"
+            )
     return 0
 
 

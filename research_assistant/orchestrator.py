@@ -636,6 +636,7 @@ async def research_ticker(
                 earnings_calendar=earnings_calendar,
                 options_positioning=options_positioning,
                 analyst_revisions=analyst_revisions,
+                base=base,
             )
         except Exception as exc:
             log.warning("synthesizer call failed for %s: %s", symbol, exc)
@@ -657,6 +658,13 @@ async def research_ticker(
                     "flags_dropped_verification": synthesis_output.flags_dropped_verification,
                     "synthesizer_cost_usd": synthesis_output.synthesizer_cost_usd,
                     "verifier_cost_usd": synthesis_output.verifier_cost_usd,
+                    # Per-event degrade flag — Phase C Gate 3 excludes
+                    # degraded events from forward-return analysis (M3).
+                    "panopticon_degraded": synthesis_output.cap_reached,
+                    # Full kept+dropped flag detail (anchors + per-anchor
+                    # verdicts + reasoning) so Phase C replay can hand-grade
+                    # without re-running the verifier.
+                    "flags": synthesis_output.trace_flags_payload(),
                 }
                 if synthesis_output is not None
                 else None
