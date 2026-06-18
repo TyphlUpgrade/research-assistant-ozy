@@ -1577,14 +1577,18 @@ rearrangement doesn't address the depth-of-synthesis gap*.
 
 ### What ships (5 deep readers + synthesizer on /research only)
 
-- **Phase A** — Deterministic substrate (KPIs + earnings calendar +
-  options positioning + analyst revisions + insider behavior detail).
-  No LLM calls. Single PR, ~4-5 days.
-- **Phase B** — Stage 1.7 Synthesizer reading ONLY Phase A substrate.
-  Emits structured flags with two-anchor citations. Ships before
-  Agent A to front-load measurement. ~1 week.
+- **Phase A** ✅ SHIPPED (commit 8e3bd55) — Deterministic substrate
+  (KPIs + earnings calendar + options positioning + analyst revisions +
+  insider behavior detail). No LLM calls. Flag: `STAGE_2_DETERMINISTIC_SUBSTRATE=on`.
+- **Phase B** ✅ SHIPPED (commit 3b48f90, branch `feat/phase-b-synthesizer`) —
+  Stage 1.7 Synthesizer reading Phase A substrate. Emits structured
+  flags with two-anchor citations + Haiku role-bound verification.
+  Flag: `STAGE_1_7_SYNTHESIZER=on`. See "Phase B post-ship" below for
+  the live-smoke findings + the anchor-contract fix that landed with it.
 - **Phase C** — Replay harness + falsifiability gate (hand-grading
-  with decoy-ticker arm). Gates Phase D. ~1 week.
+  with decoy-ticker arm). Gates Phase D. ~1 week. **Now unblocked**:
+  the trace event persists kept+dropped flag detail
+  (`parsed.flags`) and the `panopticon_degraded` flag Gate 3 needs.
 - **Phase D** — Agent A deep filing reader + XBRL-stripped extractor.
   Lift revised to 2-3 weeks after EXP2 showed XBRL extraction failure
   on 3/7 candidate filings (existing `_extract_paragraphs` returns
@@ -1643,6 +1647,37 @@ rearrangement doesn't address the depth-of-synthesis gap*.
   toward without measurement. #20 stays blocked; #26 stays
   downgraded. #28 doesn't compete with them — it solves a different
   failure mode with grounded evidence.
+
+### Phase B post-ship (2026-06-17)
+
+Live-smoke on `/research SOFI` with both flags on exposed an
+anchor-contract bug: first real run produced 10 flags, **0 kept** — the
+role-bound verifier correctly rejected every flag because the
+synthesizer was citing thin anchors (bare-scalar `TICKER_DATA:*`
+sub-keys + metadata-only news) it couldn't support. Fixed (landed in
+commit 3b48f90): removed scalar sub-keys from corpus + allow-list
+(framing claims must cite `daily_signals`), constrained news anchors to
+headline-fact claims, replaced the futile per-flag whole-synthesizer
+retry (the ~10× cost amplifier) with drop-and-record. Verified
+0→3 flags on SOFI; generalizes (PLUG 6/10, QUBT 4/12 — losers surface
+more, as predicted). Synthesizer cost $0.47→$0.044.
+
+Landed as follow-ons (branch `feat/phase-b-synthesizer`):
+- **Trace persistence** — `parsed.flags = {kept, dropped}` with
+  per-anchor verdicts + reasoning (Phase C hand-grading input).
+- **Cost circuit breaker** — `research_assistant/cost_breaker.py`:
+  per-ET-day per-base ledger, `PANOPTICON_DAILY_CAP_USD` (default $10),
+  two-level degrade (skip synthesizer / anchor-existence-only fallback),
+  `panopticon_degraded` per-event telemetry + scoreboard surface.
+
+Open follow-ups surfaced:
+- **Brief insider aggregate is misleading** — the morning brief
+  reported SOFI insiders as "net +$241K buy-side" while the deep Form-4
+  fetch showed −$1.6M discretionary / −$10.6M total. The brief's shallow
+  aggregate masks net selling. Wire Phase A insider-detail into the
+  brief, or report discretionary-vs-total instead of a rosy net.
+- **No live `axes_agreed: true`** observed yet — validate the
+  clean-agreement happy path on a quiet large-cap.
 
 ### Cross-references
 
