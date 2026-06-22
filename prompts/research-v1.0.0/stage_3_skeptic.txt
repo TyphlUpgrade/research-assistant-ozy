@@ -147,10 +147,19 @@ TEMPER or CHALLENGE it.
     - `ticker_data.volume_ratio > 1.5`  (top-level field, NOT nested)
 
 VOIDING CONDITIONS — the setup is NOT a clean continuation if ANY holds (the
-move is terminal-parabolic; fall through to the exhaustion handling):
+move is terminal-parabolic OR gap-driven rather than trending; fall through to
+the exhaustion handling):
     - `daily_signals.rsi_14d >= 80`, OR
     - `daily_signals.range_pct_20d >= 95`, OR
-    - `daily_signals.roc_5d >= 25`  (5-day move ≥ +25%)
+    - `daily_signals.roc_5d >= 25`  (5-day move ≥ +25%), OR
+    - `ticker_data.single_day_share_30d >= 0.6`  (one gap day is ≥60% of the
+      entire 30-day move — the "trend" is a single event; ADX reads high off
+      that gap and LAGS, so it is NOT continuation), OR
+    - `ticker_data.trend_efficiency_10d <= 0.30`  (last 10 sessions are wide
+      oscillation with little net progress — chop at the highs, not a trend)
+  (The two trend-quality fields are top-level `ticker_data`, NOT nested under
+  daily_signals. Treat null as "not breached" — they are null only on flat or
+  short-history names.)
 
 FAIL-CLOSED: if `daily_signals` is absent, or `daily_signals.adx_14d` is null
 (< 28 bars), trend strength is UNPROVEN — the continuation gate does NOT open;

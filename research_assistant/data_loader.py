@@ -89,6 +89,47 @@ def _pct_return(series: pd.Series, lookback_bars: int) -> Optional[float]:
         return None
 
 
+def _single_day_share(close: pd.Series, lookback_bars: int = 30) -> Optional[float]:
+    """Fraction of the lookback-window net move concentrated in its single
+    biggest day.
+
+    ~1.0 (or >1) means one gap day IS the move — chop/digestion around a
+    one-off event, NOT a broad-based trend (ADX reads high off the gap and
+    lags). Low values mean participation is spread across many sessions.
+    None when the net move is ~flat (the ratio is undefined / not meaningful).
+    """
+    if close is None or len(close) < lookback_bars + 1:
+        return None
+    try:
+        window = close.iloc[-(lookback_bars + 1):]
+        net = abs(float(window.iloc[-1]) / float(window.iloc[0]) - 1.0)
+        if net < 0.05:  # net under 5% — "share of move" isn't meaningful
+            return None
+        biggest = float(window.pct_change().dropna().abs().max())
+        return round(biggest / net, 2)
+    except (IndexError, ValueError, TypeError, ZeroDivisionError):
+        return None
+
+
+def _trend_efficiency(close: pd.Series, lookback_bars: int = 10) -> Optional[float]:
+    """Kaufman efficiency ratio over the recent window: |net move| / sum of
+    per-bar absolute moves. 1.0 = a clean directional trend; near 0 = wide
+    oscillation with no net progress (the 'flat chop at the highs' shape).
+    Complements _single_day_share: that flags the gap, this flags the churn
+    after it."""
+    if close is None or len(close) < lookback_bars + 1:
+        return None
+    try:
+        window = close.iloc[-(lookback_bars + 1):]
+        net = abs(float(window.iloc[-1]) - float(window.iloc[0]))
+        path = float(window.diff().abs().sum())
+        if path == 0:
+            return None
+        return round(net / path, 2)
+    except (IndexError, ValueError, TypeError, ZeroDivisionError):
+        return None
+
+
 def _volume_5d_trend(volume: pd.Series) -> str:
     """Classify 5-day rolling-avg volume slope as rising / flat / declining."""
     if volume is None or len(volume) < 10:
@@ -283,8 +324,13 @@ async def load_ticker_data(
                                 color / debugging).
       - weekly_rsi_14         : RSI(14) on weekly resample
       - volume_5d_trend       : "rising" | "flat" | "declining"
+      - single_day_share_30d  : biggest single day's |move| / |30d net move|.
+                                ~1 → one gap IS the move (chop, not a trend).
+      - trend_efficiency_10d  : Kaufman efficiency ratio (|net| / path). 1 →
+                                clean trend; near 0 → wide oscillation / churn.
       - sector                : optional sector label (caller-supplied or None)
-      - earnings_within_days  : None for v1 (yfinance calendar wiring is v1.x)
+      - earnings_within_days  : None here (this fetch has no calendar); the CLI
+                                backfills it from load_earnings_calendar.
       - daily_signals         : full generate_daily_signal_summary output
 
     Two ways to populate volume_ratio_intraday:
@@ -354,6 +400,10 @@ async def load_ticker_data(
         "recent_return_5d": _pct_return(close, 5),
         "return_30d": _pct_return(close, 30),
         "return_90d": _pct_return(close, 90),
+        # Trend-quality guards: distinguish a real trend from one gap + chop so
+        # the momentum-continuation gate isn't fooled by a lagging ADX.
+        "single_day_share_30d": _single_day_share(close, 30),
+        "trend_efficiency_10d": _trend_efficiency(close, 10),
         "volume_ratio": _volume_ratio_vs_20d(volume),
         "volume_ratio_intraday": volume_ratio_intraday,
         "volume_ratio_intraday_source": volume_ratio_intraday_source,

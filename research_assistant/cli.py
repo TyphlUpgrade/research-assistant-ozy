@@ -208,17 +208,32 @@ async def _cmd_research(args: argparse.Namespace) -> int:
             )
             insider_activity, insider_detail = insider_pair
         else:
-            ticker_data, headlines, insider_activity, institutional_ownership = await asyncio.gather(
+            # Earnings calendar is cheap (one `.calendar` call) and the date is
+            # first-order for swing risk — load it even when the heavier Phase A
+            # substrate (KPI / options / revisions) stays gated off behind
+            # STAGE_2_DETERMINISTIC_SUBSTRATE.
+            from research_assistant.fundamentals import load_earnings_calendar
+            (
+                ticker_data, headlines, insider_activity,
+                institutional_ownership, earnings_calendar,
+            ) = await asyncio.gather(
                 load_ticker_data(symbol, adapter, include_intraday=True),
                 load_headlines(symbol, adapter, max_items=5),
                 load_insider_activity(symbol, client=edgar),
                 load_institutional_ownership(symbol, client=edgar),
+                load_earnings_calendar(symbol),
             )
             kpi_summary = None
-            earnings_calendar = None
             options_positioning = None
             analyst_revisions = None
             insider_detail = None
+    # Backfill the structured earnings-distance field the momentum/exhaustion
+    # gate reads. load_ticker_data hardcodes it to None (its own fetch has no
+    # calendar); both branches above now always populate `earnings_calendar`,
+    # so feed the distance through here instead of leaving the gate blind.
+    if earnings_calendar is not None and ticker_data.get("earnings_within_days") is None:
+        ticker_data["earnings_within_days"] = earnings_calendar.days_until_earnings
+
     if ticker_data.get("_data_quality") != "ok":
         print(
             f"ERROR: insufficient yfinance data for {symbol} "
