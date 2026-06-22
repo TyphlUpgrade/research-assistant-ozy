@@ -1075,6 +1075,53 @@ def _cmd_trace(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# panopticon-gate — Phase C replay + falsifiability gate (#28)
+# ---------------------------------------------------------------------------
+
+def _cmd_panopticon_gate(args: argparse.Namespace) -> int:
+    from research_assistant import panopticon as pan
+
+    base = _resolve_base(args.base)
+    traces_base = base / "traces"
+    if not traces_base.exists():
+        print(
+            f"No traces under {traces_base} — run /research with "
+            "STAGE_1_7_SYNTHESIZER=on first to generate synthesizer events.",
+            file=sys.stderr,
+        )
+        return 1
+    decoys = frozenset(
+        d.strip().upper() for d in (args.decoys or "").split(",") if d.strip()
+    )
+    records, stats = pan.collect_flag_records(traces_base, decoys=decoys)
+
+    # Optional: fold a filled grading sheet back in to compute precision.
+    if args.graded:
+        graded_path = Path(args.graded)
+        if not graded_path.exists():
+            print(f"ERROR: graded sheet not found: {graded_path}", file=sys.stderr)
+            return 1
+        applied = pan.apply_grades(records, pan.parse_graded_sheet(graded_path.read_text()))
+        print(f"Applied {applied}/{len(records)} grades from {graded_path}.", file=sys.stderr)
+
+    gate = pan.compute_gate(
+        records, stats, decoys=decoys,
+        max_decoy_fp_rate=args.max_decoy_fp_rate,
+        min_precision=args.min_precision,
+    )
+
+    if not args.graded:
+        out = Path(args.emit) if args.emit else (base / "panopticon" / "grading.md")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(pan.render_grading_sheet(records))
+        print(f"Grading sheet ({len(records)} flags) → {out}", file=sys.stderr)
+        print(f"Fill the GRADE column, then re-run with --graded {out}", file=sys.stderr)
+
+    print(pan.render_gate_summary(gate))
+    return 1 if gate.status == "FAIL" else 0
+
+
+# ---------------------------------------------------------------------------
 # dossier <TICKER>
 # ---------------------------------------------------------------------------
 
@@ -1679,6 +1726,29 @@ def _build_parser() -> argparse.ArgumentParser:
     pd = sub.add_parser("dossier", help="Print the current per-ticker dossier")
     pd.add_argument("ticker", help="Stock symbol")
 
+    # panopticon-gate — Phase C replay + falsifiability gate (#28)
+    ppg = sub.add_parser(
+        "panopticon-gate",
+        help="Phase C: replay synthesizer flags from traces, run the decoy "
+             "falsifiability arm, emit a grading sheet + PASS/FAIL/INCOMPLETE gate",
+    )
+    ppg.add_argument(
+        "--decoys", default="",
+        help="Comma-separated control tickers a contrarian flag should NOT fire "
+             "on (e.g. AAPL,MSFT,COST). Every kept flag on these is a false positive.",
+    )
+    ppg.add_argument(
+        "--emit", default=None,
+        help="Where to write the grading sheet (default .research/panopticon/grading.md)",
+    )
+    ppg.add_argument(
+        "--graded", default=None,
+        help="Path to a filled grading sheet — folds grades in to compute precision",
+    )
+    # Defaults mirror panopticon.DEFAULT_* (kept literal to avoid an import here).
+    ppg.add_argument("--max-decoy-fp-rate", type=float, default=0.10)
+    ppg.add_argument("--min-precision", type=float, default=0.70)
+
     pdc = sub.add_parser(
         "defender-check",
         help="Decide whether the Defender subagent should fire on user pushback",
@@ -1832,6 +1902,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "brief":          lambda a: asyncio.run(_cmd_brief(a)),
         "alerts":         lambda a: asyncio.run(_cmd_alerts(a)),
         "trace":          _cmd_trace,
+        "panopticon-gate": _cmd_panopticon_gate,
         "dossier":        _cmd_dossier,
         "defender-check": _cmd_defender_check,
         "trajectory":     _cmd_trajectory,
