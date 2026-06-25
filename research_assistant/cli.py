@@ -393,7 +393,7 @@ async def _cmd_probe(args: argparse.Namespace) -> int:
             ticker_data, headlines, insider_activity,
             institutional_ownership, filing_excerpts,
         ) = await asyncio.gather(
-            load_ticker_data(symbol, adapter, include_intraday=True),
+            load_ticker_data(symbol, adapter, include_intraday=getattr(args, "intraday", False)),
             load_headlines(symbol, adapter, max_items=5),
             load_insider_activity(symbol, client=edgar),
             load_institutional_ownership(symbol, client=edgar),
@@ -1667,6 +1667,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Fetch the latest filing of the given form (e.g. 10-K, 10-Q, 8-K) and "
              "inject paragraphs matching the question keywords. Cited anchors "
              "(edgar:<form>:<acc>:para_N) persist into the trace for Defender.",
+    )
+    pp.add_argument(
+        "--intraday",
+        action="store_true",
+        help="Force the live intraday (15m) volume fetch. Off by default — a probe "
+             "normally uses the live quote + last-close daily signals; pass this "
+             "when you specifically need today's intraday volume shape.",
     )
 
     pb = sub.add_parser("brief", help="Morning summary over watchlist + dynamic universe")

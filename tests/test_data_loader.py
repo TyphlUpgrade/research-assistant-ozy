@@ -214,7 +214,7 @@ async def test_load_ticker_data_shape_matches_prompt_contract() -> None:
         "symbol", "price", "recent_return_5d", "return_30d", "return_90d",
         "volume_ratio", "volume_ratio_intraday", "volume_ratio_intraday_source",
         "weekly_rsi_14", "volume_5d_trend", "sector", "earnings_within_days",
-        "daily_signals", "_data_quality",
+        "daily_signals", "daily_as_of", "session", "live_quote", "_data_quality",
     }
     assert required_fields.issubset(td.keys()), (
         f"Missing fields: {required_fields - td.keys()}"
@@ -224,6 +224,52 @@ async def test_load_ticker_data_shape_matches_prompt_contract() -> None:
     assert td["_data_quality"] == "ok"
     assert td["recent_return_5d"] is not None  # synthetic data has 5+ bars
     assert td["volume_5d_trend"] in ("rising", "flat", "declining")
+
+
+@pytest.mark.asyncio
+async def test_load_ticker_data_session_split_open_vs_closed() -> None:
+    """Open: today's in-progress daily bar is dropped, so daily_as_of is the
+    prior completed close and a live_quote block carries today. Closed: today's
+    bar is complete and kept, so daily_as_of == today. Same bars both times."""
+    from zoneinfo import ZoneInfo
+
+    et = ZoneInfo("America/New_York")
+    # Index ends on a known non-holiday weekday so session detection is stable.
+    idx = pd.bdate_range(end="2026-06-23", periods=120)  # ... 06-22 (Mon), 06-23 (Tue)
+    closes = [100.0 + i * 0.5 for i in range(120)]
+    bars = pd.DataFrame({
+        "open": closes, "high": [c + 1 for c in closes],
+        "low": [c - 1 for c in closes], "close": closes,
+        "volume": [1_000_000] * 120,
+    }, index=idx)
+    last_day, prev_day = idx[-1].date(), idx[-2].date()
+
+    adapter = MagicMock()
+    adapter.fetch_bars = AsyncMock(return_value=bars)
+    adapter.fetch_quote = AsyncMock(return_value=MagicMock(
+        last=158.5, bid=158.4, ask=158.6, volume=400.0, timestamp=None))
+
+    td_open = await load_ticker_data(
+        "NVDA", adapter,
+        now_et=datetime(2026, 6, 23, 10, 0, tzinfo=et),  # mid-session
+    )
+    assert td_open["session"] == "regular_hours"
+    assert td_open["daily_as_of"] == prev_day.isoformat()  # partial bar dropped
+    assert td_open["live_quote"]["last"] == 158.5
+    assert td_open["live_quote"]["bid"] == 158.4
+    # prior_close = last COMPLETED close (06-22 = 159.0 after dropping 06-23);
+    # gap = 158.5/159.0 - 1 = -0.31%.
+    assert td_open["live_quote"]["prior_close"] == 159.0
+    assert td_open["live_quote"]["gap_vs_prior_close_pct"] == -0.31
+
+    td_closed = await load_ticker_data(
+        "NVDA", adapter,
+        now_et=datetime(2026, 6, 23, 20, 30, tzinfo=et),  # after close
+    )
+    assert td_closed["session"] == "closed"
+    assert td_closed["daily_as_of"] == last_day.isoformat()  # today's bar kept
+    # closed: today's complete bar kept → prior_close = 06-23 close = 159.5.
+    assert td_closed["live_quote"]["prior_close"] == 159.5
 
 
 @pytest.mark.asyncio
@@ -352,3 +398,63 @@ async def test_load_headlines_handles_none_result() -> None:
     adapter.fetch_news = AsyncMock(return_value=None)
     headlines = await load_headlines("OBSCURE", adapter)
     assert headlines == []
+
+
+# ---------------------------------------------------------------------------
+# Fear & Greed index
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_build_world_state_includes_fear_greed(monkeypatch) -> None:
+    """The fetched F&G score flows into the world-state input context."""
+    import research_assistant.data_loader as dl
+
+    monkeypatch.setattr(
+        dl, "fetch_fear_greed",
+        AsyncMock(return_value={"score": 27.1, "rating": "fear"}),
+    )
+    adapter = MagicMock()
+    adapter.fetch_bars = AsyncMock(return_value=_synthetic_bars(60))
+    adapter.fetch_news = AsyncMock(return_value=[])
+
+    ws_input = await dl.build_world_state_input(
+        adapter, macro_instruments=("SPY",), sector_etfs=("XLK",),
+    )
+    assert ws_input["fear_greed"] == {"score": 27.1, "rating": "fear"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_fear_greed_parses_and_flags_extreme(monkeypatch) -> None:
+    """Parses score/rating and flags the contrarian tails (extreme fear/greed)."""
+    import httpx
+
+    import research_assistant.data_loader as dl
+
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self): return {"fear_and_greed": {"score": 18.4, "rating": "extreme fear"}}
+
+    class _Client:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, *a, **k): return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    fg = await dl.fetch_fear_greed()
+    assert fg == {"score": 18.4, "rating": "extreme fear", "extreme": True}
+
+
+@pytest.mark.asyncio
+async def test_fetch_fear_greed_degrades_to_none(monkeypatch) -> None:
+    """Any network/parse failure → None (never blocks the brief)."""
+    import httpx
+
+    import research_assistant.data_loader as dl
+
+    class _Boom:
+        def __init__(self, *a, **k):
+            raise RuntimeError("network down")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Boom)
+    assert await dl.fetch_fear_greed() is None

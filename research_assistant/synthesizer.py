@@ -294,9 +294,25 @@ def build_anchor_corpus(
     corpus["TICKER_DATA"] = json.dumps(ticker_data, indent=2)
     daily_signals = ticker_data.get("daily_signals")
     if daily_signals is not None:
-        corpus["TICKER_DATA:daily_signals"] = (
+        as_of = ticker_data.get("daily_as_of")
+        header = (
+            f"DAILY SIGNALS — as of completed close {as_of} (NOT today's live state):\n"
+            if as_of else ""
+        )
+        corpus["TICKER_DATA:daily_signals"] = header + (
             json.dumps(daily_signals, indent=2)
             if not isinstance(daily_signals, str) else daily_signals
+        )
+
+    # Live quote — today's current-session state, a distinct dated block from
+    # the (last-close) daily signals. Citable so a flag can anchor "now" claims.
+    live_quote = ticker_data.get("live_quote")
+    if live_quote is not None:
+        corpus["TICKER_DATA:live_quote"] = (
+            "LIVE QUOTE — current session, NOT a completed daily bar. "
+            "gap_vs_prior_close_pct is today's move vs the last completed close "
+            "(the daily signals' date) — use it, don't infer the move:\n"
+            + json.dumps(live_quote, indent=2)
         )
 
     # headlines — title/publisher/age metadata ONLY (no article body exists

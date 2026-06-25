@@ -409,6 +409,14 @@ async def build_brief(
     if world_state is None:
         raise RuntimeError("Stage 0 (world state) JSON parse failed")
 
+    # Stamp the exact fetched Fear & Greed score into macro_signals. The LLM
+    # sees it in context_json (factors into the regime call), but we write the
+    # raw value deterministically so display + downstream never depend on the
+    # model echoing a number back.
+    fear_greed = market_context.get("fear_greed")
+    if fear_greed and isinstance(world_state, dict):
+        world_state.setdefault("macro_signals", {})["fear_greed"] = fear_greed
+
     # Stage 1 — deterministic composite (PR 2A.1). No LLM call here.
     insider_activities = insider_activities or {}
     screener_alerts = list(screener_alerts or [])
@@ -696,8 +704,15 @@ def render_brief_top_level(brief: Brief) -> str:
     macro = ws.get("macro_signals", {})
     if macro:
         catalysts = macro.get("active_catalysts", [])
+        fg = macro.get("fear_greed")
+        fg_str = ""
+        if isinstance(fg, dict) and fg.get("score") is not None:
+            # Context line; only the tails (extreme fear/greed) are flagged as a
+            # contrarian signal — the mid-range level adds nothing over VIX.
+            mark = " — ⚠ contrarian extreme" if fg.get("extreme") else ""
+            fg_str = f"  ·  **Fear/Greed:** {fg['score']} ({fg.get('rating', '?')}){mark}"
         lines.append(
-            f"- **VIX:** {macro.get('vix_level', '?')} ({macro.get('vix_trend', '?')})  ·  "
+            f"- **VIX:** {macro.get('vix_level', '?')} ({macro.get('vix_trend', '?')}){fg_str}  ·  "
             f"**Active catalysts:** {', '.join(catalysts) if catalysts else 'none'}"
         )
     lines.append("")

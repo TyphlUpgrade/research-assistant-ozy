@@ -34,6 +34,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from ozymandias.core.market_hours import Session, get_current_session
 from ozymandias.data.adapters.yfinance_adapter import YFinanceAdapter
 from ozymandias.intelligence.technical_analysis import (
     compute_ema,
@@ -332,6 +333,16 @@ async def load_ticker_data(
       - earnings_within_days  : None here (this fetch has no calendar); the CLI
                                 backfills it from load_earnings_calendar.
       - daily_signals         : full generate_daily_signal_summary output
+      - daily_as_of           : ISO date of the completed close the daily signals
+                                describe. During regular hours the in-progress
+                                partial bar is dropped, so this is the prior close.
+      - session               : market session at fetch time (regular_hours /
+                                pre_market / post_market / closed)
+      - live_quote            : full current quote (last/bid/ask/volume/timestamp)
+                                plus prior_close + gap_vs_prior_close_pct so the
+                                live-vs-last-close move is a real number, not a
+                                guess — today's state, distinct from the dated
+                                daily block
 
     Two ways to populate volume_ratio_intraday:
       - `include_intraday=True` (single-ticker /research & /probe): one extra
@@ -355,9 +366,49 @@ async def load_ticker_data(
             "_data_quality": "insufficient_bars",
         }
 
+    # Market-session split. During regular hours yfinance's latest daily bar is
+    # the in-progress partial session; drop it so the daily indicators are
+    # honestly "as of the last completed close". Today's live state is carried
+    # separately by `live_quote`, so the two reach the model as distinct dated
+    # blocks rather than a stale partial masquerading as current. After the
+    # close (and pre/post) the latest bar is complete, so it stands.
+    session = get_current_session(now_et)
+    asof = now_et or datetime.now(_ET)
+    if session == Session.REGULAR_HOURS and len(bars):
+        last_ts = bars.index[-1]
+        last_date = last_ts.date() if hasattr(last_ts, "date") else None
+        if last_date is not None and last_date == asof.date():
+            bars = bars.iloc[:-1]
+
     close = bars["close"]
     volume = bars["volume"]
     daily_signals = generate_daily_signal_summary(symbol, bars)
+    _last_bar = bars.index[-1]
+    daily_as_of = _last_bar.date().isoformat() if hasattr(_last_bar, "date") else None
+
+    # Full live quote — nothing thrown away. Carries prior_close + the computed
+    # gap so the live-vs-last-close question is answerable with a real number,
+    # not a guess. `close.iloc[-1]` is the last COMPLETED session's close
+    # (today's partial was dropped above during regular hours), so the gap reads
+    # as today's intraday move during the session / the after-hours move once
+    # the session has closed.
+    _ts = getattr(quote, "timestamp", None)
+    _last = getattr(quote, "last", None)
+    _prior_close = float(close.iloc[-1]) if len(close) else None
+    _gap_pct = (
+        round((_last / _prior_close - 1) * 100, 2)
+        if _last and _prior_close else None
+    )
+    live_quote = {
+        "last": _last,
+        "prior_close": _prior_close,
+        "gap_vs_prior_close_pct": _gap_pct,
+        "bid": getattr(quote, "bid", None),
+        "ask": getattr(quote, "ask", None),
+        "volume": getattr(quote, "volume", None),
+        "timestamp": _ts.isoformat() if hasattr(_ts, "isoformat") else _ts,
+        "session": session.value,
+    }
 
     # Time-of-day-aware intraday participation. Both paths degrade to None on
     # any failure so callers fall back to the prior-close `volume_ratio`.
@@ -412,6 +463,9 @@ async def load_ticker_data(
         "sector": sector,
         "earnings_within_days": None,  # v1.x: wire yfinance calendar
         "daily_signals": daily_signals,
+        "daily_as_of": daily_as_of,  # date of the completed close the signals describe
+        "session": session.value,
+        "live_quote": live_quote,
         "_data_quality": "ok",
     }
 
@@ -487,6 +541,43 @@ async def _instrument_snapshot(symbol: str, adapter: YFinanceAdapter) -> dict[st
         return {"symbol": symbol, "_data_quality": f"error: {exc}"}
 
 
+_FEAR_GREED_URL = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+
+
+async def fetch_fear_greed() -> Optional[dict[str, Any]]:
+    """CNN Fear & Greed index — current composite market sentiment (0–100).
+
+    Returns {"score": float, "rating": str} or None on any failure. The
+    endpoint is unofficial, so this degrades to None (never blocks the brief);
+    the brief's per-ET-date JSON cache means it's fetched ~once per build, so no
+    separate TTL is needed here. The 7 sub-components VIX/RSI/dispersion don't
+    capture (breadth, put/call, safe-haven, junk spreads) are what it adds.
+    """
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.get(
+                _FEAR_GREED_URL,
+                headers={"User-Agent": "Mozilla/5.0 (research-assistant)"},
+            )
+            r.raise_for_status()
+            fg = r.json().get("fear_and_greed", {})
+        score = fg.get("score")
+        if score is None:
+            return None
+        rating = fg.get("rating")
+        # Context, not signal: the daily level is redundant with VIX/dispersion/
+        # rotation. Only the tails carry a contrarian edge, so we flag those.
+        return {
+            "score": round(float(score), 1),
+            "rating": rating,
+            "extreme": rating in ("extreme fear", "extreme greed"),
+        }
+    except Exception as exc:
+        log.warning("fear/greed fetch failed: %s", exc)
+        return None
+
+
 async def build_world_state_input(
     adapter: YFinanceAdapter,
     *,
@@ -513,8 +604,8 @@ async def build_world_state_input(
 
     macro_task = [_with_sem(_instrument_snapshot(s, adapter)) for s in macro_instruments]
     sector_task = [_with_sem(_instrument_snapshot(s, adapter)) for s in sector_etfs]
-    macro_snaps, sector_snaps = await asyncio.gather(
-        asyncio.gather(*macro_task), asyncio.gather(*sector_task)
+    macro_snaps, sector_snaps, fear_greed = await asyncio.gather(
+        asyncio.gather(*macro_task), asyncio.gather(*sector_task), fetch_fear_greed()
     )
 
     # Macro news from SPY/QQQ + optionally watchlist names
@@ -532,6 +623,7 @@ async def build_world_state_input(
     return {
         "macro_instruments": {snap.get("symbol"): snap for snap in macro_snaps},
         "sector_performance": {snap.get("symbol"): snap for snap in sector_snaps},
+        "fear_greed": fear_greed,  # CNN composite sentiment (None if fetch failed)
         "recent_news_digest": recent_news_digest,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
