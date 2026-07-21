@@ -1100,3 +1100,16 @@ class TestReturnCacheKeyDiscrimination:
 
         cache = scoreboard.read_return_cache(tmp_path, "MU")
         assert ("brief", "2026-05-29T12:00:00+00:00") in cache
+
+
+def test_read_all_research_skips_foreign_ticker(tmp_path: Path):
+    """A foreign-listing dossier (e.g. SK Hynix `000660.KS`) on disk makes
+    enumerate_tickers yield a symbol the SEC-shaped guard in
+    read_unified_history rejects. read_all_research must skip it, not crash
+    the whole scoreboard — regression for the ValueError that took the
+    `scoreboard` CLI down entirely when such a dossier existed."""
+    tickers_dir = tmp_path / "tickers"
+    tickers_dir.mkdir(parents=True)
+    (tickers_dir / "000660.KS.md").write_text("# SK Hynix dossier\n")
+    # Must not raise; nothing SEC-shaped to score, so the result is empty.
+    assert scoreboard.read_all_research(tmp_path) == []

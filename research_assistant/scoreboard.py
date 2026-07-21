@@ -248,7 +248,17 @@ def read_all_research(base: Path) -> list[dict]:
 
     rows: list[dict] = []
     for ticker in enumerate_tickers(base):
-        for entry in read_unified_history(ticker, base):
+        # enumerate_tickers yields whatever has a dossier/journal on disk,
+        # including foreign symbols (e.g. `000660.KS`, SK Hynix) that the
+        # SEC-shaped guard in read_unified_history rejects. Skip those
+        # rather than letting one bad symbol crash the whole scoreboard.
+        # ponytail: try/except over pre-filter — one guard, same regex authority.
+        try:
+            history = read_unified_history(ticker, base)
+        except ValueError:
+            log.debug("scoreboard: skipping non-SEC ticker %r", ticker)
+            continue
+        for entry in history:
             if entry.source != "research":
                 continue
             if entry.composite_conviction is None:
