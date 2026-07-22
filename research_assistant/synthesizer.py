@@ -315,6 +315,34 @@ def build_anchor_corpus(
             + json.dumps(live_quote, indent=2)
         )
 
+    # Trend-recognition primitives (FOLLOWUPS #31). These are context-RICH
+    # blobs (a labelled dict, not a bare scalar), so — unlike the removed
+    # TICKER_DATA:<scalar> anchors — the role-bound verifier can read a real
+    # framing from them. Cite these for structure/momentum framing claims.
+    # Labels MUST stay in sync with the stage_1_7_synthesizer prompt allow-list
+    # (see tests/test_synthesizer_trend_anchors.py).
+    _TREND_ANCHORS = (
+        ("market_structure",
+         "MARKET STRUCTURE — fractal swing structure. structure is "
+         "uptrend/downtrend/range from higher-high+higher-low vs "
+         "lower-high+lower-low; last/prior swing highs & lows are the levels:"),
+        ("ts_momentum",
+         "TS MOMENTUM — volatility-scaled time-series momentum. vol_scaled is "
+         "the move in units of the window's own (Yang-Zhang) volatility, so it "
+         "is comparable across tickers; sign is direction:"),
+        ("directional_change",
+         "DIRECTIONAL CHANGE — Guillaume/Olsen state at threshold theta. mode "
+         "is the confirmed trend at this threshold; high n_events means choppy "
+         "at this scale; running_extreme_price is the provisional (unconfirmed) "
+         "extreme:"),
+    )
+    for _key, _header in _TREND_ANCHORS:
+        _blob = ticker_data.get(_key)
+        if _blob is not None:
+            corpus[f"TICKER_DATA:{_key}"] = _header + "\n" + json.dumps(
+                _blob, indent=2
+            )
+
     # headlines — title/publisher/age metadata ONLY (no article body exists
     # in the pipeline). The explicit prefix keeps the role-bound extractor
     # honest: a flag may cite what the headline LITERALLY states, never

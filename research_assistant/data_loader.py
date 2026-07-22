@@ -49,8 +49,21 @@ from research_assistant.volume_profile import (
     load_profile,
     refresh_profile,
 )
+from research_assistant.momentum import ts_momentum
+from research_assistant.structure import (
+    directional_change_state,
+    market_structure,
+)
 
 log = logging.getLogger(__name__)
+
+# Directional-change threshold for the narrative structure signal. UNTUNED
+# default — not fit against the journals (FOLLOWUPS #31 pt 5: no threshold
+# gets tuned here without a deflated-Sharpe lens). High n_events at this theta
+# is itself informative (choppy at this scale).
+_DC_THETA = 0.05
+# TSM lookback (bars) ~ 1 month, aligned with the days-to-weeks swing horizon.
+_TSM_LOOKBACK = 20
 
 
 # Default sector ETFs surveyed for world-state (subset of Ozy's full sector map)
@@ -386,6 +399,18 @@ async def load_ticker_data(
     _last_bar = bars.index[-1]
     daily_as_of = _last_bar.date().isoformat() if hasattr(_last_bar, "date") else None
 
+    # Quant-grounded trend/structure primitives (FOLLOWUPS #31). Computed on the
+    # completed-close bars (today's partial was dropped above during regular
+    # hours), so they describe the same dated close as daily_signals. All three
+    # degrade to None/'range'/empty on short history — no crash on a sparse
+    # ticker. Narrative-only: they reach Stage 2/3 (whole dict is JSON-dumped)
+    # and are citable synthesizer anchors, but do NOT feed composite.py's score.
+    momentum = ts_momentum(
+        bars["open"], bars["high"], bars["low"], close, lookback=_TSM_LOOKBACK
+    )
+    structure = market_structure(bars["high"], bars["low"])
+    dc_state = directional_change_state(close, theta=_DC_THETA)
+
     # Full live quote — nothing thrown away. Carries prior_close + the computed
     # gap so the live-vs-last-close question is answerable with a real number,
     # not a guess. `close.iloc[-1]` is the last COMPLETED session's close
@@ -464,6 +489,9 @@ async def load_ticker_data(
         "earnings_within_days": None,  # v1.x: wire yfinance calendar
         "daily_signals": daily_signals,
         "daily_as_of": daily_as_of,  # date of the completed close the signals describe
+        "ts_momentum": momentum,
+        "market_structure": structure,
+        "directional_change": dc_state,
         "session": session.value,
         "live_quote": live_quote,
         "_data_quality": "ok",

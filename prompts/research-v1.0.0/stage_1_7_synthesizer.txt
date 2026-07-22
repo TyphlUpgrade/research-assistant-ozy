@@ -90,6 +90,18 @@ drawn from the following allow-list:
     "TICKER_DATA:recent_return_5d" are NO LONGER valid anchors — a number
     with no context cannot support the verifier, and the value already
     lives inside TICKER_DATA / daily_signals.
+  - "TICKER_DATA:market_structure" — fractal swing structure
+    (uptrend/downtrend/range from higher-high+higher-low vs lower-high+
+    lower-low, plus the last/prior swing highs & lows). Cite for a claim
+    about market structure / swing levels (e.g. a headline calling a
+    "breakout" while structure is a lower-high downtrend).
+  - "TICKER_DATA:ts_momentum" — volatility-scaled time-series momentum
+    (return, Yang-Zhang vol, vol_scaled, direction). Cite for a
+    momentum-strength-per-risk framing (a big % move that is small in
+    vol-adjusted terms, or vice versa).
+  - "TICKER_DATA:directional_change" — Guillaume/Olsen DC state (mode,
+    extremes, n_events at a threshold). Cite for a near-term reversal /
+    bounce-vs-trend framing.
   - "yfinance:fetch_bars:{ticker}" / "yfinance:fetch_quote:{ticker}" — bars/quote
   - "yfinance:fetch_news:{ticker}:item_N" — a specific headline
     (N = 1..len(headlines)). METADATA ONLY: title + publisher + age, with
