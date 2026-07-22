@@ -40,7 +40,24 @@ from ozymandias.intelligence.technical_analysis import (
     generate_daily_signal_summary,
 )
 
+from research_assistant.momentum import ts_momentum
+from research_assistant.structure import (
+    directional_change_state,
+    market_structure,
+)
+
 log = logging.getLogger(__name__)
+
+# Directional-change threshold for the narrative structure signal. UNTUNED
+# default — a sensible daily single-name value, NOT fit against the journals
+# (FOLLOWUPS #31 pt 5: no threshold gets tuned here without a deflated-Sharpe
+# lens). A vol-adaptive theta is the documented follow-up. High n_events at
+# this theta is itself informative (choppy at this scale).
+_DC_THETA = 0.05
+
+# Time-series-momentum lookback (bars). ~1 month aligns with the tool's
+# days-to-weeks swing horizon.
+_TSM_LOOKBACK = 20
 
 
 # Default sector ETFs surveyed for world-state (subset of Ozy's full sector map)
@@ -175,6 +192,24 @@ async def load_ticker_data(
       - sector                : optional sector label (caller-supplied or None)
       - earnings_within_days  : None for v1 (yfinance calendar wiring is v1.x)
       - daily_signals         : full generate_daily_signal_summary output
+      - ts_momentum           : vol-scaled time-series momentum (momentum.py) —
+                                {momentum_return, realized_vol (Yang-Zhang),
+                                vol_scaled, direction, lookback}. vol_scaled is
+                                the return in units of the window's own vol, so
+                                it's comparable across tickers (a +8% low-vol
+                                grind vs a +8% high-vol lurch read differently).
+      - market_structure      : fractal swing structure (structure.py) —
+                                {structure: uptrend/downtrend/range, last/prior
+                                swing H & L, n_pivots}. Names the HH-HL/LH-LL
+                                shape the EMA fields only proxy.
+      - directional_change    : Guillaume/Olsen DC state at theta=_DC_THETA —
+                                {mode, theta, n_events, extremes}. Scale-
+                                adaptive companion to the fractal pivots.
+
+    NOTE: ts_momentum / market_structure / directional_change are NARRATIVE-
+    ONLY — they reach the Stage 2/3 LLM (the whole dict is JSON-dumped into
+    the prompt) but are NOT wired into composite.py's deterministic score.
+    Ranker wiring is a separate, calibration-gated decision (FOLLOWUPS #31).
     """
     bars = await adapter.fetch_bars(symbol, interval="1d", period="3mo")
     quote = await adapter.fetch_quote(symbol)
@@ -192,6 +227,14 @@ async def load_ticker_data(
     volume = bars["volume"]
     daily_signals = generate_daily_signal_summary(symbol, bars)
 
+    # Quant-grounded trend/structure primitives (FOLLOWUPS #31). All degrade
+    # to None/'range'/empty on short history — no crash on a sparse ticker.
+    momentum = ts_momentum(
+        bars["open"], bars["high"], bars["low"], close, lookback=_TSM_LOOKBACK
+    )
+    structure = market_structure(bars["high"], bars["low"])
+    dc_state = directional_change_state(close, theta=_DC_THETA)
+
     return {
         "symbol": symbol,
         "price": getattr(quote, "last", None) or float(close.iloc[-1]),
@@ -204,6 +247,9 @@ async def load_ticker_data(
         "sector": sector,
         "earnings_within_days": None,  # v1.x: wire yfinance calendar
         "daily_signals": daily_signals,
+        "ts_momentum": momentum,
+        "market_structure": structure,
+        "directional_change": dc_state,
         "_data_quality": "ok",
     }
 

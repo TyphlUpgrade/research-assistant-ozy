@@ -141,6 +141,7 @@ async def test_load_ticker_data_shape_matches_prompt_contract() -> None:
         "symbol", "price", "recent_return_5d", "return_30d", "return_90d",
         "volume_ratio", "weekly_rsi_14", "volume_5d_trend",
         "sector", "earnings_within_days", "daily_signals", "_data_quality",
+        "ts_momentum", "market_structure", "directional_change",
     }
     assert required_fields.issubset(td.keys()), (
         f"Missing fields: {required_fields - td.keys()}"
@@ -150,6 +151,35 @@ async def test_load_ticker_data_shape_matches_prompt_contract() -> None:
     assert td["_data_quality"] == "ok"
     assert td["recent_return_5d"] is not None  # synthetic data has 5+ bars
     assert td["volume_5d_trend"] in ("rising", "flat", "declining")
+
+
+@pytest.mark.asyncio
+async def test_load_ticker_data_includes_trend_recognition_fields() -> None:
+    """FOLLOWUPS #31 narrative wiring: the vol-scaled momentum + swing/DC
+    structure primitives are present and correctly shaped, so the whole-dict
+    json.dumps in orchestrator carries them into the Stage 2/3 prompt."""
+    adapter = MagicMock()
+    adapter.fetch_bars = AsyncMock(return_value=_synthetic_bars(120))
+    adapter.fetch_quote = AsyncMock(return_value=MagicMock(last=158.5))
+
+    td = await load_ticker_data("NVDA", adapter)
+
+    assert set(td["ts_momentum"]) >= {
+        "momentum_return", "realized_vol", "vol_scaled", "direction", "lookback",
+    }
+    assert set(td["market_structure"]) >= {
+        "structure", "last_swing_high", "last_swing_low", "n_pivots",
+    }
+    assert set(td["directional_change"]) >= {"mode", "theta", "n_events"}
+
+    # Synthetic bars are a clean monotonic rise: momentum is up, and a strictly
+    # monotonic path has no interior swing pivots → fractal structure = 'range'
+    # (n_pivots 0), while the DC clock still confirms an up mode past theta.
+    assert td["ts_momentum"]["direction"] == "up"
+    assert td["ts_momentum"]["vol_scaled"] is not None
+    assert td["market_structure"]["structure"] == "range"
+    assert td["market_structure"]["n_pivots"] == 0
+    assert td["directional_change"]["mode"] == "up"
 
 
 @pytest.mark.asyncio
