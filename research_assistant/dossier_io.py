@@ -39,13 +39,15 @@ byte-identical output).
 """
 from __future__ import annotations
 
+import fcntl
 import os
 import re
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 import frontmatter
 
@@ -273,11 +275,55 @@ def write_dossier_atomic(d: Dossier, base: Path) -> None:
         raise
 
 
+@contextmanager
+def dossier_lock(symbol: str, base: Path) -> Iterator[None]:
+    """
+    Per-symbol exclusive advisory lock (`fcntl.flock`) for the
+    read-modify-write cycle. Coordinates concurrent writers for the same
+    ticker so that two probes landing on the same dossier don't lose each
+    other's ledger entries.
+
+    The lock file (`<SYMBOL>.md.lock`) sits beside the dossier; locking a
+    separate file avoids interaction with the atomic `os.replace` rename.
+    """
+    path = _dossier_path(symbol, base)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with open(lock_path, "w") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def update_dossier_under_lock(
+    symbol: str,
+    base: Path,
+    update_fn: Callable[[Dossier], Dossier],
+) -> Dossier:
+    """
+    Atomic read-modify-write under the per-symbol lock.
+
+    `update_fn` receives the freshly-loaded dossier (or a new one if no
+    dossier exists yet) and returns the mutated dossier to persist. The
+    re-read inside the lock guarantees concurrent writers (parallel
+    /probe or /research calls on the same ticker) cannot lose each
+    other's ledger entries — each writer rebases onto the latest disk
+    state before appending.
+    """
+    symbol = symbol.upper()
+    with dossier_lock(symbol, base):
+        d = read_dossier(symbol, base) or Dossier(symbol=symbol)
+        d = update_fn(d)
+        write_dossier_atomic(d, base)
+        return d
+
+
 def append_ledger_entry(symbol: str, entry: LedgerEntry, base: Path) -> None:
-    """Convenience: read → append → atomic-write. Guaranteed append-only."""
-    d = read_dossier(symbol, base)
-    if d is None:
-        d = Dossier(symbol=symbol.upper())
-    d.ledger.append(entry)
-    d.last_updated = datetime.now(timezone.utc).isoformat()
-    write_dossier_atomic(d, base)
+    """Convenience: read → append → atomic-write under per-symbol lock."""
+    def _add(d: Dossier) -> Dossier:
+        d.ledger.append(entry)
+        d.last_updated = datetime.now(timezone.utc).isoformat()
+        return d
+    update_dossier_under_lock(symbol, base, _add)
