@@ -724,18 +724,25 @@ async def load_watchlist_data(
 
     async def _one(sym: str):
         async with sem:
-            td = await load_ticker_data(
-                sym, adapter,
-                volume_profile_base=volume_profile_base,
-                now_et=now_et,
-            )
-            hl = await load_headlines(sym, adapter)
+            try:
+                td = await load_ticker_data(
+                    sym, adapter,
+                    volume_profile_base=volume_profile_base,
+                    now_et=now_et,
+                )
+                hl = await load_headlines(sym, adapter)
+            except Exception as e:  # ponytail: one delisted/bad symbol must not abort the whole brief
+                log.warning("skipping %s: load failed (%s)", sym, e)
+                return None
             return sym.upper(), td, hl
 
     results = await asyncio.gather(*[_one(s) for s in symbols])
     tickers: dict[str, dict] = {}
     headlines: dict[str, list[dict]] = {}
-    for sym, td, hl in results:
+    for res in results:
+        if res is None:
+            continue
+        sym, td, hl = res
         tickers[sym] = td
         headlines[sym] = hl
     return tickers, headlines

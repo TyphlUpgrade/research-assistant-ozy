@@ -22,6 +22,7 @@ from research_assistant.data_loader import (
     _weekly_rsi_14,
     load_headlines,
     load_ticker_data,
+    load_watchlist_data,
 )
 
 
@@ -458,3 +459,25 @@ async def test_fetch_fear_greed_degrades_to_none(monkeypatch) -> None:
 
     monkeypatch.setattr(httpx, "AsyncClient", _Boom)
     assert await dl.fetch_fear_greed() is None
+
+
+@pytest.mark.asyncio
+async def test_load_watchlist_data_skips_failed_symbol() -> None:
+    """One delisted/bad symbol must not abort the whole brief batch — the
+    per-symbol load is guarded and the failure is dropped, not propagated."""
+    adapter = MagicMock()
+
+    async def _bars(symbol, *a, **k):
+        if symbol == "BAD":
+            raise RuntimeError("possibly delisted; no price data found")
+        return _synthetic_bars(120)
+
+    adapter.fetch_bars = AsyncMock(side_effect=_bars)
+    adapter.fetch_quote = AsyncMock(return_value=MagicMock(last=100.0))
+    adapter.fetch_news = AsyncMock(return_value=[])
+
+    tickers, headlines = await load_watchlist_data(["GOOD", "BAD"], adapter)
+
+    assert "GOOD" in tickers
+    assert "BAD" not in tickers          # skipped, not fatal
+    assert "GOOD" in headlines
